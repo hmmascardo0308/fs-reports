@@ -1,0 +1,93 @@
+Region : Cebu Central Region A | Area : A				
+Category	GLCode	Description	Amount	%
+	411101	Service Charge - Pawned Jewelries	"11,398.00"	0.00%
+	411102	Interest Income - Advance on Jewelries	"2,092,619.42"	0.65%
+	411104	Interest Income - Ordinary/Past Due Redemption on Jewelries	"716,503.64"	0.22%
+	411105	Liquidated Damages - Pawned Jewelries	"425,587.48"	0.13%
+	411201	Service Charge - Pawned OPI	25	0.00%
+	411202	Interest Income - Advance on OPI	"32,550.00"	0.01%
+	411501	Interest Income - Autoloan	"88,290.30"	0.03%
+	411502	Application Fee - Autoloan	"21,400.00"	0.01%
+	411503	Appraisal Fee - Autoloan	"1,000.00"	0.00%
+	411504	Penalty Fee and Other Fees - Autoloan	"11,032.20"	0.00%
+	411901	Storage Fee	0	0.00%
+	411902	Towing Fee	0	0.00%
+	411904	Notarial Fee	"1,500.00"	0.00%
+	421101	KP Sendout Income	"55,568.00"	0.02%
+	421102	KP Payout Income	"43,274.00"	0.01%
+	421103	KP Other Income	140	0.00%
+	422101	MCash Income	"7,737.52"	0.00%
+	423101	ML Express Income	"10,915.70"	0.00%
+	424101	Corporate Transactions' Commission	"195,910.25"	0.06%
+	425101	Payment Solution Commission	"20,425.00"	0.01%
+	426101	POS Commission	0	0.00%
+	427101	Domestic Partners Commission	"106,821.50"	0.03%
+	428101	Billspayment Commission	"62,565.00"	0.02%
+	429101	EPAY Transactions Commission	4.56	0.00%
+	431102	Commission from PhilLife	"1,108.60"	0.00%
+	431103	Commission from Medicare Plus	858.34	0.00%
+	431104	Commission from CTPL Insurance	"15,844.97"	0.00%
+	431105	Commission from Malayan Insurance	"8,480.00"	0.00%
+	431106	Commission from Maagap Insurance	"46,936.50"	0.01%
+	431107	Commission from Paramount Insurance	"6,330.00"	0.00%
+	441101	Sales - Jewelries	"104,372,096.52"	32.47%
+	442101	Sales - Food Products	"2,025.00"	0.00%
+	442201	Sales - Telco Products	"35,056.00"	0.01%
+	442204	Sales - Retailer Wallet	300	0.00%
+	443201	Service - Logistics / Cargo	111.25	0.00%
+	449101	Sales Returns and Allowances	"-536,758.64"	-0.17%
+	449102	Sales Discounts	"-34,790,075.71"	-10.82%
+	461101	Gain/Loss on Forex Currency	"169,485.29"	0.05%
+	491102	Interest on Bank Deposits	12.1	0.00%
+	491198	Other Income	"27,612.06"	0.01%
+	411505	Chattel Fees - Autoloan	"1,500.00"	0.00%
+	411506	Notarial Fees - Autoloan	"1,000.00"	0.00%
+Revenue	"73,267,189.85"			
+	511101	Cost of Sales - Jewelries	"30,634,488.82"	41.81%
+	512101	Cost of Sales - Food Products	"1,593.55"	0.00%
+	512201	Cost of Sales - Telco Products	"34,603.72"	0.05%
+	512204	Cost of Sales - Retailer Wallet	300	0.00%
+	513201	Cost of Sales - Logistics / Cargo	0	0.00%
+	521101	Salaries - Regular	"766,013.04"	1.05%
+	521102	Salaries - Probationary and Trainee	"120,721.57"	0.16%
+	521103	Overtime Expenses	"161,652.59"	0.22%
+	522101	SSS Expenses	"105,278.20"	0.14%
+	522102	PhilHealth Expenses	"22,807.25"	0.03%
+	522103	PagIBIG Expenses	"9,305.00"	0.01%
+	522201	Cost of Living Allowance/COLA	0	0.00%
+	522202	Officer's Allowance	"90,019.94"	0.12%
+	522203	Branch Manager's Allowance	"7,077.20"	0.01%
+	522207	Housing/Meal Allowance	"16,004.66"	0.02%
+	522301	A.L.L. Bonus	"101,205.01"	0.14%
+	522302	13th Month Bonus	"88,638.90"	0.12%
+	522303	Productivity Bonus	"13,751.95"	0.02%
+	522304	Receivable Incentives	"22,440.00"	0.03%
+	522305	Sales Incentives	"6,666.67"	0.01%
+	522306	Insurance Sales Incentives	"10,317.65"	0.01%
+	522310	Leave Conversion	"117,658.37"	0.16%
+	522501	Bank Interest	"2,834.00"	0.00%
+	522901	Building/Space Rental	"700,006.50"	0.96%
+	523101	Guard's Salary/Overtime	"108,973.86"	0.15%
+	523103	Agency Fee	"18,536.44"	0.03%
+	523105	SSMI/911 Alarm	"3,250.00"	0.00%
+	523106	Janitorial Salaries	"18,537.08"	0.03%
+	523201	Electric Bills	"68,725.51"	0.09%
+	523202	Water Bills	"4,472.56"	0.01%
+	523203	Mailing Expense	"-1,360.00"	0.00%
+	523204	Internet Charges	"7,761.35"	0.01%
+	523206	Cellular Charges	"42,253.59"	0.06%
+	523301	"Stationeries, Office and Cleaning Supplies"	"22,725.13"	0.03%
+	523302	Appraisal Supplies	"10,548.21"	0.01%
+	523401	Repairs and Maintenance	"80,597.64"	0.11%
+	523502	Fuel and Oil	"4,450.16"	0.01%
+	523701	Traveling Expenses	"5,265.13"	0.01%
+	523702	Transportation Expenses	"7,245.17"	0.01%
+	523801	Delivery and Freight Charges	119.99	0.00%
+	524203	Credit Card Merchant Fee	"358,154.94"	0.49%
+	524801	Miscellaneous Expense	"343,010.94"	0.47%
+	524904	Depreciation Expense - Leasehold Improvement	"78,071.10"	0.11%
+	524906	Depreciation Expense - Furnitures and Fixtures	"11,428.58"	0.02%
+	524907	"Depreciation Expense - Desktop, Laptop, Office and Appraisal Equipment"	"1,104.91"	0.00%
+	611101	HO Support Expenses	"10,237,321.02"	13.97%
+Expense	"44,464,577.90"			
+NET Income	"28,802,611.95"			
