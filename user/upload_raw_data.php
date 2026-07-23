@@ -57,17 +57,20 @@ define('COL_DESCRIPTION', 7);
 define('COL_AMOUNT', 8);
 
 // Function to get branch type from masterdata
-function getBranchType($branch_id) {
+function getBranchType(string $branch_id): string
+{
     global $conn; // Use MySQLi connection
     static $branch_cache = [];
-    
-    if (empty($branch_id)) return 'Unknown';
-    
+
+    if (empty($branch_id)) {
+        return 'Unknown';
+    }
+
     // Check cache first
     if (isset($branch_cache[$branch_id])) {
         return $branch_cache[$branch_id];
     }
-    
+
     try {
         // Query the branch_profile table
         $query = "SELECT branch_type FROM masterdata.branch_profile WHERE branch_id = ?";
@@ -76,15 +79,15 @@ function getBranchType($branch_id) {
         $stmt->execute();
         $result = $stmt->get_result();
         $row = $result->fetch_assoc();
-        
+
         if ($row) {
             $branch_type = $row['branch_type'] ?? 'Unknown';
             $branch_cache[$branch_id] = $branch_type;
             return $branch_type;
-        } else {
-            $branch_cache[$branch_id] = 'Unknown';
-            return 'Unknown';
         }
+
+        $branch_cache[$branch_id] = 'Unknown';
+        return 'Unknown';
     } catch (Exception $e) {
         error_log("Error fetching branch type for ID $branch_id: " . $e->getMessage());
         return 'Unknown';
@@ -355,7 +358,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
         .drop-zone {
             border: 2px dashed #f63b3b;
             border-radius: 12px;
-            padding: 15px 20px;
+            padding: 10px 20px;
             text-align: center;
             background: #f8fafc;
             cursor: pointer;
@@ -367,7 +370,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
             border-color: #c50000;
         }
         .drop-zone i {
-            font-size: 48px;
+            font-size: 30px;
             color: #f63b3b;
             margin-bottom: 12px;
         }
@@ -423,7 +426,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
             display: flex;
             gap: 10px;
             align-items: center;
-            margin-top: 15px;
+            margin-top: -.5%;
             flex-wrap: wrap;
         }
 
@@ -922,7 +925,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
 
                         <!-- Show column mapping for debugging -->
                         <?php if (!empty($column_mapping)): ?>
-                        <div class="column-mapping-info">
+                        <!-- <div class="column-mapping-info">
                             <i class="fa-solid fa-info-circle"></i> 
                             <strong>Fixed column mapping (positions):</strong> 
                             Region → <code>Column C (index 2)</code>, 
@@ -934,7 +937,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                             <span style="font-size: 12px; color: #64748b;">
                                 <i class="fa-solid fa-arrow-right"></i> Branch type is determined from masterdata.branch_profile using Branch ID
                             </span>
-                        </div>
+                        </div> -->
                         <?php endif; ?>
 
                         <div class="table-wrapper">

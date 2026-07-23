@@ -84,7 +84,6 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'get_areas') {
 
 // Fetch filter options
 $regions = $conn->query("SELECT DISTINCT region FROM comparative_report ORDER BY region ASC");
-// Don't fetch all areas initially - we'll load them via AJAX
 $areas = $conn->query("SELECT DISTINCT area FROM comparative_report ORDER BY area ASC");
 
 // Initialize filter variables
@@ -220,7 +219,6 @@ if (!empty($filter_areas)) {
             </section>
 
             <div class="reports-flex-container">
-                <!-- Rest of your HTML remains the same -->
                 <?php if (empty($_GET)): ?>
                     <div style="width: 100%; text-align: center; color: #999; padding: 40px;">
                         Select Transaction Type, Region, Area(s), & Month to view the report.
@@ -232,26 +230,29 @@ if (!empty($filter_areas)) {
                     <?php if (in_array($transaction_type, ['branch', 'all'])): ?>
                         <?php
                         $branch_where = "transaction_type = 'Branch'";
-                        $sql_groups = "SELECT DISTINCT area 
+                        $sql_groups = "SELECT DISTINCT area, region 
                                        FROM comparative_report 
                                        WHERE $branch_where $region_where $month_where $areas_in 
-                                       ORDER BY area ASC";
+                                       ORDER BY region ASC, area ASC";
                         $result_groups = $conn->query($sql_groups);
 
                         if ($result_groups && $result_groups->num_rows > 0):
                             $has_data = true;
                             while ($row = $result_groups->fetch_assoc()):
                                 $current_area = $row['area'];
+                                $current_region = $row['region'];
                                 $sql_data = "SELECT id, gl_code, gl_description, amount, adjusted_amount, new_amount, percentage 
                                              FROM comparative_report 
                                              WHERE area = '" . $conn->real_escape_string($current_area) . "'
+                                             AND region = '" . $conn->real_escape_string($current_region) . "'
                                              AND $branch_where $region_where $month_where
                                              ORDER BY gl_code ASC";
                                 $results = $conn->query($sql_data);
                         ?>
                                 <div class="report-table-wrapper">
                                     <div class="area-title">
-                                        Area: <?= htmlspecialchars($current_area) ?>
+                                        Region: <?= htmlspecialchars($current_region) ?> | Area: <?= htmlspecialchars($current_area) ?>
+                                        <span style="color:white; font-weight:500; font-size:14px;">(Branch)</span>
                                     </div>
                                     <table class="report-table">
                                         <thead>
@@ -287,7 +288,6 @@ if (!empty($filter_areas)) {
                                                         <td style="text-align: center;"><?= htmlspecialchars($data_row['percentage']); ?></td>
                                                     </tr>
                                                     <?php
-                                                    // Use new_amount for totals if available, otherwise use original amount
                                                     $amount_for_total = $data_row['amount'];
                                                     if ($gl_prefix == '4') {
                                                         $total_revenue += $amount_for_total;
@@ -317,7 +317,7 @@ if (!empty($filter_areas)) {
                                                 </tr>
                                             <?php else: ?>
                                                 <tr>
-                                                    <td colspan="6" style="text-align: center; color: red; padding: 20px; font-weight: bold;">
+                                                    <td colspan="4" style="text-align: center; color: red; padding: 20px; font-weight: bold;">
                                                         No data for this area.
                                                     </td>
                                                 </tr>
@@ -329,34 +329,33 @@ if (!empty($filter_areas)) {
                         <?php endif; ?>
                     <?php endif; ?>
 
-                    <!-- Showroom/Branch Tables (shown for 'showroom' or 'all') -->
+                    <!-- Showroom Tables (shown for 'showroom' or 'all') -->
                     <?php if (in_array($transaction_type, ['showroom', 'all'])): ?>
                         <?php
                         $showroom_where = "transaction_type = 'Showroom'";
-                        $sql_groups = "SELECT DISTINCT branch_name, area 
+                        $sql_groups = "SELECT DISTINCT area, region 
                                        FROM comparative_report 
                                        WHERE $showroom_where $region_where $month_where $areas_in 
-                                       ORDER BY area ASC, branch_name ASC";
+                                       ORDER BY region ASC, area ASC";
                         $result_groups = $conn->query($sql_groups);
 
                         if ($result_groups && $result_groups->num_rows > 0):
                             $has_data = true;
                             while ($row = $result_groups->fetch_assoc()):
-                                $current_branch = $row['branch_name'];
                                 $current_area = $row['area'];
+                                $current_region = $row['region'];
                                 $sql_data = "SELECT id, gl_code, gl_description, amount, adjusted_amount, new_amount, percentage 
                                              FROM comparative_report 
-                                             WHERE branch_name = '" . $conn->real_escape_string($current_branch) . "'
+                                             WHERE area = '" . $conn->real_escape_string($current_area) . "'
+                                             AND region = '" . $conn->real_escape_string($current_region) . "'
                                              AND $showroom_where $region_where $month_where
                                              ORDER BY gl_code ASC";
                                 $results = $conn->query($sql_data);
                         ?>
                                 <div class="report-table-wrapper">
-                                    <div class="area-title">
-                                        Showroom: <?= htmlspecialchars($current_branch) ?>
-                                        <span style="color:white; font-weight:500;">
-                                            (<?= htmlspecialchars($current_area) ?>)
-                                        </span>
+                                    <div class="area-title" style="background: #2c3e50;">
+                                        Region: <?= htmlspecialchars($current_region) ?> | Area: <?= htmlspecialchars($current_area) ?>
+                                        <span style="color:#f1c40f; font-weight:500; font-size:14px;">(Showroom)</span>
                                     </div>
                                     <table class="report-table">
                                         <thead>
@@ -421,8 +420,8 @@ if (!empty($filter_areas)) {
                                                 </tr>
                                             <?php else: ?>
                                                 <tr>
-                                                    <td colspan="6" style="text-align: center; color: red; padding: 20px; font-weight: bold;">
-                                                        No data for this branch.
+                                                    <td colspan="4" style="text-align: center; color: red; padding: 20px; font-weight: bold;">
+                                                        No data for this area.
                                                     </td>
                                                 </tr>
                                             <?php endif; ?>

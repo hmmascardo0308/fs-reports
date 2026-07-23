@@ -40,6 +40,20 @@ function stripCsvBom(mixed $value): mixed
     return $value;
 }
 
+function detectDelimiter(string $line): string
+{
+    $delimiters = [',', '|', "\t", ';'];
+    $counts = [];
+    
+    foreach ($delimiters as $delimiter) {
+        $counts[$delimiter] = substr_count($line, $delimiter);
+    }
+    
+    // Return the delimiter with the highest count
+    arsort($counts);
+    return key($counts);
+}
+
 function readCsvRows(string $path): array
 {
     $rows = [];
@@ -49,11 +63,24 @@ function readCsvRows(string $path): array
         throw new RuntimeException('Unable to open CSV file.');
     }
 
-    while (($row = fgetcsv($handle)) !== false) {
-        if (isset($row[0])) {
-            $row[0] = stripCsvBom($row[0]);
+    // Read first line to detect delimiter
+    $firstLine = fgets($handle);
+    rewind($handle);
+    
+    if ($firstLine === false) {
+        fclose($handle);
+        return [];
+    }
+    
+    $delimiter = detectDelimiter($firstLine);
+    
+    while (($row = fgetcsv($handle, 0, $delimiter)) !== false) {
+        // Clean up each cell - remove quotes, trim whitespace
+        foreach ($row as &$cell) {
+            $cell = trim($cell);
+            $cell = trim($cell, '"');
+            $cell = stripCsvBom($cell);
         }
-
         $rows[] = $row;
     }
 
@@ -73,6 +100,7 @@ function maxCsvColumns(array $rows): int
     return $maxCols;
 }
 
+// --- STAGE 1: UPLOAD & PREVIEW ---
 // --- STAGE 1: UPLOAD & PREVIEW ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
     $transactionMonth = $_POST['transaction_month'] ?? '';
@@ -120,10 +148,111 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                     continue;
                 }
 
-                $previewTable .= '<h4 class="file-name">Preview: ' . htmlspecialchars($singleFile['name']) . '</h4>';
-                $previewTable .= '<div class="table-container">';
-                $previewTable .= '<table class="excel-preview" style="margin-bottom: 20px; width: 100%; border-collapse: collapse;">';
+                // Extract metadata from rows 0, 1, 2
+                $regionID = trim($rows[0][0] ?? '');
+                $regionDescription = trim($rows[1][0] ?? '');
+                $area = trim($rows[2][0] ?? '');
 
+                // Clean up metadata
+                $regionID = str_replace(['Region ID:', 'Region ID :', '"', "'", ' '], '', $regionID);
+                $regionID = trim($regionID);
+                
+                $regionDescription = str_replace(['Region Description:', 'Region Description :', '"', "'"], '', $regionDescription);
+                $regionDescription = trim($regionDescription);
+                
+                $area = str_replace(['Area:', 'Area :', '"', "'"], '', $area);
+                $area = trim($area);
+
+                // Find where data actually starts
+                $glCodeCol = null;
+                $descriptionCol = null;
+                $dataStartRow = null;
+                $branchAmountCol = null;
+                $showroomAmountCol = null;
+                $percentageCol = null;
+                $headerRowIndex = null;
+
+                // First, find the header row with "GLCode" and "Description"
+                for ($i = 0; $i < min(15, count($rows)); $i++) {
+                    $row = $rows[$i] ?? [];
+                    $hasGLCode = false;
+                    $hasDescription = false;
+                    
+                    foreach ($row as $colIndex => $cell) {
+                        $cellClean = trim((string)$cell);
+                        if (stripos($cellClean, 'GLCode') !== false) {
+                            $glCodeCol = $colIndex;
+                            $hasGLCode = true;
+                        }
+                        if (stripos($cellClean, 'Description') !== false) {
+                            $descriptionCol = $colIndex;
+                            $hasDescription = true;
+                        }
+                        if (stripos($cellClean, 'Branch Amount') !== false) {
+                            $branchAmountCol = $colIndex;
+                        }
+                        if (stripos($cellClean, 'Showroom Amount') !== false) {
+                            $showroomAmountCol = $colIndex;
+                        }
+                        if (stripos($cellClean, '%') !== false) {
+                            $percentageCol = $colIndex;
+                        }
+                    }
+                    
+                    if ($hasGLCode && $hasDescription) {
+                        $headerRowIndex = $i;
+                        $dataStartRow = $i + 1;
+                        break;
+                    }
+                }
+
+                // If we still couldn't find the header, use default
+                if ($headerRowIndex === null) {
+                    // Look for "Category" row
+                    for ($i = 0; $i < min(10, count($rows)); $i++) {
+                        $row = $rows[$i] ?? [];
+                        foreach ($row as $colIndex => $cell) {
+                            $cellClean = trim((string)$cell);
+                            if (stripos($cellClean, 'Category') !== false) {
+                                // The next row might have GLCode and Description
+                                if (isset($rows[$i + 1])) {
+                                    $nextRow = $rows[$i + 1];
+                                    foreach ($nextRow as $colIdx => $cellVal) {
+                                        $cellValClean = trim((string)$cellVal);
+                                        if (stripos($cellValClean, 'GLCode') !== false) {
+                                            $glCodeCol = $colIdx;
+                                        }
+                                        if (stripos($cellValClean, 'Description') !== false) {
+                                            $descriptionCol = $colIdx;
+                                        }
+                                    }
+                                    if ($glCodeCol !== null && $descriptionCol !== null) {
+                                        $headerRowIndex = $i + 1;
+                                        $dataStartRow = $i + 2;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if ($headerRowIndex !== null) {
+                            break;
+                        }
+                    }
+                }
+
+                // If still not found, use defaults
+                if ($headerRowIndex === null) {
+                    $headerRowIndex = 4; // Assuming row 4 is the header (0-indexed)
+                    $dataStartRow = 5;
+                }
+                if ($glCodeCol === null) {
+                    $glCodeCol = 1;
+                }
+                if ($descriptionCol === null) {
+                    $descriptionCol = 2;
+                }
+
+                // Find where NET Income appears to stop
                 $cutoffRow = count($rows) - 1;
                 foreach ($rows as $rowIndex => $row) {
                     foreach ($row as $cell) {
@@ -134,37 +263,94 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                     }
                 }
 
-                $alignRightCols = [];
-                foreach ([1, 3] as $hIdx) {
-                    if (isset($rows[$hIdx])) {
-                        foreach ($rows[$hIdx] as $colKey => $cellValue) {
-                            $val = trim((string)$cellValue);
-                            if (stripos($val, 'Amount') !== false || $val === '%') {
-                                $alignRightCols[$colKey] = true;
+                // Build preview - METADATA SECTION
+                $previewTable .= '<div class="file-preview-container">';
+                $previewTable .= '<h4 class="file-name" style="colpr: white;">📄 Preview: ' . htmlspecialchars($singleFile['name']) . '</h4>';
+                
+                // Metadata section
+                $previewTable .= '<div class="metadata-section" style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #4a90d9;">';
+                $previewTable .= '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">';
+                $previewTable .= '<div><strong>🏷️ Region ID:</strong> <span style="color: #2d3748;">' . htmlspecialchars($regionID) . '</span></div>';
+                $previewTable .= '<div><strong>📍 Region Description:</strong> <span style="color: #2d3748;">' . htmlspecialchars($regionDescription) . '</span></div>';
+                $previewTable .= '<div><strong>📌 Area:</strong> <span style="color: #2d3748;">' . htmlspecialchars($area) . '</span></div>';
+                $previewTable .= '</div>';
+                $previewTable .= '</div>';
+
+                // DATA TABLE SECTION
+                $previewTable .= '<div class="table-container" style="max-height: 600px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 8px;">';
+                $previewTable .= '<table class="excel-preview" style="width: 100%; border-collapse: collapse;">';
+
+                // Show the header row first (with sticky positioning)
+                if (isset($rows[$headerRowIndex])) {
+                    $headerRow = $rows[$headerRowIndex];
+                    $previewTable .= '<thead><tr class="sticky-row-header" style="background: #ff0000;">';
+                    foreach ($headerRow as $colKey => $cell) {
+                        $previewTable .= '<th style="padding: 10px 12px; border: 1px solid #e2e8f0; font-weight: 600; text-align: left; white-space: nowrap; position: sticky; top: 0; background: #ff0000; z-index: 10;">' . htmlspecialchars($cell ?? '') . '</th>';
+                    }
+                    $previewTable .= '</tr></thead>';
+                }
+
+                // Show ALL data rows from dataStartRow to cutoffRow
+                $previewTable .= '<tbody>';
+                $rowCount = 0;
+                for ($rowIndex = $dataStartRow; $rowIndex <= $cutoffRow && $rowIndex < count($rows); $rowIndex++) {
+                    $row = $rows[$rowIndex];
+                    
+                    // Skip empty rows
+                    $isEmpty = true;
+                    foreach ($row as $cell) {
+                        if (!empty(trim($cell))) {
+                            $isEmpty = false;
+                            break;
+                        }
+                    }
+                    if ($isEmpty) {
+                        continue;
+                    }
+
+                    $rowCount++;
+                    $previewTable .= '<tr>';
+                    
+                    // Display all columns in the row
+                    foreach ($row as $colKey => $cell) {
+                        $style = 'padding: 8px 12px; border: 1px solid #e2e8f0;';
+                        // Style based on content
+                        $cellValue = trim($cell ?? '');
+                        if (is_numeric(str_replace(',', '', $cellValue))) {
+                            $style .= ' text-align: right;';
+                        }
+                        // Highlight GL Code column if it's numeric
+                        if ($colKey == $glCodeCol && !empty($cellValue) && is_numeric($cellValue)) {
+                            $style .= ' font-weight: 500; color: #2b6cb0;';
+                        }
+                        $previewTable .= "<td style='$style'>" . htmlspecialchars($cell ?? '') . "</td>";
+                    }
+                    
+                    // If row has fewer columns than header, add empty cells
+                    if (isset($rows[$headerRowIndex])) {
+                        $headerCount = count($rows[$headerRowIndex]);
+                        $currentCount = count($row);
+                        if ($currentCount < $headerCount) {
+                            for ($i = $currentCount; $i < $headerCount; $i++) {
+                                $previewTable .= "<td style='padding: 8px 12px; border: 1px solid #e2e8f0;'></td>";
                             }
                         }
                     }
-                }
-
-                foreach ($rows as $rowIndex => $row) {
-                    if ($rowIndex > $cutoffRow) {
-                        break;
-                    }
-
-                    $rowClass = ($rowIndex <= 1) ? 'sticky-row-' . ($rowIndex + 1) : '';
-                    $previewTable .= '<tr class="' . $rowClass . '">';
-
-                    foreach ($row as $colKey => $cell) {
-                        $tag = ($rowIndex === 0) ? 'th' : 'td';
-                        $style = isset($alignRightCols[$colKey]) ? 'text-align: right;' : '';
-                        $previewTable .= "<$tag style='$style'>" . htmlspecialchars($cell ?? '') . "</$tag>";
-                    }
-
+                    
                     $previewTable .= '</tr>';
                 }
+                $previewTable .= '</tbody>';
 
                 $previewTable .= '</table>';
                 $previewTable .= '</div>';
+                
+                // Summary section
+                $totalRows = count($rows);
+                $previewTable .= '<div class="summary-bar" style="padding: 10px; background: #f8f9fa; border-radius: 4px; margin-top: 10px; font-size: 14px; color: #4a5568;">';
+                $previewTable .= '<small>📊 <strong>Summary:</strong> Total rows: ' . $totalRows . ' | Data rows: ' . $rowCount . ' | Header at row: ' . ($headerRowIndex + 1) . ' | Metadata rows: 3 (Region ID, Region Description, Area)</small>';
+                $previewTable .= '</div>';
+                $previewTable .= '</div>';
+
             } catch (Exception $e) {
                 $uploadMessage = '<div class="error">Error: ' . $e->getMessage() . '</div>';
             }
@@ -205,13 +391,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
             $stmt = $conn->prepare("
                 INSERT INTO comparative_report
                 (gl_code, gl_description, amount, percentage, region, area, mainzone, zone, region_code,
-                 transaction_type, transaction_month, transaction_year, uploaded_by, branch_name,
-                 cost_center, bp_cost_center, branch_id, uploaded_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 transaction_type, transaction_month, transaction_year, uploaded_by, region_id,
+                 uploaded_date, gl_region)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ");
 
-            $checkStatusStmt = $conn->prepare("SELECT status FROM comparative_report WHERE region = ? AND mainzone <=> ? AND zone <=> ? AND transaction_type = ? AND transaction_month <=> ? AND status_void IS NULL LIMIT 1");
-            $voidStmt = $conn->prepare("UPDATE comparative_report SET status = 'Locked', locked_by = ?, locked_date = ?, status_void = 'Void', voided_by = ?, voided_at = ? WHERE region = ? AND mainzone <=> ? AND zone <=> ? AND transaction_type = ? AND transaction_month <=> ? AND status_void IS NULL");
+            $checkStatusStmt = $conn->prepare("SELECT status FROM comparative_report WHERE region_id = ? AND area = ? AND transaction_type = ? AND transaction_month <=> ? AND status_void IS NULL LIMIT 1");
+            
+            $voidStmt = $conn->prepare("UPDATE comparative_report SET status = 'Locked', locked_by = ?, locked_date = ?, status_void = 'Void', voided_by = ?, voided_at = ? WHERE region_id = ? AND area = ? AND transaction_type = ? AND transaction_month <=> ? AND status_void IS NULL");
 
             foreach ($paths as $path) {
                 if (!file_exists($path)) {
@@ -225,149 +412,191 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
 
                 $maxCols = maxCsvColumns($rows);
 
-                for ($colStart = 0; $colStart < $maxCols; $colStart += 6) {
-                    $headerString = $rows[0][$colStart] ?? '';
-                    $region = $region_code = $area = $branch_name = $cost_center = $bp_cost_center = $mainzone = $zone = null;
-                    $transaction_type = null;
-                    $branch_id = null;
-                    $dataStartRow = 2; // Default for old and showroom formats
+                // Extract Region ID from A1 (row 0, col 0)
+                $regionID = trim($rows[0][0] ?? '');
+                $regionID = str_replace(['Region ID:', 'Region ID :', '"', "'", ' '], '', $regionID);
+                $regionID = trim($regionID);
+                $regionID = preg_replace('/[^0-9]/', '', $regionID);
+                
+                // Extract Region Description from row 1, col 0
+                $glRegion = trim($rows[1][0] ?? '');
+                $glRegion = str_replace(['Region Description:', 'Region Description :', '"', "'"], '', $glRegion);
+                $glRegion = trim($glRegion);
+                
+                // Extract Area from row 2, col 0
+                $area = trim($rows[2][0] ?? '');
+                $area = str_replace(['Area:', 'Area :', '"', "'"], '', $area);
+                $area = trim($area);
 
-                    // --- NEW FORMAT: 3 rows for Region info ---
-                    if (preg_match('/Region\s*Code/i', $rows[0][$colStart] ?? '') &&
-                        preg_match('/Region\s*Description/i', $rows[1][$colStart] ?? '') &&
-                        preg_match('/Area/i', $rows[2][$colStart] ?? '')) {
-                        
-                        $extracted_region_code = trim($rows[0][$colStart + 1] ?? '');
-                        $region_code = $extracted_region_code;
-                        $area = strtoupper(trim($rows[2][$colStart + 1] ?? ''));
-                        $transaction_type = 'Branch';
-                        $dataStartRow = 4;
+                // Lookup region details from masterdata.branch_profile
+                $region = $region_code = $mainzone = $zone = null;
 
-                        // Look up details from masterdata.region_masterfile using region_code
-                        $lookup_sql = "SELECT region_description, mainzone, zone_code FROM masterdata.region_masterfile WHERE region_code = ? LIMIT 1";
-                        $lookup_stmt = $conn->prepare($lookup_sql);
-                        if ($lookup_stmt) {
-                            $res_region = $res_mainzone = $res_zone = null;
-                            $lookup_stmt->bind_param("s", $extracted_region_code);
-                            $lookup_stmt->execute();
-                            $lookup_stmt->bind_result($res_region, $res_mainzone, $res_zone);
-                            if ($lookup_stmt->fetch()) {
-                                $region = $res_region;
-                                $mainzone = $res_mainzone;
-                                $zone = $res_zone;
-                            } else {
-                                $region = trim($rows[1][$colStart + 1] ?? ''); // Fallback if not found in masterfile
+if (!empty($regionID) && !empty($area)) {
+    $lookup_sql = "SELECT region, region_code, mainzone, zone
+                   FROM masterdata.branch_profile
+                   WHERE regionID_MLmatic = ? AND area = ?
+                   LIMIT 1";
+
+    $lookup_stmt = $conn->prepare($lookup_sql);
+
+    if ($lookup_stmt) {
+        $lookup_stmt->bind_param("ss", $regionID, $area);
+
+        $lookup_stmt->execute();
+
+        // Initialize variables first
+        $lookup_region = null;
+        $lookup_region_code = null;
+        $lookup_mainzone = null;
+        $lookup_zone = null;
+
+        $lookup_stmt->bind_result(
+            $lookup_region,
+            $lookup_region_code,
+            $lookup_mainzone,
+            $lookup_zone
+        );
+
+        if ($lookup_stmt->fetch()) {
+            $region = $lookup_region;
+            $region_code = $lookup_region_code;
+            $mainzone = $lookup_mainzone;
+            $zone = $lookup_zone;
+        }
+
+        $lookup_stmt->close();
+    }
+}
+
+                // If lookup failed, try to find region_code from region_masterfile
+                if (empty($region_code) && !empty($glRegion)) {
+                    $rc_sql = "SELECT region_code FROM masterdata.region_masterfile WHERE region_description = ? LIMIT 1";
+                    $rc_stmt = $conn->prepare($rc_sql);
+                    if ($rc_stmt) {
+                        $found_region_code = null;
+                        $rc_stmt->bind_param("s", $glRegion);
+                        $rc_stmt->execute();
+                        $rc_stmt->bind_result($found_region_code);
+                        if ($rc_stmt->fetch()) {
+                            $region_code = $found_region_code;
+                            if (empty($region)) {
+                                $region = $glRegion;
                             }
-                            $lookup_stmt->close();
+                        }
+                        $rc_stmt->close();
+                    }
+                }
+
+                if ($region === null || $area === null || $region_code === null) {
+                    continue;
+                }
+
+                // Find where the data starts
+                $glCodeCol = null;
+                $descriptionCol = null;
+                $branchAmountCol = null;
+                $showroomAmountCol = null;
+                $percentageCol = null;
+                $dataStartRow = null;
+
+                for ($i = 0; $i < min(10, count($rows)); $i++) {
+                    $row = $rows[$i] ?? [];
+                    foreach ($row as $colIndex => $cell) {
+                        $cellClean = trim((string)$cell);
+                        if (stripos($cellClean, 'GLCode') !== false) {
+                            $glCodeCol = $colIndex;
+                        }
+                        if (stripos($cellClean, 'Description') !== false) {
+                            $descriptionCol = $colIndex;
+                        }
+                        if (stripos($cellClean, 'Branch Amount') !== false) {
+                            $branchAmountCol = $colIndex;
+                        }
+                        if (stripos($cellClean, 'Showroom Amount') !== false) {
+                            $showroomAmountCol = $colIndex;
+                        }
+                        if (stripos($cellClean, '%') !== false) {
+                            $percentageCol = $colIndex;
                         }
                     }
-                    // --- OLD FORMAT: Region | Area ---
-                    elseif (preg_match('/Region\s*:\s*(.*?)\s*\|\s*Area\s*:\s*(.*)/i', $headerString, $matches)) {
-                        $region = trim($matches[1]);
-                        $area = strtoupper(trim($matches[2]));
-                        $transaction_type = 'Branch';
+                    
+                    if ($glCodeCol !== null && $descriptionCol !== null) {
+                        $dataStartRow = $i + 1;
+                        break;
+                    }
+                }
 
-                        // Lookup for old format from branch_profile using region name
-                        if (!empty($region)) {
-                            $lookup_sql = "SELECT mainzone, zone FROM masterdata.branch_profile WHERE region = ? LIMIT 1";
-                            $lookup_stmt = $conn->prepare($lookup_sql);
-                            if ($lookup_stmt) {
-                                $lookup_stmt->bind_param("s", $region);
-                                $lookup_stmt->execute();
-                                $lookup_stmt->bind_result($mainzone, $zone);
-                                $lookup_stmt->fetch();
-                                $lookup_stmt->close();
-                            }
-                        }
-                    } elseif (preg_match('/Branch\s*:\s*(.*?)\s*\|\s*Cost\s*Center\s*:\s*(.*)/i', $headerString, $matches)) {
-                        $branch_name = trim($matches[1]);
-                        $cc_raw = trim($matches[2]);
-                        $transaction_type = 'Showroom';
-
-                        if (!preg_match('/^\d+$/', $cc_raw)) {
-                            continue;
-                        }
-
-                        $cost_center = $cc_raw;
-                        $cc_padded = str_pad($cc_raw, 3, '0', STR_PAD_LEFT);
-                        $bp_cost_center = '0001-' . $cc_padded;
-
-                        if ($cc_raw == 844) {
-                            if (strpos($branch_name, 'ML SM CITY NAGA') !== false) {
-                                $region = 'Camacat Region';
-                                $area = 'A';
-                                $mainzone = 'LNCR';
-                                $zone = 'LZN';
-                                $branch_id = 2160;
-                            } elseif (strpos($branch_name, 'ML IL CORSO CEBU JEWELLERS') !== false) {
-                                $region = 'Cebu Central Region A';
-                                $area = 'A';
-                                $mainzone = 'VISMIN';
-                                $zone = 'VIS';
-                                $branch_id = 5001;
-                            } else {
-                                $lookup_sql = "SELECT region, area, mainzone, zone, branch_id FROM masterdata.branch_profile WHERE cost_center = ? LIMIT 1";
-                                $lookup_stmt = $conn->prepare($lookup_sql);
-                                if ($lookup_stmt) {
-                                    $lookup_region = $lookup_area = $lookup_mainzone = $lookup_zone = $lookup_branch_id = null;
-                                    $lookup_stmt->bind_param("s", $bp_cost_center);
-                                    $lookup_stmt->execute();
-                                    $lookup_stmt->bind_result($lookup_region, $lookup_area, $lookup_mainzone, $lookup_zone, $lookup_branch_id);
-                                    if ($lookup_stmt->fetch()) {
-                                        $region = $lookup_region;
-                                        $area = strtoupper($lookup_area ?? '');
-                                        $mainzone = $lookup_mainzone;
-                                        $zone = $lookup_zone;
-                                        $branch_id = $lookup_branch_id;
+                if ($dataStartRow === null) {
+                    for ($i = 0; $i < min(10, count($rows)); $i++) {
+                        $row = $rows[$i] ?? [];
+                        foreach ($row as $colIndex => $cell) {
+                            $cellClean = trim((string)$cell);
+                            if (stripos($cellClean, 'Category') !== false) {
+                                if (isset($rows[$i + 1])) {
+                                    $nextRow = $rows[$i + 1];
+                                    foreach ($nextRow as $colIdx => $cellVal) {
+                                        $cellValClean = trim((string)$cellVal);
+                                        if (stripos($cellValClean, 'GLCode') !== false) {
+                                            $glCodeCol = $colIdx;
+                                        }
+                                        if (stripos($cellValClean, 'Description') !== false) {
+                                            $descriptionCol = $colIdx;
+                                        }
                                     }
-                                    $lookup_stmt->close();
+                                    if ($glCodeCol !== null && $descriptionCol !== null) {
+                                        $dataStartRow = $i + 2;
+                                        break;
+                                    }
                                 }
                             }
-                        } else {
-                            $lookup_sql = "SELECT region, area, mainzone, zone, branch_id FROM masterdata.branch_profile WHERE cost_center = ? LIMIT 1";
-                            $lookup_stmt = $conn->prepare($lookup_sql);
-                            if ($lookup_stmt) {
-                                $lookup_region = $lookup_area = $lookup_mainzone = $lookup_zone = $lookup_branch_id = null;
-                                $lookup_stmt->bind_param("s", $bp_cost_center);
-                                $lookup_stmt->execute();
-                                $lookup_stmt->bind_result($lookup_region, $lookup_area, $lookup_mainzone, $lookup_zone, $lookup_branch_id);
-                                if ($lookup_stmt->fetch()) {
-                                    $region = $lookup_region;
-                                    $area = strtoupper($lookup_area ?? '');
-                                    $mainzone = $lookup_mainzone;
-                                    $zone = $lookup_zone;
-                                    $branch_id = $lookup_branch_id;
-                                }
-                                $lookup_stmt->close();
-                            }
+                        }
+                        if ($dataStartRow !== null) {
+                            break;
                         }
                     }
+                }
 
-                    // Look up region_code based on region value (region_description) if not already set (e.g. for fallback or older formats)
-                    if (!empty($region) && empty($region_code)) {
-                        $rc_sql = "SELECT region_code FROM masterdata.region_masterfile WHERE region_description = ? LIMIT 1";
-                        $rc_stmt = $conn->prepare($rc_sql);
-                        if ($rc_stmt) {
-                            $found_region_code = null;
-                            $rc_stmt->bind_param("s", $region);
-                            $rc_stmt->execute();
-                            $rc_stmt->bind_result($found_region_code);
-                            if ($rc_stmt->fetch()) {
-                                $region_code = $found_region_code;
-                            }
-                            $rc_stmt->close();
+                if ($glCodeCol === null) {
+                    $glCodeCol = 1;
+                }
+                if ($descriptionCol === null) {
+                    $descriptionCol = 2;
+                }
+                if ($dataStartRow === null) {
+                    $dataStartRow = 5;
+                }
+
+                // Find where NET Income appears
+                $cutoffRow = count($rows) - 1;
+                foreach ($rows as $rowIndex => $row) {
+                    foreach ($row as $cell) {
+                        if (stripos(trim((string)$cell), 'NET Income') !== false) {
+                            $cutoffRow = $rowIndex;
+                            break 2;
                         }
                     }
+                }
 
-                    if ($region === null || $area === null) {
-                        continue;
-                    }
+                // Process data rows
+                $transactionTypes = [];
+                if ($branchAmountCol !== null) {
+                    $transactionTypes[] = ['type' => 'Branch', 'col' => $branchAmountCol];
+                }
+                if ($showroomAmountCol !== null) {
+                    $transactionTypes[] = ['type' => 'Showroom', 'col' => $showroomAmountCol];
+                }
 
-                    $groupKey = $region . '|' . ($mainzone ?? 'NULL') . '|' . ($zone ?? 'NULL') . '|' . $transaction_type . '|' . ($dbTransactionMonth ?? 'NULL');
+                if (empty($transactionTypes)) {
+                    continue;
+                }
 
+                // Check for existing records
+                foreach ($transactionTypes as $tt) {
+                    $groupKey = $regionID . '|' . $area . '|' . $tt['type'] . '|' . ($dbTransactionMonth ?? 'NULL');
+                    
                     if (!in_array($groupKey, $checkedGroups)) {
                         $existingStatus = null;
-                        $checkStatusStmt->bind_param("sssss", $region, $mainzone, $zone, $transaction_type, $dbTransactionMonth);
+                        $checkStatusStmt->bind_param("ssss", $regionID, $area, $tt['type'], $dbTransactionMonth);
                         $checkStatusStmt->execute();
                         $checkStatusStmt->store_result();
 
@@ -376,73 +605,120 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                             $checkStatusStmt->fetch();
 
                             if ($existingStatus === 'Locked') {
-                                $lockedRegions[] = $region;
+                                $lockedRegions[] = $regionID . '-' . $area . '-' . $tt['type'];
                             } elseif (!$forceInsert) {
-                                $existingRegions[] = $region;
+                                $existingRegions[] = $regionID . '-' . $area . '-' . $tt['type'];
                             }
                         }
-
+                        $checkStatusStmt->free_result();
                         $checkedGroups[] = $groupKey;
                     }
-                    $checkStatusStmt->free_result();
+                }
 
-                    if (in_array($region, $lockedRegions) || (in_array($region, $existingRegions) && !$forceInsert)) {
+                $regionLocked = false;
+                foreach ($transactionTypes as $tt) {
+                    if (in_array($regionID . '-' . $area . '-' . $tt['type'], $lockedRegions)) {
+                        $regionLocked = true;
+                        break;
+                    }
+                }
+                if ($regionLocked) {
+                    continue;
+                }
+
+                if ($forceInsert) {
+                    foreach ($transactionTypes as $tt) {
+                        $groupKey = $regionID . '|' . $area . '|' . $tt['type'] . '|' . ($dbTransactionMonth ?? 'NULL');
+                        if (!in_array($groupKey, $voidedGroups)) {
+                            $voidStmt->bind_param(
+                                "ssssssss",
+                                $uploadedBy,
+                                $uploadedDate,
+                                $uploadedBy,
+                                $uploadedDate,
+                                $regionID,
+                                $area,
+                                $tt['type'],
+                                $dbTransactionMonth
+                            );
+                            $voidStmt->execute();
+                            $voidedGroups[] = $groupKey;
+                        }
+                    }
+                } else {
+                    $hasExisting = false;
+                    foreach ($transactionTypes as $tt) {
+                        if (in_array($regionID . '-' . $area . '-' . $tt['type'], $existingRegions)) {
+                            $hasExisting = true;
+                            break;
+                        }
+                    }
+                    if ($hasExisting) {
+                        continue;
+                    }
+                }
+
+                // Process data rows
+                for ($rowIndex = $dataStartRow; $rowIndex < count($rows) && $rowIndex <= $cutoffRow; $rowIndex++) {
+                    $row = $rows[$rowIndex] ?? [];
+                    
+                    $rowString = implode(' ', $row);
+                    if (stripos($rowString, 'NET Income') !== false) {
+                        break;
+                    }
+
+                    $isEmpty = true;
+                    foreach ($row as $cell) {
+                        if (!empty(trim($cell))) {
+                            $isEmpty = false;
+                            break;
+                        }
+                    }
+                    if ($isEmpty) {
                         continue;
                     }
 
-                    if ($forceInsert && !in_array($groupKey, $voidedGroups)) {
-                        $voidStmt->bind_param(
-                            "sssssssss",
-                            $uploadedBy,
-                            $uploadedDate,
-                            $uploadedBy,
-                            $uploadedDate,
-                            $region,
-                            $mainzone,
-                            $zone,
-                            $transaction_type,
-                            $dbTransactionMonth
-                        );
-                        $voidStmt->execute();
-                        $voidedGroups[] = $groupKey;
+                    $glCode = isset($row[$glCodeCol]) ? trim($row[$glCodeCol]) : '';
+                    $description = isset($row[$descriptionCol]) ? trim($row[$descriptionCol]) : '';
+
+                    if (empty($glCode) || !is_numeric($glCode) || empty($description)) {
+                        continue;
                     }
 
-                    for ($rowIndex = $dataStartRow; $rowIndex < count($rows); $rowIndex++) {
-                        $row = $rows[$rowIndex] ?? [];
-                        $glCode = trim($row[$colStart + 1] ?? '');
-                        $description = trim($row[$colStart + 2] ?? '');
+                    foreach ($transactionTypes as $tt) {
+                        if (isset($row[$tt['col']])) {
+                            $amountValue = trim($row[$tt['col']] ?? '0');
+                            $amount = (float)str_replace([',', ' ', '₱', '$', '(', ')'], '', $amountValue);
+                            
+                            if (strpos($amountValue, '(') !== false && strpos($amountValue, ')') !== false) {
+                                $amount = -$amount;
+                            }
+                            
+                            $percentage = $percentageCol !== null ? trim($row[$percentageCol] ?? '0') : '0';
+                            
+                            $stmt->bind_param(
+                                "ssdsssssssssssss",
+                                $glCode,
+                                $description,
+                                $amount,
+                                $percentage,
+                                $region,
+                                $area,
+                                $mainzone,
+                                $zone,
+                                $region_code,
+                                $tt['type'],
+                                $dbTransactionMonth,
+                                $dbTransactionYear,
+                                $uploadedBy,
+                                $regionID,
+                                $uploadedDate,
+                                $glRegion
+                            );
 
-                        if (empty($glCode) || !is_numeric($glCode) || empty($description)) {
-                            continue;
-                        }
-
-                        $amount = (float)str_replace([',', ' '], '', $row[$colStart + 3] ?? '0');
-                        $percentage = trim($row[$colStart + 4] ?? '0');
-
-                        $stmt->bind_param(
-                            "ssdsssssssssssssss",
-                            $glCode,
-                            $description,
-                            $amount,
-                            $percentage,
-                            $region,
-                            $area,
-                            $mainzone,
-                            $zone,
-                            $region_code,
-                            $transaction_type,
-                            $dbTransactionMonth,
-                            $dbTransactionYear,
-                            $uploadedBy,
-                            $branch_name,
-                            $cost_center,
-                            $bp_cost_center,
-                            $branch_id,
-                            $uploadedDate
-                        );
-
-                        if ($stmt->execute()) {
-                            $insertCount++;
+                            if ($stmt->execute()) {
+                                $insertCount++;
+                            }
                         }
                     }
                 }
@@ -509,7 +785,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
     }
 }
 ?>
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -518,8 +793,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
     <title>Comparative Report CSV</title>
     <link rel="icon" href="../images/MLW%20Logo.png" type="image/png"/>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-    <link rel="stylesheet" href="css/comparative.css?v=<?= time(); ?>">
+    <link rel="stylesheet" href="css/comparative_csv.css?v=<?= time(); ?>">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
 </head>
 <body>
     <main class="main-content">
