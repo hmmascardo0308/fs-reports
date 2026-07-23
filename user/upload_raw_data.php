@@ -15,6 +15,7 @@ if (isset($_GET['reset']) && $_GET['reset'] == '1') {
     unset($_SESSION['error_message']);
     unset($_SESSION['summary_data']);
     unset($_SESSION['column_mapping']);
+    unset($_SESSION['remarks_data']);
     header("Location: upload_raw_data.php");
     exit;
 }
@@ -38,10 +39,10 @@ $id_number = $_SESSION['id_number'] ?? "unknown";
 $full_name = $_SESSION['full_name'] ?? "unknown";
 $user_type = $_SESSION['user_type'] ?? "unknown";
 
-// Expected headers in Row 1 (for display only, not used for mapping)
-$expected_headers = [
-    'Date', 'Zone', 'Region', 'Area', 'Branch', 
-    'BranchID', 'Code', 'Description', 'Total Amount'
+// Hardcoded column headers for display only
+$display_headers = [
+    'Date', 'Zone', 'Region', 'Area', 'Branch Name', 
+    'Branch ID', 'GL Code', 'GL Description', 'Total Amount'
 ];
 
 // Fixed column positions (0-indexed)
@@ -98,8 +99,9 @@ $parsed_data = [];
 $uploaded_headers = [];
 $error_message = '';
 $success_message = '';
-$view_mode = isset($_GET['view']) ? $_GET['view'] : 'raw'; // raw or summary
+$view_mode = isset($_GET['view']) ? $_GET['view'] : 'raw'; // raw, summary, or remarks
 $summary_data = [];
+$remarks_data = [];
 $column_mapping = [];
 
 // Pagination variables
@@ -126,6 +128,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file_upload'])) {
 
                 if (!empty($rows)) {
                     $first_row = array_shift($rows);
+                    // Store the actual headers from the file (for display purposes)
                     $uploaded_headers = array_map('trim', array_filter($first_row));
 
                     // Clean up headers - remove empty values and normalize
@@ -166,25 +169,55 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file_upload'])) {
 
                     // Build summary data from ALL rows - Group by Region, Area, Code, Branch Type
                     $summary_data = [];
-                    foreach ($parsed_data as $row) {
+                    $remarks_data = [];
+                    
+                    foreach ($parsed_data as $row_index => $row) {
                         // Get values using fixed column positions
                         $region = isset($row[COL_REGION]) ? trim($row[COL_REGION]) : 'Unknown Region';
                         $area = isset($row[COL_AREA]) ? trim($row[COL_AREA]) : 'Unknown Area';
                         $code = isset($row[COL_CODE]) ? trim($row[COL_CODE]) : 'Unknown Code';
                         $branch_id = isset($row[COL_BRANCH_ID]) ? trim($row[COL_BRANCH_ID]) : '';
+                        $branch_name = isset($row[COL_BRANCH]) ? trim($row[COL_BRANCH]) : '';
+                        $date = isset($row[COL_DATE]) ? trim($row[COL_DATE]) : '';
+                        $amount_str = isset($row[COL_AMOUNT]) ? trim($row[COL_AMOUNT]) : '0';
+                        $amount_str = str_replace(['₱', 'PHP', '$', ',', ' '], '', $amount_str);
+                        $amount = floatval($amount_str);
                         
                         // Get branch type from masterdata
                         $branch_type = getBranchType($branch_id);
                         
-                        // Handle amount - remove currency symbols and commas
-                        $amount_str = isset($row[COL_AMOUNT]) ? trim($row[COL_AMOUNT]) : '0';
-                        $amount_str = str_replace(['₱', 'PHP', '$', ',', ' '], '', $amount_str);
-                        $amount = floatval($amount_str);
+                        // If branch type is Unknown, add to remarks data
+                        if ($branch_type === 'Unknown' && !empty($branch_id)) {
+                            $key = $region . '|' . $area . '|' . $code . '|' . $branch_id;
+                            
+                            if (!isset($remarks_data[$key])) {
+                                $remarks_data[$key] = [
+                                    'region' => $region,
+                                    'area' => $area,
+                                    'code' => $code,
+                                    'branch_id' => $branch_id,
+                                    'branch_name' => $branch_name,
+                                    'date' => $date,
+                                    'total_amount' => 0,
+                                    'row_count' => 0,
+                                    'transactions' => [] // Store individual transactions for reference
+                                ];
+                            }
+                            
+                            $remarks_data[$key]['total_amount'] += $amount;
+                            $remarks_data[$key]['row_count']++;
+                            $remarks_data[$key]['transactions'][] = [
+                                'date' => $date,
+                                'branch_name' => $branch_name,
+                                'amount' => $amount
+                            ];
+                        }
 
-                        $key = $region . '|' . $area . '|' . $code . '|' . $branch_type;
+                        // Continue with summary data for non-unknown branch types
+                        $summary_key = $region . '|' . $area . '|' . $code . '|' . $branch_type;
                         
-                        if (!isset($summary_data[$key])) {
-                            $summary_data[$key] = [
+                        if (!isset($summary_data[$summary_key])) {
+                            $summary_data[$summary_key] = [
                                 'region' => $region,
                                 'area' => $area,
                                 'code' => $code,
@@ -200,16 +233,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file_upload'])) {
                         
                         // Add to appropriate totals based on branch type
                         if (strtolower($branch_type) === 'branch' || $branch_type === 'Branch') {
-                            $summary_data[$key]['branch_total'] += $amount;
-                            $summary_data[$key]['branch_count']++;
+                            $summary_data[$summary_key]['branch_total'] += $amount;
+                            $summary_data[$summary_key]['branch_count']++;
                         } elseif (strtolower($branch_type) === 'showroom' || $branch_type === 'Showroom') {
-                            $summary_data[$key]['showroom_total'] += $amount;
-                            $summary_data[$key]['showroom_count']++;
+                            $summary_data[$summary_key]['showroom_total'] += $amount;
+                            $summary_data[$summary_key]['showroom_count']++;
                         }
                         
                         // Always add to total
-                        $summary_data[$key]['total_amount'] += $amount;
-                        $summary_data[$key]['total_count']++;
+                        $summary_data[$summary_key]['total_amount'] += $amount;
+                        $summary_data[$summary_key]['total_count']++;
                     }
 
                     // Sort summary by Region, then Area, then Code, then Branch Type
@@ -219,17 +252,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file_upload'])) {
                         if ($a['code'] != $b['code']) return strcmp($a['code'], $b['code']);
                         return strcmp($a['branch_type'], $b['branch_type']);
                     });
+                    
+                    // Sort remarks data by Region, Area, Code
+                    usort($remarks_data, function($a, $b) {
+                        if ($a['region'] != $b['region']) return strcmp($a['region'], $b['region']);
+                        if ($a['area'] != $b['area']) return strcmp($a['area'], $b['area']);
+                        if ($a['code'] != $b['code']) return strcmp($a['code'], $b['code']);
+                        return strcmp($a['branch_id'], $b['branch_id']);
+                    });
 
                     $_SESSION['parsed_data'] = $parsed_data;
                     $_SESSION['uploaded_headers'] = $uploaded_headers;
                     $_SESSION['total_rows'] = count($parsed_data);
                     $_SESSION['file_name'] = $file_name;
                     $_SESSION['summary_data'] = $summary_data;
+                    $_SESSION['remarks_data'] = $remarks_data;
                     $_SESSION['column_mapping'] = $column_mapping;
                     
                     // Show debug info
                     $debug_info = "Fixed column mapping: Region=Column C (index 2), Area=Column D (index 3), Code=Column G (index 6), Amount=Column I (index 8), Branch ID=Column F (index 5)";
-                    $_SESSION['success_message'] = "File <strong>" . htmlspecialchars($file_name) . "</strong> parsed successfully! Previewing " . count($parsed_data) . " rows. " . $debug_info;
+                    $unknown_count = count($remarks_data);
+                    $_SESSION['success_message'] = "File <strong>" . htmlspecialchars($file_name) . "</strong> parsed successfully! Previewing " . count($parsed_data) . " rows. Found <strong>$unknown_count</strong> unknown branch types. " . $debug_info;
 
                     $current_page = 1;
                     $success_message = $_SESSION['success_message'];
@@ -258,6 +301,7 @@ if (isset($_SESSION['parsed_data']) && empty($parsed_data)) {
     $success_message = $_SESSION['success_message'] ?? '';
     $error_message = $_SESSION['error_message'] ?? '';
     $summary_data = $_SESSION['summary_data'] ?? [];
+    $remarks_data = $_SESSION['remarks_data'] ?? [];
     $column_mapping = $_SESSION['column_mapping'] ?? [];
 }
 
@@ -327,6 +371,14 @@ $page_rows = array_slice($parsed_data, $offset, $rows_per_page);
 
 // For summary view, we want to show all data without pagination
 $summary_total_rows = count($summary_data);
+
+// Calculate grand total for raw data view
+$grand_total_amount = 0;
+foreach ($parsed_data as $row) {
+    $amount_str = isset($row[COL_AMOUNT]) ? trim($row[COL_AMOUNT]) : '0';
+    $amount_str = str_replace(['₱', 'PHP', '$', ',', ' '], '', $amount_str);
+    $grand_total_amount += floatval($amount_str);
+}
 
 // Clear session messages after displaying
 if (isset($_SESSION['success_message']) && empty($_POST)) {
@@ -462,6 +514,18 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
             background: #f1f5f9;
             border-color: #94a3b8;
         }
+        .view-toggle .btn-toggle.remarks-tab {
+            border-color: #e2e8f0;
+        }
+        .view-toggle .btn-toggle.remarks-tab.active {
+            background: #ff0000;
+            border-color: #ff0000;
+            color: white;
+        }
+        .view-toggle .btn-toggle.remarks-tab:hover:not(.active) {
+            background: #fff6f6;
+            border-color: #797878;
+        }
 
         .pagination-container {
             display: flex;
@@ -520,6 +584,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
         }
         .alert-danger { background-color: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
         .alert-success { background-color: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; }
+        .alert-warning { background-color: #fffbeb; color: #92400e; border: 1px solid #fde68a; }
 
         .table-wrapper {
             margin-top: 20px;
@@ -578,6 +643,18 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
             background-color: #e5e7eb !important;
             font-weight: 700;
         }
+        /* Grand total row for raw data */
+        .preview-table tr.raw-grand-total td {
+            border-top: 3px solid #dc2626;
+            border-bottom: 3px solid #dc2626;
+            background-color: #fef2f2 !important;
+            font-weight: 700;
+            color: #dc2626;
+        }
+        .preview-table tr.raw-grand-total td:last-child {
+            color: #dc2626;
+            font-size: 15px;
+        }
 
         .badge-header {
             display: inline-block;
@@ -586,9 +663,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
             font-size: 11px;
             margin-left: 5px;
         }
-        .badge-valid { background-color: #dcfce7; color: #15803d; }
-        .badge-invalid { background-color: #fee2e2; color: #b91c1c; }
-        
+
         .row-number {
             color: #94a3b8;
             font-weight: bold;
@@ -616,6 +691,10 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
         }
         .summary-stats .stat-item strong {
             color: #1e293b;
+        }
+        .summary-stats .stat-item .grand-total-value {
+            color: #dc2626;
+            font-size: 16px;
         }
 
         .empty-state {
@@ -715,16 +794,16 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
             font-weight: 600;
         }
         .branch-type-badge.branch {
-            background-color: #dbeafe;
-            color: #1e40af;
+            background-color: #fedbdb;
+            color: #af1e1e;
         }
         .branch-type-badge.showroom {
-            background-color: #fce7f3;
-            color: #9d174d;
+            background-color: #ff0000;
+            color: #ffffff;
         }
         .branch-type-badge.unknown {
-            background-color: #f3f4f6;
-            color: #6b7280;
+            background-color: #fef3c7;
+            color: #92400e;
         }
         .amount-column {
             text-align: right;
@@ -734,10 +813,10 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
             text-align: center;
         }
         .subtotal-amount-branch {
-            color: #1e40af !important;
+            color: #000000 !important;
         }
         .subtotal-amount-showroom {
-            color: #9d174d !important;
+            color: #000000 !important;
         }
         /* Style for negative amounts */
         .negative-amount {
@@ -748,6 +827,55 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
         }
         .negative-amount-showroom {
             color: #dc2626 !important;
+        }
+
+        /* Remarks Table Styles */
+        .remarks-unknown-badge {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+            background-color: #ffdede;
+            color: #ff0000;
+        }
+        .remarks-table tr:hover {
+            background-color: #fffbeb;
+        }
+        .remarks-table .transaction-details {
+            font-size: 12px;
+            color: #6b7280;
+            margin-top: 4px;
+        }
+        .remarks-table .transaction-details span {
+            display: inline-block;
+            margin-right: 10px;
+        }
+        .remarks-table .expand-btn {
+            background: none;
+            border: none;
+            color: #ff0000;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
+        .remarks-table .expand-btn:hover {
+            background: #fef3c7;
+        }
+        .remarks-table .transaction-row {
+            background-color: #fffbeb;
+        }
+        .remarks-table .transaction-row td {
+            padding: 6px 12px !important;
+            font-size: 12px;
+            color: #6b7280;
+            border-bottom: 1px dashed #fde68a;
+        }
+        .remarks-table .transaction-row .amount-detail {
+            color: #000000;
+            font-weight: 600;
         }
 
         @media (max-width: 768px) {
@@ -791,11 +919,12 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
             <div class="upload-container">
                 <h2>Upload Raw Data File</h2>
 
-                <!-- <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 10px 15px; margin-bottom: 15px;"> -->
-                    <!-- <i class="fa-solid fa-info-circle" style="color: #15803d;"></i> -->
-                    <!-- <strong style="color: #166534;">File Format Required:</strong> -->
-                    <!-- <span style="color: #166534;">Column A=Date, B=Zone, C=Region, D=Area, E=Branch, F=BranchID, G=Code, H=Description, I=Amount</span> -->
-                <!-- </div> -->
+                <!-- Column format information -->
+                <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 10px 15px; margin-bottom: 15px;">
+                    <i class="fa-solid fa-info-circle" style="color: #15803d;"></i>
+                    <strong style="color: #166534;">Column Format (Fixed Positions):</strong>
+                    <span style="color: #166534;">Column A=Date, B=Zone, C=Region, D=Area, E=Branch Name, F=Branch ID, G=GL Code, H=GL Description, I=Total Amount</span>
+                </div>
 
                 <?php if (!empty($error_message)): ?>
                     <div class="alert alert-danger" id="errorAlert">
@@ -833,10 +962,18 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                 <div class="view-toggle">
                     <span class="toggle-label"><i class="fa-solid fa-eye"></i> View Mode:</span>
                     <a href="?view=raw&page=<?= $current_page ?>" class="btn-toggle <?= $view_mode === 'raw' ? 'active' : '' ?>">
-                        <i class="fa-solid fa-table"></i> Raw Data
+                        <i class="fa-solid fa-table"></i> Detailed
                     </a>
                     <a href="?view=summary" class="btn-toggle <?= $view_mode === 'summary' ? 'active' : '' ?>">
-                        <i class="fa-solid fa-chart-pie"></i> Summary by Region-Area & Code
+                        <i class="fa-solid fa-chart-pie"></i> Summary (Region & Area)
+                    </a>
+                    <a href="?view=remarks" class="btn-toggle remarks-tab <?= $view_mode === 'remarks' ? 'active' : '' ?>">
+                        <i class="fa-solid fa-triangle-exclamation"></i> Remarks 
+                        <?php if (!empty($remarks_data)): ?>
+                            <span class="badge" style="background: #fec7c7; color: #ff0000; padding: 2px 8px; border-radius: 12px; font-size: 11px; margin-left: 5px;">
+                                <?= count($remarks_data) ?>
+                            </span>
+                        <?php endif; ?>
                     </a>
                 </div>
                 <?php endif; ?>
@@ -848,8 +985,9 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                         <!-- RAW DATA VIEW -->
                         <div class="summary-stats">
                             <span class="stat-item"><i class="fa-solid fa-file-lines"></i> <strong><?= $total_rows ?></strong> total rows</span>
-                            <span class="stat-item"><i class="fa-solid fa-columns"></i> <strong><?= count($uploaded_headers) ?></strong> columns</span>
+                            <span class="stat-item"><i class="fa-solid fa-columns"></i> <strong><?= count($display_headers) ?></strong> columns</span>
                             <span class="stat-item"><i class="fa-solid fa-file"></i> File: <strong><?= htmlspecialchars($_SESSION['file_name'] ?? '') ?></strong></span>
+                            <span class="stat-item"><i class="fa-solid fa-calculator"></i> Grand Total: <strong class="grand-total-value">₱<?= number_format($grand_total_amount, 2) ?></strong></span>
                         </div>
 
                         <div class="table-wrapper">
@@ -857,15 +995,9 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                 <thead>
                                     <tr>
                                         <th class="row-number">#</th>
-                                        <?php 
-                                        foreach ($uploaded_headers as $index => $col_header): 
-                                            $is_matched = in_array(trim($col_header), $expected_headers);
-                                        ?>
+                                        <?php foreach ($display_headers as $col_header): ?>
                                             <th>
                                                 <?= htmlspecialchars($col_header) ?>
-                                                <span class="badge-header <?= $is_matched ? 'badge-valid' : 'badge-invalid' ?>">
-                                                    <?= $is_matched ? 'Valid' : 'Unknown' ?>
-                                                </span>
                                             </th>
                                         <?php endforeach; ?>
                                     </tr>
@@ -886,6 +1018,22 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                     endforeach; 
                                     ?>
                                 </tbody>
+                                <tfoot>
+                                    <!-- Grand Total Row -->
+                                    <tr class="raw-grand-total">
+                                        <td class="row-number"></td>
+                                        <?php 
+                                        // Empty cells for all columns except the last one (Total Amount)
+                                        $total_columns = count($display_headers);
+                                        for ($i = 0; $i < $total_columns - 1; $i++): 
+                                        ?>
+                                            <td></td>
+                                        <?php endfor; ?>
+                                        <td style="text-align: right; font-weight: 700; color: #dc2626; font-size: 15px;">
+                                            ₱<?= number_format($grand_total_amount, 2) ?>
+                                        </td>
+                                    </tr>
+                                </tfoot>
                             </table>
                         </div>
 
@@ -925,7 +1073,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
 
                         <!-- Show column mapping for debugging -->
                         <?php if (!empty($column_mapping)): ?>
-                        <!-- <div class="column-mapping-info">
+                        <div class="column-mapping-info">
                             <i class="fa-solid fa-info-circle"></i> 
                             <strong>Fixed column mapping (positions):</strong> 
                             Region → <code>Column C (index 2)</code>, 
@@ -937,7 +1085,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                             <span style="font-size: 12px; color: #64748b;">
                                 <i class="fa-solid fa-arrow-right"></i> Branch type is determined from masterdata.branch_profile using Branch ID
                             </span>
-                        </div> -->
+                        </div>
                         <?php endif; ?>
 
                         <div class="table-wrapper">
@@ -1147,11 +1295,11 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                         // Overall Grand Total (all regions)
                                         if (count($grouped_data) > 1):
                                         ?>
-                                            <tr style="background-color: #0f172a !important;">
+                                            <tr style="background-color: #ff5656 !important;">
                                                 <td colspan="11" style="padding: 15px 15px !important; color: white !important; font-size: 17px; font-weight: 800;">
                                                     <i class="fa-solid fa-crown"></i> 
                                                     OVERALL GRAND TOTAL (All Regions)
-                                                    <span style="float: right; font-weight: 800; color: #fbbf24;">
+                                                    <span style="float: right; font-weight: 800; color: #ffffff;">
                                                         Branch: ₱<?= number_format($grand_branch_total, 2) ?> | 
                                                         Showroom: ₱<?= number_format($grand_showroom_total, 2) ?> | 
                                                         Total: ₱<?= number_format($grand_total_all, 2) ?>
@@ -1182,6 +1330,140 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                             </span>
                         </div>
 
+                    <?php elseif ($view_mode === 'remarks' && !empty($remarks_data)): ?>
+                        <!-- REMARKS VIEW - Unknown Branch Types (Display Only) -->
+                        <div style="background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 15px 20px; margin-bottom: 15px;">
+                            <div style="display: flex; align-items: center; gap: 10px;">
+                                <i class="fa-solid fa-triangle-exclamation" style="color: #92400e; font-size: 20px;"></i>
+                                <div>
+                                    <strong style="color: #92400e;">Unknown Branch Types</strong>
+                                    <p style="margin: 5px 0 0 0; color: #78350f; font-size: 13px;">
+                                        These transactions have Branch IDs that are not recognized in the masterdata. 
+                                        Listed below are unique Region-Area-Code-Branch ID combinations with their totals.
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="summary-stats">
+                            <span class="stat-item"><i class="fa-solid fa-question-circle"></i> <strong><?= count($remarks_data) ?></strong> unique unknown branch ID combinations</span>
+                            <span class="stat-item"><i class="fa-solid fa-layer-group"></i> <strong><?= count(array_unique(array_column($remarks_data, 'region'))) ?></strong> regions affected</span>
+                            <span class="stat-item"><i class="fa-solid fa-cubes"></i> <strong><?= count(array_unique(array_column($remarks_data, 'area'))) ?></strong> areas affected</span>
+                            <span class="stat-item"><i class="fa-solid fa-file"></i> File: <strong><?= htmlspecialchars($_SESSION['file_name'] ?? '') ?></strong></span>
+                        </div>
+
+                        <div class="table-wrapper">
+                            <table class="preview-table remarks-table">
+                                <thead>
+                                    <tr>
+                                        <th style="width: 50px;">#</th>
+                                        <th style="width: 12%;">Region</th>
+                                        <th style="width: 12%;">Area</th>
+                                        <th style="width: 12%;">GL Code</th>
+                                        <th style="width: 15%;">Branch ID</th>
+                                        <th style="width: 12%;">Branch Name</th>
+                                        <th style="width: 10%; text-align: right;">Total Amount</th>
+                                        <th style="width: 8%; text-align: center;">Transactions</th>
+                                        <th style="width: 18%;">Transaction Details</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php 
+                                    if (!empty($remarks_data)):
+                                        $row_counter = 1;
+                                        $grand_unknown_total = 0;
+                                        $grand_unknown_count = 0;
+                                        
+                                        foreach ($remarks_data as $index => $item):
+                                            $grand_unknown_total += $item['total_amount'];
+                                            $grand_unknown_count += $item['row_count'];
+                                            $transaction_count = count($item['transactions']);
+                                    ?>
+                                        <tr>
+                                            <td style="text-align: center; color: #94a3b8;"><?= $row_counter ?></td>
+                                            <td><strong><?= htmlspecialchars($item['region']) ?></strong></td>
+                                            <td><?= htmlspecialchars($item['area']) ?></td>
+                                            <td><span class="code-value"><?= htmlspecialchars($item['code']) ?></span></td>
+                                            <td>
+                                                <span class="remarks-unknown-badge">
+                                                    <i class="fa-solid fa-question-circle"></i> 
+                                                    <?= htmlspecialchars($item['branch_id']) ?>
+                                                </span>
+                                            </td>
+                                            <td><?= htmlspecialchars($item['branch_name'] ?: '-') ?></td>
+                                            <td class="amount-column" style="font-weight: 600; color: #ff0000;">
+                                                ₱<?= number_format($item['total_amount'], 2) ?>
+                                            </td>
+                                            <td class="count-column" style="font-weight: 600;">
+                                                <?= $transaction_count ?>
+                                            </td>
+                                            <td>
+                                                <button class="expand-btn" onclick="toggleTransactions(<?= $index ?>)">
+                                                    <i class="fa-solid fa-chevron-down" id="icon_<?= $index ?>"></i> 
+                                                    View
+                                                </button>
+                                                <div id="transactions_<?= $index ?>" style="display: none; margin-top: 5px;">
+                                                    <?php foreach ($item['transactions'] as $t): ?>
+                                                        <div style="font-size: 12px; color: #6b7280; padding: 2px 0;">
+                                                            <?= htmlspecialchars($t['date']) ?> - 
+                                                            <span class="amount-detail">₱<?= number_format($t['amount'], 2) ?></span>
+                                                            <?php if (!empty($t['branch_name'])): ?>
+                                                                - <?= htmlspecialchars($t['branch_name']) ?>
+                                                            <?php endif; ?>
+                                                        </div>
+                                                    <?php endforeach; ?>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    <?php 
+                                        $row_counter++;
+                                        endforeach; 
+                                    ?>
+                                        <!-- Grand Total for Unknown Branch Types -->
+                                        <tr style="background-color: #ffdede !important; border-top: 3px solid #ff0000;">
+                                            <td colspan="6" style="text-align: right; font-weight: 800; color: #ae0000; font-size: 14px; padding: 12px;">
+                                                <i class="fa-solid fa-calculator"></i> TOTAL UNKNOWN:
+                                            </td>
+                                            <td class="amount-column" style="font-weight: 800; color: #ae0000; font-size: 15px;">
+                                                ₱<?= number_format($grand_unknown_total, 2) ?>
+                                            </td>
+                                            <td style="text-align: center; font-weight: 600; color: #ae0000;">
+                                                <?= $grand_unknown_count ?>
+                                            </td>
+                                            <td></td>
+                                        </tr>
+                                    <?php 
+                                    else: 
+                                    ?>
+                                        <tr>
+                                            <td colspan="9" style="text-align: center; padding: 40px; color: #94a3b8;">
+                                                <i class="fa-solid fa-check-circle" style="font-size: 24px; color: #10b981; display: block; margin-bottom: 10px;"></i>
+                                                No unknown branch types found! All Branch IDs are recognized in the masterdata.
+                                            </td>
+                                        </tr>
+                                    <?php endif; ?>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <div style="margin-top: 15px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
+                            <div style="padding: 10px 15px; background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0;">
+                                <span style="color: #64748b; font-size: 13px;">
+                                    <i class="fa-solid fa-info-circle"></i> 
+                                    <strong><?= count($remarks_data) ?></strong> unique combinations found with unknown branch types
+                                </span>
+                            </div>
+                            <div style="padding: 10px 15px; background: #ffd7d7; border-radius: 6px; border: 1px solid #fd8a8a;">
+                                <span style="color: #64748b; font-size: 13px;">
+                                    <i class="fa-solid fa-flag"></i> 
+                                    <span style="color: #92400e; font-weight: 600;">Total Unknown Amount: ₱<?= number_format($grand_unknown_total, 2) ?></span>
+                                    <span style="color: #92400e; font-weight: 600; margin-left: 15px;">
+                                        (<?= $grand_unknown_count ?> transactions)
+                                    </span>
+                                </span>
+                            </div>
+                        </div>
+
                     <?php endif; ?>
                 </div>
 
@@ -1207,6 +1489,20 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
         urlParams.set('spage', pageNumber);
         urlParams.set('view', 'summary');
         window.location.search = urlParams.toString();
+    }
+
+    // Toggle transaction details in Remarks view
+    function toggleTransactions(index) {
+        const container = document.getElementById('transactions_' + index);
+        const icon = document.getElementById('icon_' + index);
+        
+        if (container.style.display === 'none') {
+            container.style.display = 'block';
+            icon.className = 'fa-solid fa-chevron-up';
+        } else {
+            container.style.display = 'none';
+            icon.className = 'fa-solid fa-chevron-down';
+        }
     }
 
     // Drag and drop functionality
