@@ -1,5 +1,19 @@
 <?php
 session_start();
+
+// Session timeout after 30 minutes of inactivity
+$inactivity_timeout = 1800; // 30 seconds for testing, change to 1800 for production
+
+if (isset($_SESSION['last_activity']) && (time() - $_SESSION['last_activity']) > $inactivity_timeout) {
+    // Clear all session data
+    session_unset();
+    session_destroy();
+    session_start();
+}
+
+// Update last activity time
+$_SESSION['last_activity'] = time();
+
 require_once __DIR__ . '/../config/config.php'; 
 require_once '../vendor/autoload.php';
 
@@ -15,8 +29,38 @@ if (isset($_GET['reset']) && $_GET['reset'] == '1') {
     unset($_SESSION['column_mapping']);
     unset($_SESSION['remarks_data']);
     unset($_SESSION['skipped_data']);
+    unset($_SESSION['last_activity']);
     header("Location: upload_raw_data.php");
     exit;
+}
+
+// Clear session when coming from another page (optional)
+if (isset($_SERVER['HTTP_REFERER']) && !empty($_SERVER['HTTP_REFERER'])) {
+    $referer = $_SERVER['HTTP_REFERER'];
+    // Check if referer is from a different page (not upload_raw_data.php)
+    if (strpos($referer, 'upload_raw_data.php') === false && !isset($_POST['file_upload']) && !isset($_GET['view'])) {
+        // Only clear if data exists and we're not in the middle of an upload
+        if (isset($_SESSION['parsed_data'])) {
+            // Don't clear immediately, let the user see the data
+            // But mark it for clearing on next visit
+            $_SESSION['clear_on_next_load'] = true;
+        }
+    }
+}
+
+// Check if we need to clear data
+if (isset($_SESSION['clear_on_next_load']) && $_SESSION['clear_on_next_load'] === true) {
+    unset($_SESSION['parsed_data']);
+    unset($_SESSION['uploaded_headers']);
+    unset($_SESSION['total_rows']);
+    unset($_SESSION['file_name']);
+    unset($_SESSION['success_message']);
+    unset($_SESSION['error_message']);
+    unset($_SESSION['summary_data']);
+    unset($_SESSION['column_mapping']);
+    unset($_SESSION['remarks_data']);
+    unset($_SESSION['skipped_data']);
+    unset($_SESSION['clear_on_next_load']);
 }
 
 if (!isset($_SESSION['username'])) {
@@ -1085,7 +1129,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                 <div>
                                     <strong style="color: #c20c0c;">Skipped Rows</strong>
                                     <div style="font-size: 13px; color: #d00202; margin-top: 2px;">
-                                        Rows excluded from the import due to some conditions.
+                                        Rows excluded from the preview due to some conditions.
                                     </div>
                                 </div>
                             </div>
@@ -1267,7 +1311,63 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
         }, 30000);
     });
 
+    // ============================================
+    // AUTO-CLEAR SESSION ON NAVIGATION AWAY
+    // ============================================
+    
+    // Clear session when navigating away from this page
+    window.addEventListener('beforeunload', function(e) {
+        // Send a beacon to clear session data
+        if (navigator.sendBeacon) {
+            navigator.sendBeacon('clear_session.php');
+        } else {
+            // Fallback for older browsers - use synchronous XHR (not recommended but works)
+            try {
+                const xhr = new XMLHttpRequest();
+                xhr.open('GET', 'clear_session.php', false);
+                xhr.send();
+            } catch (err) {
+                // Silent fail
+            }
+        }
+    });
+
+    // ============================================
+    // SESSION TIMEOUT WITH INACTIVITY
+    // ============================================
+    
+    let inactivityTimer;
+    const TIMEOUT_MINUTES = 30; // 30 minutes
+    
+    function resetInactivityTimer() {
+        clearTimeout(inactivityTimer);
+        inactivityTimer = setTimeout(function() {
+            // Show a warning and redirect to reset
+            const shouldReset = confirm(
+                'Your session has been inactive for ' + TIMEOUT_MINUTES + ' minutes.\n\n' +
+                'Click OK to reset the page and clear uploaded data, or Cancel to stay.'
+            );
+            if (shouldReset) {
+                window.location.href = '?reset=1';
+            } else {
+                // Reset the timer if user cancels
+                resetInactivityTimer();
+            }
+        }, TIMEOUT_MINUTES * 60 * 1000);
+    }
+
+    // Reset timer on user activity
+    const activityEvents = ['click', 'keypress', 'scroll', 'mousemove', 'touchstart', 'touchmove'];
+    activityEvents.forEach(event => {
+        document.addEventListener(event, resetInactivityTimer);
+    });
+
+    // Start the timer when page loads
+    resetInactivityTimer();
+
     console.log('Raw Data Upload page loaded successfully');
+    console.log('Session will auto-clear when navigating away');
+    console.log('Session will timeout after ' + TIMEOUT_MINUTES + ' minutes of inactivity');
 </script>
 </body>
 </html>

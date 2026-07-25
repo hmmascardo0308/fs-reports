@@ -49,7 +49,6 @@ function detectDelimiter(string $line): string
         $counts[$delimiter] = substr_count($line, $delimiter);
     }
     
-    // Return the delimiter with the highest count
     arsort($counts);
     return key($counts);
 }
@@ -63,7 +62,6 @@ function readCsvRows(string $path): array
         throw new RuntimeException('Unable to open CSV file.');
     }
 
-    // Read first line to detect delimiter
     $firstLine = fgets($handle);
     rewind($handle);
     
@@ -75,7 +73,6 @@ function readCsvRows(string $path): array
     $delimiter = detectDelimiter($firstLine);
     
     while (($row = fgetcsv($handle, 0, $delimiter)) !== false) {
-        // Clean up each cell - remove quotes, trim whitespace
         foreach ($row as &$cell) {
             $cell = trim($cell);
             $cell = trim($cell, '"');
@@ -85,22 +82,80 @@ function readCsvRows(string $path): array
     }
 
     fclose($handle);
-
     return $rows;
 }
 
 function maxCsvColumns(array $rows): int
 {
     $maxCols = 0;
-
     foreach ($rows as $row) {
         $maxCols = max($maxCols, count($row));
     }
-
     return $maxCols;
 }
 
-// --- STAGE 1: UPLOAD & PREVIEW ---
+// Helper function to clean CSV values - COMPLETELY REWORKED
+function cleanCsvValue($value, $prefixes = []) {
+    if (!is_string($value)) {
+        return $value;
+    }
+
+    $value = trim($value);
+
+    // Remove BOM
+    $value = preg_replace('/^\xEF\xBB\xBF/', '', $value);
+
+    // Remove quotes
+    $value = str_replace(['"', "'"], '', $value);
+
+    // If there's a colon, the real value is everything AFTER the first colon.
+    // This handles "Label : Value", "Label:Value", "Label :Value", etc.
+    if (strpos($value, ':') !== false) {
+        [, $value] = explode(':', $value, 2);
+    } else {
+        // No colon present — fall back to stripping the label by prefix
+        foreach ($prefixes as $prefix) {
+            $prefix = trim($prefix);
+            if ($prefix === '') continue;
+            $value = preg_replace(
+                '/^' . preg_quote($prefix, '/') . '\s*[-|]?\s*/i',
+                '',
+                $value
+            );
+        }
+    }
+
+    return trim($value);
+}
+
+// Enhanced function to extract numeric amount from various formats
+function extractNumericAmount($value) {
+    if (!is_string($value) && !is_numeric($value)) {
+        return 0;
+    }
+    
+    $value = trim((string)$value);
+    
+    // Handle negative numbers in parentheses
+    if (strpos($value, '(') !== false && strpos($value, ')') !== false) {
+        $value = str_replace(['(', ')', ' ', '₱', '$', ','], '', $value);
+        return -(float)$value;
+    }
+    
+    // Remove currency symbols, commas, spaces
+    $value = str_replace([' ', '₱', '$', ','], '', $value);
+    
+    // Handle negative sign
+    $isNegative = false;
+    if (strpos($value, '-') === 0) {
+        $isNegative = true;
+        $value = substr($value, 1);
+    }
+    
+    $amount = (float)$value;
+    return $isNegative ? -$amount : $amount;
+}
+
 // --- STAGE 1: UPLOAD & PREVIEW ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
     $transactionMonth = $_POST['transaction_month'] ?? '';
@@ -148,20 +203,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                     continue;
                 }
 
-                // Extract metadata from rows 0, 1, 2
-                $regionID = trim($rows[0][0] ?? '');
-                $regionDescription = trim($rows[1][0] ?? '');
-                $area = trim($rows[2][0] ?? '');
-
-                // Clean up metadata
-                $regionID = str_replace(['Region ID:', 'Region ID :', '"', "'", ' '], '', $regionID);
-                $regionID = trim($regionID);
+                // Extract metadata from rows 0, 1, 2 with improved cleaning
+                $regionID = cleanCsvValue($rows[0][0] ?? '', ['Region ID']);
+                $regionID = preg_replace('/[^0-9]/', '', $regionID);
                 
-                $regionDescription = str_replace(['Region Description:', 'Region Description :', '"', "'"], '', $regionDescription);
-                $regionDescription = trim($regionDescription);
+                $regionDescription = cleanCsvValue($rows[1][0] ?? '', ['Region Description']);
                 
-                $area = str_replace(['Area:', 'Area :', '"', "'"], '', $area);
-                $area = trim($area);
+                $area = cleanCsvValue($rows[2][0] ?? '', ['Area']);
 
                 // Find where data actually starts
                 $glCodeCol = null;
@@ -173,14 +221,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                 $headerRowIndex = null;
 
                 // First, find the header row with "GLCode" and "Description"
-                for ($i = 0; $i < min(15, count($rows)); $i++) {
+                for ($i = 0; $i < min(20, count($rows)); $i++) {
                     $row = $rows[$i] ?? [];
                     $hasGLCode = false;
                     $hasDescription = false;
                     
                     foreach ($row as $colIndex => $cell) {
                         $cellClean = trim((string)$cell);
-                        if (stripos($cellClean, 'GLCode') !== false) {
+                        if (stripos($cellClean, 'GLCode') !== false || stripos($cellClean, 'GL Code') !== false) {
                             $glCodeCol = $colIndex;
                             $hasGLCode = true;
                         }
@@ -188,10 +236,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                             $descriptionCol = $colIndex;
                             $hasDescription = true;
                         }
-                        if (stripos($cellClean, 'Branch Amount') !== false) {
+                        if (stripos($cellClean, 'Branch Amount') !== false || stripos($cellClean, 'Branch') !== false) {
                             $branchAmountCol = $colIndex;
                         }
-                        if (stripos($cellClean, 'Showroom Amount') !== false) {
+                        if (stripos($cellClean, 'Showroom Amount') !== false || stripos($cellClean, 'Showroom') !== false) {
                             $showroomAmountCol = $colIndex;
                         }
                         if (stripos($cellClean, '%') !== false) {
@@ -208,18 +256,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
 
                 // If we still couldn't find the header, use default
                 if ($headerRowIndex === null) {
-                    // Look for "Category" row
-                    for ($i = 0; $i < min(10, count($rows)); $i++) {
+                    for ($i = 0; $i < min(15, count($rows)); $i++) {
                         $row = $rows[$i] ?? [];
                         foreach ($row as $colIndex => $cell) {
                             $cellClean = trim((string)$cell);
                             if (stripos($cellClean, 'Category') !== false) {
-                                // The next row might have GLCode and Description
                                 if (isset($rows[$i + 1])) {
                                     $nextRow = $rows[$i + 1];
                                     foreach ($nextRow as $colIdx => $cellVal) {
                                         $cellValClean = trim((string)$cellVal);
-                                        if (stripos($cellValClean, 'GLCode') !== false) {
+                                        if (stripos($cellValClean, 'GLCode') !== false || stripos($cellValClean, 'GL Code') !== false) {
                                             $glCodeCol = $colIdx;
                                         }
                                         if (stripos($cellValClean, 'Description') !== false) {
@@ -242,7 +288,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
 
                 // If still not found, use defaults
                 if ($headerRowIndex === null) {
-                    $headerRowIndex = 4; // Assuming row 4 is the header (0-indexed)
+                    $headerRowIndex = 4;
                     $dataStartRow = 5;
                 }
                 if ($glCodeCol === null) {
@@ -252,22 +298,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                     $descriptionCol = 2;
                 }
 
-                // Find where NET Income appears to stop
+                // Find where NET Income appears to stop - but keep processing until we find it
                 $cutoffRow = count($rows) - 1;
+                $foundNetIncome = false;
                 foreach ($rows as $rowIndex => $row) {
                     foreach ($row as $cell) {
                         if (stripos(trim((string)$cell), 'NET Income') !== false) {
-                            $cutoffRow = $rowIndex;
+                            $cutoffRow = $rowIndex - 1; // Stop BEFORE NET Income
+                            $foundNetIncome = true;
                             break 2;
                         }
                     }
                 }
 
-                // Build preview - METADATA SECTION
+                // Build preview
                 $previewTable .= '<div class="file-preview-container">';
-                $previewTable .= '<h4 class="file-name" style="colpr: white;">📄 Preview: ' . htmlspecialchars($singleFile['name']) . '</h4>';
+                $previewTable .= '<h4 class="file-name">📄 Preview: ' . htmlspecialchars($singleFile['name']) . '</h4>';
                 
-                // Metadata section
+                // Metadata section - show cleaned values
                 $previewTable .= '<div class="metadata-section" style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #4a90d9;">';
                 $previewTable .= '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">';
                 $previewTable .= '<div><strong>🏷️ Region ID:</strong> <span style="color: #2d3748;">' . htmlspecialchars($regionID) . '</span></div>';
@@ -280,7 +328,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                 $previewTable .= '<div class="table-container" style="max-height: 600px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 8px;">';
                 $previewTable .= '<table class="excel-preview" style="width: 100%; border-collapse: collapse;">';
 
-                // Show the header row first (with sticky positioning)
+                // Show the header row first
                 if (isset($rows[$headerRowIndex])) {
                     $headerRow = $rows[$headerRowIndex];
                     $previewTable .= '<thead><tr class="sticky-row-header" style="background: #ff0000;">';
@@ -290,13 +338,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                     $previewTable .= '</tr></thead>';
                 }
 
-                // Show ALL data rows from dataStartRow to cutoffRow
+                // Show data rows
                 $previewTable .= '<tbody>';
                 $rowCount = 0;
                 for ($rowIndex = $dataStartRow; $rowIndex <= $cutoffRow && $rowIndex < count($rows); $rowIndex++) {
                     $row = $rows[$rowIndex];
                     
-                    // Skip empty rows
                     $isEmpty = true;
                     foreach ($row as $cell) {
                         if (!empty(trim($cell))) {
@@ -311,22 +358,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                     $rowCount++;
                     $previewTable .= '<tr>';
                     
-                    // Display all columns in the row
                     foreach ($row as $colKey => $cell) {
                         $style = 'padding: 8px 12px; border: 1px solid #e2e8f0;';
-                        // Style based on content
                         $cellValue = trim($cell ?? '');
                         if (is_numeric(str_replace(',', '', $cellValue))) {
                             $style .= ' text-align: right;';
                         }
-                        // Highlight GL Code column if it's numeric
                         if ($colKey == $glCodeCol && !empty($cellValue) && is_numeric($cellValue)) {
                             $style .= ' font-weight: 500; color: #2b6cb0;';
                         }
                         $previewTable .= "<td style='$style'>" . htmlspecialchars($cell ?? '') . "</td>";
                     }
                     
-                    // If row has fewer columns than header, add empty cells
                     if (isset($rows[$headerRowIndex])) {
                         $headerCount = count($rows[$headerRowIndex]);
                         $currentCount = count($row);
@@ -340,14 +383,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                     $previewTable .= '</tr>';
                 }
                 $previewTable .= '</tbody>';
-
                 $previewTable .= '</table>';
                 $previewTable .= '</div>';
                 
                 // Summary section
                 $totalRows = count($rows);
                 $previewTable .= '<div class="summary-bar" style="padding: 10px; background: #f8f9fa; border-radius: 4px; margin-top: 10px; font-size: 14px; color: #4a5568;">';
-                $previewTable .= '<small>📊 <strong>Summary:</strong> Total rows: ' . $totalRows . ' | Data rows: ' . $rowCount . ' | Header at row: ' . ($headerRowIndex + 1) . ' | Metadata rows: 3 (Region ID, Region Description, Area)</small>';
+                $previewTable .= '<small>📊 <strong>Summary:</strong> Total rows: ' . $totalRows . ' | Data rows: ' . $rowCount . ' | Header at row: ' . ($headerRowIndex + 1) . ' | Cutoff at: ' . ($cutoffRow + 1) . '</small>';
                 $previewTable .= '</div>';
                 $previewTable .= '</div>';
 
@@ -386,14 +428,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
         $voidedGroups = [];
         $checkedGroups = [];
         $insertCount = 0;
+        $debugInfo = [];
+        $skippedRows = [];
+        $processedRows = [];
 
         try {
+            // Prepare the INSERT statement with correct column mapping
             $stmt = $conn->prepare("
                 INSERT INTO comparative_report
-                (gl_code, gl_description, amount, percentage, region, area, mainzone, zone, region_code,
+                (gl_code, gl_description, amount, region, area, mainzone, zone, region_code,
                  transaction_type, transaction_month, transaction_year, uploaded_by, region_id,
                  uploaded_date, gl_region)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ");
 
             $checkStatusStmt = $conn->prepare("SELECT status FROM comparative_report WHERE region_id = ? AND area = ? AND transaction_type = ? AND transaction_month <=> ? AND status_void IS NULL LIMIT 1");
@@ -402,74 +448,129 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
 
             foreach ($paths as $path) {
                 if (!file_exists($path)) {
+                    $debugInfo[] = "✗ File not found: $path";
                     continue;
                 }
 
                 $rows = readCsvRows($path);
                 if (empty($rows)) {
+                    $debugInfo[] = "✗ Empty file: $path";
                     continue;
                 }
 
-                $maxCols = maxCsvColumns($rows);
-
-                // Extract Region ID from A1 (row 0, col 0)
-                $regionID = trim($rows[0][0] ?? '');
-                $regionID = str_replace(['Region ID:', 'Region ID :', '"', "'", ' '], '', $regionID);
-                $regionID = trim($regionID);
+                // Extract and CLEAN metadata from rows 0, 1, 2 with improved cleaning
+                $regionID = cleanCsvValue($rows[0][0] ?? '', ['Region ID']);
                 $regionID = preg_replace('/[^0-9]/', '', $regionID);
                 
-                // Extract Region Description from row 1, col 0
-                $glRegion = trim($rows[1][0] ?? '');
-                $glRegion = str_replace(['Region Description:', 'Region Description :', '"', "'"], '', $glRegion);
-                $glRegion = trim($glRegion);
+                // CLEAN glRegion - remove all variations of "Region Description" prefix
+                $glRegion = cleanCsvValue($rows[1][0] ?? '', ['Region Description']);
                 
-                // Extract Area from row 2, col 0
-                $area = trim($rows[2][0] ?? '');
-                $area = str_replace(['Area:', 'Area :', '"', "'"], '', $area);
-                $area = trim($area);
+                // CLEAN area - remove all variations of "Area" prefix
+                $area = cleanCsvValue($rows[2][0] ?? '', ['Area']);
+
+                // DEBUG: Log the extracted values
+                $debugInfo[] = "=== Processing File: " . basename($path) . " ===";
+                $debugInfo[] = "Region ID extracted: '$regionID'";
+                $debugInfo[] = "Area extracted: '$area'";
+                $debugInfo[] = "Region Description extracted: '$glRegion'";
 
                 // Lookup region details from masterdata.branch_profile
-                $region = $region_code = $mainzone = $zone = null;
+                $region = null;
+                $region_code = null;
+                $mainzone = null;
+                $zone = null;
 
-if (!empty($regionID) && !empty($area)) {
-    $lookup_sql = "SELECT region, region_code, mainzone, zone
-                   FROM masterdata.branch_profile
-                   WHERE regionID_MLmatic = ? AND area = ?
-                   LIMIT 1";
+                // Try multiple lookup strategies
+                $lookupSuccess = false;
 
-    $lookup_stmt = $conn->prepare($lookup_sql);
+                // Strategy 1: Try exact match on regionID_MLmatic and area
+                if (!empty($regionID) && !empty($area)) {
+                    $debugInfo[] = "Strategy 1: Looking up regionID_MLmatic='$regionID' AND area='$area'";
+                    
+                    $lookup_sql = "SELECT region, region_code, mainzone, zone
+                                   FROM masterdata.branch_profile 
+                                   WHERE regionID_MLmatic = ? AND area = ?
+                                   LIMIT 1";
 
-    if ($lookup_stmt) {
-        $lookup_stmt->bind_param("ss", $regionID, $area);
+                    $lookup_stmt = $conn->prepare($lookup_sql);
 
-        $lookup_stmt->execute();
+                    if ($lookup_stmt) {
+                        $lookup_stmt->bind_param("ss", $regionID, $area);
+                        $lookup_stmt->execute();
 
-        // Initialize variables first
-        $lookup_region = null;
-        $lookup_region_code = null;
-        $lookup_mainzone = null;
-        $lookup_zone = null;
+                        $lookup_region = null;
+                        $lookup_region_code = null;
+                        $lookup_mainzone = null;
+                        $lookup_zone = null;
 
-        $lookup_stmt->bind_result(
-            $lookup_region,
-            $lookup_region_code,
-            $lookup_mainzone,
-            $lookup_zone
-        );
+                        $lookup_stmt->bind_result(
+                            $lookup_region,
+                            $lookup_region_code,
+                            $lookup_mainzone,
+                            $lookup_zone
+                        );
 
-        if ($lookup_stmt->fetch()) {
-            $region = $lookup_region;
-            $region_code = $lookup_region_code;
-            $mainzone = $lookup_mainzone;
-            $zone = $lookup_zone;
-        }
+                        if ($lookup_stmt->fetch()) {
+                            $region = $lookup_region;
+                            $region_code = $lookup_region_code;
+                            $mainzone = $lookup_mainzone;
+                            $zone = $lookup_zone;
+                            $lookupSuccess = true;
+                            $debugInfo[] = "✓ Strategy 1 SUCCESS - Found record: region='$region', region_code='$region_code'";
+                        } else {
+                            $debugInfo[] = "✗ Strategy 1 FAILED - No matching record found";
+                        }
 
-        $lookup_stmt->close();
-    }
-}
+                        $lookup_stmt->close();
+                    }
+                }
 
-                // If lookup failed, try to find region_code from region_masterfile
-                if (empty($region_code) && !empty($glRegion)) {
+                // Strategy 2: If area lookup failed, try using only regionID_MLmatic
+                if (!$lookupSuccess && !empty($regionID)) {
+                    $debugInfo[] = "Strategy 2: Looking up regionID_MLmatic='$regionID' (without area filter)";
+                    
+                    $lookup_sql2 = "SELECT region, region_code, mainzone, zone
+                                   FROM masterdata.branch_profile 
+                                   WHERE regionID_MLmatic = ?
+                                   LIMIT 1";
+
+                    $lookup_stmt2 = $conn->prepare($lookup_sql2);
+
+                    if ($lookup_stmt2) {
+                        $lookup_stmt2->bind_param("s", $regionID);
+                        $lookup_stmt2->execute();
+
+                        $lookup_region = null;
+                        $lookup_region_code = null;
+                        $lookup_mainzone = null;
+                        $lookup_zone = null;
+
+                        $lookup_stmt2->bind_result(
+                            $lookup_region,
+                            $lookup_region_code,
+                            $lookup_mainzone,
+                            $lookup_zone
+                        );
+
+                        if ($lookup_stmt2->fetch()) {
+                            $region = $lookup_region;
+                            $region_code = $lookup_region_code;
+                            $mainzone = $lookup_mainzone;
+                            $zone = $lookup_zone;
+                            $lookupSuccess = true;
+                            $debugInfo[] = "✓ Strategy 2 SUCCESS - Found record: region='$region', region_code='$region_code'";
+                        } else {
+                            $debugInfo[] = "✗ Strategy 2 FAILED - No matching record found";
+                        }
+
+                        $lookup_stmt2->close();
+                    }
+                }
+
+                // Strategy 3: Try using region description from region_masterfile
+                if (!$lookupSuccess && !empty($glRegion)) {
+                    $debugInfo[] = "Strategy 3: Looking up region_description='$glRegion' in region_masterfile";
+                    
                     $rc_sql = "SELECT region_code FROM masterdata.region_masterfile WHERE region_description = ? LIMIT 1";
                     $rc_stmt = $conn->prepare($rc_sql);
                     if ($rc_stmt) {
@@ -482,37 +583,85 @@ if (!empty($regionID) && !empty($area)) {
                             if (empty($region)) {
                                 $region = $glRegion;
                             }
+                            $lookupSuccess = true;
+                            $debugInfo[] = "✓ Strategy 3 SUCCESS - Found region_code='$region_code'";
+                        } else {
+                            $debugInfo[] = "✗ Strategy 3 FAILED - No matching region description found";
                         }
                         $rc_stmt->close();
                     }
                 }
 
-                if ($region === null || $area === null || $region_code === null) {
+                // Strategy 4: If all lookups fail, use default values
+                if (!$lookupSuccess) {
+                    $debugInfo[] = "Strategy 4: Using fallback/default values";
+                    if (empty($region)) {
+                        $region = $glRegion;
+                    }
+                    if (empty($region_code)) {
+                        $region_code = $regionID;
+                    }
+                    if (empty($mainzone)) {
+                        $mainzone = '';
+                    }
+                    if (empty($zone)) {
+                        $zone = '';
+                    }
+                    $debugInfo[] = "✓ Strategy 4 (FALLBACK) - Using: region='$region', region_code='$region_code'";
+                }
+
+                $debugInfo[] = "Final values - region: '$region', region_code: '$region_code', mainzone: '$mainzone', zone: '$zone'";
+                $debugInfo[] = "Values to insert - area: '$area', gl_region: '$glRegion'";
+
+                // Skip if required fields are missing
+                if (empty($region) || empty($area) || empty($region_code)) {
+                    $debugInfo[] = "✗ SKIPPING FILE - Required fields missing (region, area, or region_code is empty)";
+                    $debugInfo[] = "  - region: '" . ($region ?? 'NULL') . "'";
+                    $debugInfo[] = "  - area: '" . ($area ?? 'NULL') . "'";
+                    $debugInfo[] = "  - region_code: '" . ($region_code ?? 'NULL') . "'";
                     continue;
                 }
 
-                // Find where the data starts
+                // Find where the data starts - MORE ROBUST DETECTION
                 $glCodeCol = null;
                 $descriptionCol = null;
                 $branchAmountCol = null;
                 $showroomAmountCol = null;
                 $percentageCol = null;
                 $dataStartRow = null;
+                $headerRowFound = false;
 
-                for ($i = 0; $i < min(10, count($rows)); $i++) {
+                // Try to find header row with GL Code and Description
+                for ($i = 0; $i < min(20, count($rows)); $i++) {
                     $row = $rows[$i] ?? [];
+                    $foundGL = false;
+                    $foundDesc = false;
+                    
                     foreach ($row as $colIndex => $cell) {
                         $cellClean = trim((string)$cell);
-                        if (stripos($cellClean, 'GLCode') !== false) {
+                        // Look for GL Code variations
+                        if (stripos($cellClean, 'GLCode') !== false || 
+                            stripos($cellClean, 'GL Code') !== false ||
+                            stripos($cellClean, 'G/L Code') !== false ||
+                            stripos($cellClean, 'Account Code') !== false ||
+                            stripos($cellClean, 'Code') !== false) {
                             $glCodeCol = $colIndex;
+                            $foundGL = true;
                         }
-                        if (stripos($cellClean, 'Description') !== false) {
+                        // Look for Description variations
+                        if (stripos($cellClean, 'Description') !== false || 
+                            stripos($cellClean, 'Account Description') !== false ||
+                            stripos($cellClean, 'Particulars') !== false) {
                             $descriptionCol = $colIndex;
+                            $foundDesc = true;
                         }
-                        if (stripos($cellClean, 'Branch Amount') !== false) {
+                        // Look for amount columns
+                        if (stripos($cellClean, 'Branch Amount') !== false || 
+                            stripos($cellClean, 'Branch') !== false) {
                             $branchAmountCol = $colIndex;
                         }
-                        if (stripos($cellClean, 'Showroom Amount') !== false) {
+                        if (stripos($cellClean, 'Showroom Amount') !== false || 
+                            stripos($cellClean, 'Showroom') !== false) {
                             $showroomAmountCol = $colIndex;
                         }
                         if (stripos($cellClean, '%') !== false) {
@@ -520,64 +669,143 @@ if (!empty($regionID) && !empty($area)) {
                         }
                     }
                     
-                    if ($glCodeCol !== null && $descriptionCol !== null) {
+                    if ($foundGL && $foundDesc) {
+                        $headerRowFound = true;
                         $dataStartRow = $i + 1;
+                        $debugInfo[] = "✓ Header found at row $i - GL Code col: $glCodeCol, Description col: $descriptionCol";
                         break;
                     }
                 }
 
-                if ($dataStartRow === null) {
-                    for ($i = 0; $i < min(10, count($rows)); $i++) {
+                // If still not found, try to find by looking for numeric values in a column
+                if (!$headerRowFound) {
+                    $debugInfo[] = "Header not found with GL/Description, trying to detect data patterns...";
+                    
+                    // Look for first row that has numbers in multiple columns
+                    for ($i = 0; $i < min(30, count($rows)); $i++) {
                         $row = $rows[$i] ?? [];
+                        $numericCount = 0;
+                        $numericCols = [];
+                        
                         foreach ($row as $colIndex => $cell) {
-                            $cellClean = trim((string)$cell);
-                            if (stripos($cellClean, 'Category') !== false) {
-                                if (isset($rows[$i + 1])) {
-                                    $nextRow = $rows[$i + 1];
-                                    foreach ($nextRow as $colIdx => $cellVal) {
-                                        $cellValClean = trim((string)$cellVal);
-                                        if (stripos($cellValClean, 'GLCode') !== false) {
-                                            $glCodeCol = $colIdx;
-                                        }
-                                        if (stripos($cellValClean, 'Description') !== false) {
-                                            $descriptionCol = $colIdx;
-                                        }
-                                    }
-                                    if ($glCodeCol !== null && $descriptionCol !== null) {
-                                        $dataStartRow = $i + 2;
-                                        break;
-                                    }
-                                }
+                            $cleaned = str_replace([',', ' ', '₱', '$', '(', ')'], '', trim($cell));
+                            if (is_numeric($cleaned) && $cleaned != '') {
+                                $numericCount++;
+                                $numericCols[] = $colIndex;
                             }
                         }
-                        if ($dataStartRow !== null) {
-                            break;
+                        
+                        // If we have multiple numeric columns, this is likely a data row
+                        if ($numericCount >= 2) {
+                            // The previous row might be the header
+                            if ($i > 0) {
+                                $headerRowIndex = $i - 1;
+                                $dataStartRow = $i;
+                                
+                                // Try to find GL Code and Description in the header
+                                $headerRow = $rows[$headerRowIndex];
+                                foreach ($headerRow as $colIndex => $cell) {
+                                    $cellClean = trim((string)$cell);
+                                    if (stripos($cellClean, 'Code') !== false && $glCodeCol === null) {
+                                        $glCodeCol = $colIndex;
+                                    }
+                                    if ((stripos($cellClean, 'Description') !== false || stripos($cellClean, 'Particulars') !== false) && $descriptionCol === null) {
+                                        $descriptionCol = $colIndex;
+                                    }
+                                }
+                                
+                                // If still not found, use the first numeric column as GL Code and second as Description
+                                if ($glCodeCol === null && !empty($numericCols)) {
+                                    $glCodeCol = $numericCols[0];
+                                }
+                                if ($descriptionCol === null && count($numericCols) > 1) {
+                                    $descriptionCol = $numericCols[1];
+                                }
+                                
+                                $headerRowFound = true;
+                                $debugInfo[] = "✓ Data pattern detected - Header at row $headerRowIndex, data starts at row $dataStartRow";
+                                $debugInfo[] = "GL Code col: $glCodeCol, Description col: $descriptionCol";
+                                break;
+                            }
                         }
                     }
                 }
 
-                if ($glCodeCol === null) {
-                    $glCodeCol = 1;
-                }
-                if ($descriptionCol === null) {
-                    $descriptionCol = 2;
-                }
-                if ($dataStartRow === null) {
+                // If still not found, use defaults
+                if (!$headerRowFound || $dataStartRow === null) {
+                    $debugInfo[] = "Using default column mappings";
                     $dataStartRow = 5;
+                    $glCodeCol = 1;
+                    $descriptionCol = 2;
+                    $branchAmountCol = 3;
+                    $showroomAmountCol = 4;
                 }
 
-                // Find where NET Income appears
+                // If amount columns not found, try to auto-detect them
+                if ($branchAmountCol === null && $showroomAmountCol === null) {
+                    $debugInfo[] = "Looking for amount columns by checking data patterns...";
+                    // Check the first few data rows to find columns with numeric values
+                    $numericColumnCounts = [];
+                    for ($i = $dataStartRow; $i < min($dataStartRow + 10, count($rows)); $i++) {
+                        $row = $rows[$i] ?? [];
+                        foreach ($row as $colIndex => $cell) {
+                            $cleaned = str_replace([',', ' ', '₱', '$', '(', ')'], '', trim($cell));
+                            if (is_numeric($cleaned) && $cleaned != '') {
+                                if (!isset($numericColumnCounts[$colIndex])) {
+                                    $numericColumnCounts[$colIndex] = 0;
+                                }
+                                $numericColumnCounts[$colIndex]++;
+                            }
+                        }
+                    }
+                    
+                    // Get columns that have numeric values in most rows
+                    arsort($numericColumnCounts);
+                    $numericCols = array_keys($numericColumnCounts);
+                    
+                    // Exclude GL Code column if it's numeric
+                    $numericCols = array_filter($numericCols, function($col) use ($glCodeCol) {
+                        return $col != $glCodeCol;
+                    });
+                    
+                    // Use the first two numeric columns as Branch and Showroom
+                    $numericCols = array_values($numericCols);
+                    if (count($numericCols) >= 1) {
+                        $branchAmountCol = $numericCols[0];
+                        $debugInfo[] = "✓ Auto-detected Branch Amount column: $branchAmountCol";
+                    }
+                    if (count($numericCols) >= 2) {
+                        $showroomAmountCol = $numericCols[1];
+                        $debugInfo[] = "✓ Auto-detected Showroom Amount column: $showroomAmountCol";
+                    }
+                }
+
+                $debugInfo[] = "Final column detection: glCodeCol=$glCodeCol, descriptionCol=$descriptionCol, branchAmountCol=$branchAmountCol, showroomAmountCol=$showroomAmountCol, dataStartRow=$dataStartRow";
+
+                // Find where NET Income appears - MORE FLEXIBLE
                 $cutoffRow = count($rows) - 1;
+                $foundNetIncome = false;
                 foreach ($rows as $rowIndex => $row) {
                     foreach ($row as $cell) {
-                        if (stripos(trim((string)$cell), 'NET Income') !== false) {
-                            $cutoffRow = $rowIndex;
+                        $cellClean = trim((string)$cell);
+                        if (stripos($cellClean, 'NET Income') !== false || 
+                            stripos($cellClean, 'Net Income') !== false ||
+                            (stripos($cellClean, 'Net') !== false && stripos($cellClean, 'Income') !== false)) {
+                            $cutoffRow = $rowIndex - 1; // Stop BEFORE NET Income
+                            $foundNetIncome = true;
+                            $debugInfo[] = "✓ Found NET Income at row $rowIndex, cutting off at row " . ($rowIndex - 1);
                             break 2;
                         }
                     }
                 }
+                
+                if (!$foundNetIncome) {
+                    $debugInfo[] = "⚠ NET Income not found, processing all rows until the end";
+                }
 
-                // Process data rows
+                $debugInfo[] = "Data detection: glCodeCol=$glCodeCol, descriptionCol=$descriptionCol, dataStartRow=$dataStartRow, cutoffRow=$cutoffRow";
+
+                // Determine which amount columns are available
                 $transactionTypes = [];
                 if ($branchAmountCol !== null) {
                     $transactionTypes[] = ['type' => 'Branch', 'col' => $branchAmountCol];
@@ -587,8 +815,11 @@ if (!empty($regionID) && !empty($area)) {
                 }
 
                 if (empty($transactionTypes)) {
+                    $debugInfo[] = "✗ SKIPPING - No transaction types found (Branch Amount or Showroom Amount columns not found)";
                     continue;
                 }
+
+                $debugInfo[] = "Transaction types: " . implode(', ', array_column($transactionTypes, 'type'));
 
                 // Check for existing records
                 foreach ($transactionTypes as $tt) {
@@ -606,8 +837,10 @@ if (!empty($regionID) && !empty($area)) {
 
                             if ($existingStatus === 'Locked') {
                                 $lockedRegions[] = $regionID . '-' . $area . '-' . $tt['type'];
+                                $debugInfo[] = "Region is LOCKED for " . $tt['type'];
                             } elseif (!$forceInsert) {
                                 $existingRegions[] = $regionID . '-' . $area . '-' . $tt['type'];
+                                $debugInfo[] = "Records already exist for " . $tt['type'];
                             }
                         }
                         $checkStatusStmt->free_result();
@@ -623,6 +856,7 @@ if (!empty($regionID) && !empty($area)) {
                     }
                 }
                 if ($regionLocked) {
+                    $debugInfo[] = "✗ SKIPPING - Region is locked";
                     continue;
                 }
 
@@ -643,6 +877,7 @@ if (!empty($regionID) && !empty($area)) {
                             );
                             $voidStmt->execute();
                             $voidedGroups[] = $groupKey;
+                            $debugInfo[] = "Voided existing records for " . $tt['type'] . " (force insert enabled)";
                         }
                     }
                 } else {
@@ -654,17 +889,25 @@ if (!empty($regionID) && !empty($area)) {
                         }
                     }
                     if ($hasExisting) {
+                        $debugInfo[] = "✗ SKIPPING - Records already exist and force_insert is not enabled";
                         continue;
                     }
                 }
 
+                $fileInsertCount = 0;
+                $fileSkippedCount = 0;
+                
                 // Process data rows
                 for ($rowIndex = $dataStartRow; $rowIndex < count($rows) && $rowIndex <= $cutoffRow; $rowIndex++) {
                     $row = $rows[$rowIndex] ?? [];
                     
                     $rowString = implode(' ', $row);
-                    if (stripos($rowString, 'NET Income') !== false) {
-                        break;
+                    // Skip summary rows - but be more specific
+                    if (stripos($rowString, 'NET Income') !== false || 
+                        (stripos($rowString, 'TOTAL') !== false && stripos($rowString, 'NET') !== false)) {
+                        $skippedRows[] = "Row $rowIndex: Summary row (NET Income or TOTAL)";
+                        $fileSkippedCount++;
+                        continue;
                     }
 
                     $isEmpty = true;
@@ -675,53 +918,88 @@ if (!empty($regionID) && !empty($area)) {
                         }
                     }
                     if ($isEmpty) {
+                        $skippedRows[] = "Row $rowIndex: Empty row";
+                        $fileSkippedCount++;
                         continue;
                     }
 
                     $glCode = isset($row[$glCodeCol]) ? trim($row[$glCodeCol]) : '';
                     $description = isset($row[$descriptionCol]) ? trim($row[$descriptionCol]) : '';
 
-                    if (empty($glCode) || !is_numeric($glCode) || empty($description)) {
+                    // Skip rows without valid GL code - but be more flexible
+                    if (empty($glCode) || empty($description)) {
+                        $skippedRows[] = "Row $rowIndex: Missing GL Code or Description (glCode='$glCode', desc='$description')";
+                        $fileSkippedCount++;
                         continue;
                     }
 
+                    // Try to handle non-numeric GL codes that might be valid (like "GL001")
+                    $glCodeNumeric = $glCode;
+                    if (!is_numeric($glCode)) {
+                        // Try to extract numbers from GL code
+                        preg_match('/\d+/', $glCode, $matches);
+                        if (!empty($matches)) {
+                            $glCodeNumeric = $matches[0];
+                        } else {
+                            $skippedRows[] = "Row $rowIndex: Non-numeric GL Code (glCode='$glCode')";
+                            $fileSkippedCount++;
+                            continue;
+                        }
+                    }
+
+                    // Insert each transaction type (Branch and Showroom) as separate records
                     foreach ($transactionTypes as $tt) {
                         if (isset($row[$tt['col']])) {
                             $amountValue = trim($row[$tt['col']] ?? '0');
-                            $amount = (float)str_replace([',', ' ', '₱', '$', '(', ')'], '', $amountValue);
                             
-                            if (strpos($amountValue, '(') !== false && strpos($amountValue, ')') !== false) {
-                                $amount = -$amount;
+                            // Extract numeric amount using the enhanced function
+                            $amount = extractNumericAmount($amountValue);
+                            
+                            // Allow zero amounts to be inserted
+                            // Only skip if the value is truly empty (no value at all)
+                            if ($amountValue === '') {
+                                $skippedRows[] = "Row $rowIndex, {$tt['type']}: Empty amount value";
+                                $fileSkippedCount++;
+                                continue;
                             }
                             
-                            $percentage = $percentageCol !== null ? trim($row[$percentageCol] ?? '0') : '0';
-                            
+                            // Insert the record with correct column mapping
                             $stmt->bind_param(
-                                "ssdsssssssssssss",
-                                $glCode,
-                                $description,
-                                $amount,
-                                $percentage,
-                                $region,
-                                $area,
-                                $mainzone,
-                                $zone,
-                                $region_code,
-                                $tt['type'],
-                                $dbTransactionMonth,
-                                $dbTransactionYear,
-                                $uploadedBy,
-                                $regionID,
-                                $uploadedDate,
-                                $glRegion
+                                "ssdssssssssssss",
+                                $glCodeNumeric,    // gl_code
+                                $description,      // gl_description
+                                $amount,          // amount (including 0.00)
+                                $region,          // region (from lookup)
+                                $area,            // area (CLEANED - just the letter)
+                                $mainzone,        // mainzone
+                                $zone,            // zone
+                                $region_code,     // region_code
+                                $tt['type'],      // transaction_type
+                                $dbTransactionMonth, // transaction_month
+                                $dbTransactionYear,  // transaction_year
+                                $uploadedBy,      // uploaded_by
+                                $regionID,        // region_id
+                                $uploadedDate,    // uploaded_date
+                                $glRegion         // gl_region (CLEANED - just the description)
                             );
 
                             if ($stmt->execute()) {
                                 $insertCount++;
+                                $fileInsertCount++;
+                                $processedRows[] = "Row $rowIndex, {$tt['type']}: Inserted GL Code $glCodeNumeric, Amount " . number_format($amount, 2);
+                            } else {
+                                $skippedRows[] = "Row $rowIndex, {$tt['type']}: Insert failed - " . $stmt->error;
+                                $fileSkippedCount++;
                             }
+                        } else {
+                            $skippedRows[] = "Row $rowIndex, {$tt['type']}: Column index {$tt['col']} not found in row";
+                            $fileSkippedCount++;
                         }
                     }
                 }
+                $debugInfo[] = "✓ Inserted $fileInsertCount records from this file";
+                $debugInfo[] = "✗ Skipped $fileSkippedCount rows from this file";
+                $debugInfo[] = "--- End of file processing ---";
             }
 
             $stmt->close();
@@ -743,7 +1021,7 @@ if (!empty($regionID) && !empty($area)) {
                 }
                 header("Location: comparative_report_csv.php");
                 exit;
-            } elseif (!empty($existingRegions)) {
+            } elseif (!empty($existingRegions) && !$forceInsert) {
                 $conn->rollback();
                 $existingRegions = array_unique($existingRegions);
                 $regionList = implode(', ', $existingRegions);
@@ -768,7 +1046,38 @@ if (!empty($regionID) && !empty($area)) {
                     $periodDisplay = $transactionYear;
                 }
 
-                $_SESSION['upload_message'] = "<div class='success'>Success! Processed all CSV files. $insertCount total records inserted for $periodDisplay.</div>";
+                // Add detailed debug info
+                $debugOutput = implode("\n", $debugInfo);
+                $skippedOutput = implode("\n", $skippedRows);
+                $processedOutput = implode("\n", $processedRows);
+                
+                $_SESSION['upload_message'] = "<div class='success'>✅ Success! Processed all CSV files. <strong>$insertCount</strong> total records inserted for $periodDisplay.<br><br>
+                    <div class='debug-details'>
+                        <details style='margin-top:10px;'>
+                            <summary style='cursor:pointer;font-weight:bold;color:#2d3748;'>📋 Processing Summary</summary>
+                            <div style='margin-top:10px;'>
+                                <p><strong>Total Records Inserted:</strong> $insertCount</p>
+                                <p><strong>Total Rows Skipped:</strong> " . count($skippedRows) . "</p>
+                            </div>
+                        </details>
+                        " . (count($skippedRows) > 0 ? "
+                        <details style='margin-top:10px;'>
+                            <summary style='cursor:pointer;font-weight:bold;color:#e53e3e;'>⚠️ Skipped Rows Details (" . count($skippedRows) . ")</summary>
+                            <pre style='background:#fff5f5;padding:15px;border-radius:5px;font-size:12px;text-align:left;white-space:pre-wrap;word-wrap:break-word;max-height:300px;overflow-y:auto;margin:10px 0 0 0;color:#c53030;'>" . htmlspecialchars($skippedOutput) . "</pre>
+                        </details>
+                        " : "") . "
+                        <details style='margin-top:10px;'>
+                            <summary style='cursor:pointer;font-weight:bold;color:#2d3748;'>📋 Detailed Debug Log</summary>
+                            <pre style='background:#f5f5f5;padding:15px;border-radius:5px;font-size:12px;text-align:left;white-space:pre-wrap;word-wrap:break-word;max-height:500px;overflow-y:auto;margin:10px 0 0 0;'>" . htmlspecialchars($debugOutput) . "</pre>
+                        </details>
+                        " . (count($processedRows) > 0 ? "
+                        <details style='margin-top:10px;'>
+                            <summary style='cursor:pointer;font-weight:bold;color:#38a169;'>✅ Inserted Rows Details (" . count($processedRows) . ")</summary>
+                            <pre style='background:#f0fff4;padding:15px;border-radius:5px;font-size:12px;text-align:left;white-space:pre-wrap;word-wrap:break-word;max-height:300px;overflow-y:auto;margin:10px 0 0 0;color:#276749;'>" . htmlspecialchars($processedOutput) . "</pre>
+                        </details>
+                        " : "") . "
+                    </div>
+                </div>";
                 header("Location: comparative_report_csv.php");
                 exit;
             }
@@ -795,7 +1104,119 @@ if (!empty($regionID) && !empty($area)) {
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <link rel="stylesheet" href="css/comparative_csv.css?v=<?= time(); ?>">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-
+    <style>
+        .debug-details {
+            background: #f8f9fa;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 15px;
+            margin-top: 15px;
+        }
+        .debug-details summary {
+            cursor: pointer;
+            font-weight: 600;
+            color: #2d3748;
+        }
+        .debug-details pre {
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 5px;
+            font-size: 12px;
+            text-align: left;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            max-height: 500px;
+            overflow-y: auto;
+            margin: 10px 0 0 0;
+        }
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+            overflow: auto;
+        }
+        .modal-content {
+            background-color: #fefefe;
+            margin: 5% auto;
+            padding: 30px;
+            border-radius: 8px;
+            max-width: 700px;
+            max-height: 90vh;
+            overflow-y: auto;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .close {
+            color: #aaa;
+            float: right;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .close:hover {
+            color: #000;
+        }
+        .modal-icon {
+            text-align: center;
+            margin-bottom: 15px;
+        }
+        .modal-icon i {
+            font-size: 3rem;
+        }
+        .fa-check-circle {
+            color: #28a745;
+        }
+        .fa-exclamation-circle {
+            color: #dc3545;
+        }
+        .fa-exclamation-triangle {
+            color: #f0ad4e;
+        }
+        .modal-title {
+            font-size: 1.5rem;
+            font-weight: bold;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+        .modal-message {
+            text-align: left;
+            font-size: 1em;
+            margin-bottom: 20px;
+        }
+        .modal-actions {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        .btn-confirm {
+            padding: 10px 25px;
+            background: #28a745;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        .btn-cancel {
+            padding: 10px 25px;
+            background: #6c757d;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .btn-confirm:hover {
+            background: #218838;
+        }
+        .btn-cancel:hover {
+            background: #5a6268;
+        }
+    </style>
 </head>
 <body>
     <main class="main-content">
@@ -847,8 +1268,8 @@ if (!empty($regionID) && !empty($area)) {
 
                         <div style="display: flex; flex-direction: column;">
                             <label style="font-weight: 600; margin-bottom: 5px;">Choose CSV File:</label>
-                            <div style="display: flex; gap: 10px;">
-                                <input type="file" name="csv_file[]" accept=".csv,text/csv" required multiple style="padding: 9px; border: 1px solid #cbd5e0; border-radius: 8px;">
+                            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                                <input type="file" name="csv_file[]" accept=".csv,text/csv" required multiple style="padding: 9px; border: 1px solid #cbd5e0; border-radius: 8px; flex: 1; min-width: 200px;">
                                 <button type="submit" style="margin-left: 0;"><i class="fa-solid fa-eye"></i> Preview</button>
                                 <a href="report.php" class="btn-generate"><i class="fa-regular fa-file"></i> View Report</a>
                                 <a href="comparative_report_csv.php" class="btn-reset"><i class="fa-solid fa-rotate"></i> Refresh</a>
@@ -878,16 +1299,16 @@ if (!empty($regionID) && !empty($area)) {
 
                 <?php if (!empty($uploadMessage)): ?>
                     <div id="messageModal" class="modal" style="display: block;">
-                        <div class="modal-content">
+                        <div class="modal-content" style="max-width: 700px; max-height: 90vh; overflow-y: auto;">
                             <span class="close" onclick="closeMessageModal()">&times;</span>
                             <div class="modal-icon" style="text-align: center; margin-bottom: 10px;">
-                                <?php if (strpos($uploadMessage, 'success') !== false): ?>
+                                <?php if (strpos($uploadMessage, 'Success') !== false || strpos($uploadMessage, '✅') !== false): ?>
                                     <i class="fas fa-check-circle" style="color: #28a745; font-size: 3rem;"></i>
                                 <?php else: ?>
                                     <i class="fas fa-exclamation-circle" style="color: #dc3545; font-size: 3rem;"></i>
                                 <?php endif; ?>
                             </div>
-                            <div class="modal-message" style="text-align: center; font-size: 1.1em;">
+                            <div class="modal-message" style="text-align: left; font-size: 1em;">
                                 <?php echo $uploadMessage; ?>
                             </div>
                             <div class="modal-actions" style="justify-content: center; margin-top: 20px; display: flex;">
@@ -923,7 +1344,7 @@ if (!empty($regionID) && !empty($area)) {
                 <?php endforeach; ?>
                 <input type="hidden" name="force_insert" value="1">
                 <div class="modal-actions">
-                    <button type="submit" class="btn-confirm">Yes</button>
+                    <button type="submit" class="btn-confirm">Yes, Proceed</button>
                     <button type="button" class="btn-cancel" onclick="closeModal()">Cancel</button>
                 </div>
             </form>
@@ -940,6 +1361,13 @@ if (!empty($regionID) && !empty($area)) {
             const modal = document.getElementById('messageModal');
             if (modal) {
                 modal.style.display = 'none';
+                // Refresh page if it's a success message
+                const messageContent = document.querySelector('.modal-message');
+                if (messageContent && messageContent.textContent.includes('Success')) {
+                    setTimeout(function() {
+                        window.location.href = 'comparative_report_csv.php';
+                    }, 3000);
+                }
             }
         }
 
