@@ -3,8 +3,6 @@ session_start();
 require_once __DIR__ . '/../config/config.php'; 
 require_once '../vendor/autoload.php';
 
-use PhpOffice\PhpSpreadsheet\IOFactory;
-
 // Check if reset is requested
 if (isset($_GET['reset']) && $_GET['reset'] == '1') {
     unset($_SESSION['parsed_data']);
@@ -16,6 +14,7 @@ if (isset($_GET['reset']) && $_GET['reset'] == '1') {
     unset($_SESSION['summary_data']);
     unset($_SESSION['column_mapping']);
     unset($_SESSION['remarks_data']);
+    unset($_SESSION['skipped_data']);
     header("Location: upload_raw_data.php");
     exit;
 }
@@ -57,6 +56,16 @@ define('COL_CODE', 6);
 define('COL_DESCRIPTION', 7);
 define('COL_AMOUNT', 8);
 
+// Helper: normalize a raw amount string into a rounded float.
+// Centralizing this ensures every view (Detailed, Summary, Remarks)
+// parses and rounds amounts identically, so totals never drift apart
+// due to floating-point summation order.
+function parseAmount(string $amount_str): float
+{
+    $amount_str = trim($amount_str ?? '0');
+    $amount_str = str_replace(['₱', 'PHP', '$', ',', ' '], '', $amount_str);
+    return round(floatval($amount_str), 2);
+}
 // Function to get branch type from masterdata
 function getBranchType(string $branch_id): string
 {
@@ -95,6 +104,66 @@ function getBranchType(string $branch_id): string
     }
 }
 
+// Function to clean malformed CSV fields with backslash and quotes
+function cleanCsvField(string $field): string
+{
+    // Remove extra quotes and backslashes
+    $field = trim($field);
+    // Remove leading/trailing quotes if present
+    $field = preg_replace('/^"|"$/', '', $field);
+    // Remove backslashes before quotes (fix for \" pattern)
+    $field = str_replace('\\"', '"', $field);
+    return $field;
+}
+
+// Function to parse CSV with better handling of quoted fields
+function parseCsvFile(string $filePath): array
+{
+    $rows = [];
+    if (($handle = fopen($filePath, "r")) !== FALSE) {
+        // Detect delimiter (comma or semicolon)
+        $firstLine = fgets($handle);
+        rewind($handle);
+        
+        // Check if delimiter is comma or semicolon
+        $delimiter = ',';
+        if (strpos($firstLine, ';') !== false && strpos($firstLine, ',') === false) {
+            $delimiter = ';';
+        }
+        
+        // Read CSV with proper handling.
+        // NOTE: the escape parameter is intentionally set to "\0" (a byte that
+        // won't appear in the file) instead of '\\'. PHP's backslash-escape
+        // handling in fgetcsv() is non-standard and can silently corrupt a row
+        // when a field contains a literal quote that isn't meant as CSV
+        // escaping -- e.g. a description like `Standard 16"` (an inch mark).
+        // Disabling it means a quote is only ever treated specially when it
+        // truly opens/closes a quoted field (RFC4180 behavior), so a stray "
+        // in the middle of a field no longer shifts or swallows later columns.
+        while (($data = fgetcsv($handle, 0, $delimiter, '"', "\0")) !== FALSE) {
+            // Clean each field
+            $cleaned = array_map('cleanCsvField', $data);
+            $rows[] = $cleaned;
+        }
+        fclose($handle);
+    }
+    return $rows;
+}
+
+// Function to clean a row and ensure it has the right number of columns
+function cleanRowData(array $row, int $expectedColumns = 9): array
+{
+    // If row has fewer columns, pad with empty strings
+    while (count($row) < $expectedColumns) {
+        $row[] = '';
+    }
+    // If row has more columns, trim to expected count
+    if (count($row) > $expectedColumns) {
+        $row = array_slice($row, 0, $expectedColumns);
+    }
+    return $row;
+}
+
 $parsed_data = [];
 $uploaded_headers = [];
 $error_message = '';
@@ -102,6 +171,7 @@ $success_message = '';
 $view_mode = isset($_GET['view']) ? $_GET['view'] : 'raw'; // raw, summary, or remarks
 $summary_data = [];
 $remarks_data = [];
+$skipped_data = [];
 $column_mapping = [];
 
 // Pagination variables
@@ -118,23 +188,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file_upload'])) {
         $file_name = $file['name'];
         $file_ext  = strtolower(pathinfo($file_name, PATHINFO_EXTENSION));
 
-        $allowed_exts = ['csv', 'xlsx', 'xls'];
-
-        if (in_array($file_ext, $allowed_exts)) {
+        // Only allow CSV files
+        if ($file_ext === 'csv') {
             try {
-                $spreadsheet = IOFactory::load($file_tmp);
-                $worksheet   = $spreadsheet->getActiveSheet();
-                $rows        = $worksheet->toArray(null, true, true, true);
+                $rows = [];
+                
+                // Use custom CSV parser
+                $rows = parseCsvFile($file_tmp);
 
                 if (!empty($rows)) {
+                    // Get headers from first row
                     $first_row = array_shift($rows);
-                    // Store the actual headers from the file (for display purposes)
-                    $uploaded_headers = array_map('trim', array_filter($first_row));
-
-                    // Clean up headers - remove empty values and normalize
-                    $uploaded_headers = array_values(array_filter($uploaded_headers, function($val) {
+                    // Clean headers
+                    $uploaded_headers = array_map('trim', array_filter($first_row, function($val) {
                         return !empty(trim($val));
                     }));
+                    $uploaded_headers = array_values($uploaded_headers);
+                    
+                    // Ensure headers match expected count
+                    if (count($uploaded_headers) < 9) {
+                        // Pad headers if needed
+                        while (count($uploaded_headers) < 9) {
+                            $uploaded_headers[] = 'Column ' . (count($uploaded_headers) + 1);
+                        }
+                    }
 
                     // Fixed column mapping based on position
                     $region_idx = COL_REGION;  // Column C (index 2)
@@ -158,14 +235,74 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file_upload'])) {
                     error_log("Fixed Column Mapping: " . print_r($column_mapping, true));
                     error_log("Headers: " . print_r($uploaded_headers, true));
 
-                    foreach ($rows as $row) {
-                        if (!array_filter($row)) continue;
-                        $row_data = [];
-                        foreach ($first_row as $key => $header_name) {
-                            $row_data[] = $row[$key] ?? '';
+                    $skipped_rows = 0;
+                    $malformed_rows = 0;
+                    $processed_rows = 0;
+                    $skipped_data = [];
+
+                    foreach ($rows as $row_index => $row) {
+                        // Remember the column count BEFORE padding/truncating --
+                        // a count that doesn't match 9 is a strong signal that a
+                        // stray character (commonly an unescaped ") in the source
+                        // file shifted the columns during parsing.
+                        $original_col_count = count($row);
+
+                        // Clean and normalize the row
+                        $row = cleanRowData($row);
+                        
+                        // Check if row has any actual data (not just empty strings)
+                        $hasData = false;
+                        foreach ($row as $cell) {
+                            if (!empty(trim($cell))) {
+                                $hasData = true;
+                                break;
+                            }
                         }
+                        
+                        if (!$hasData) {
+                            $skipped_rows++;
+                            error_log("Skipping empty row " . ($row_index + 2));
+                            $skipped_data[] = [
+                                'row_number' => $row_index + 2,
+                                'reason' => 'Empty row (no data in any column)',
+                                'raw_data' => array_pad(array_slice(array_map('trim', $row), 0, 9), 9, '')
+                            ];
+                            continue;
+                        }
+                        
+                        // Build row data with proper column mapping
+                        $row_data = [];
+                        for ($i = 0; $i < 9; $i++) {
+                            $row_data[] = isset($row[$i]) ? trim($row[$i]) : '';
+                        }
+                        
+                        // Validate that we have the minimum required data
+                        // At minimum, we need Amount (index 8) and Branch ID (index 5)
+                        if (empty($row_data[COL_AMOUNT]) && empty($row_data[COL_BRANCH_ID])) {
+                            $malformed_rows++;
+                            error_log("Skipping malformed row " . ($row_index + 2) . " - missing amount and branch ID: " . print_r($row_data, true));
+
+                            $reason = 'Missing both Amount and Branch ID';
+                            if ($original_col_count !== 9) {
+                                $reason .= " (row had {$original_col_count} columns instead of 9 -- likely an unescaped \" character in a field, e.g. a description like Standard 16\", shifted the remaining columns)";
+                            }
+
+                            $skipped_data[] = [
+                                'row_number' => $row_index + 2,
+                                'reason' => $reason,
+                                'raw_data' => $row_data
+                            ];
+                            continue;
+                        }
+                        
                         $parsed_data[] = $row_data;
+                        $processed_rows++;
                     }
+
+                    error_log("Total rows from file: " . count($rows));
+                    error_log("Processed rows: " . $processed_rows);
+                    error_log("Skipped empty rows: " . $skipped_rows);
+                    error_log("Malformed rows: " . $malformed_rows);
 
                     // Build summary data from ALL rows - Group by Region, Area, Code, Branch Type
                     $summary_data = [];
@@ -179,9 +316,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file_upload'])) {
                         $branch_id = isset($row[COL_BRANCH_ID]) ? trim($row[COL_BRANCH_ID]) : '';
                         $branch_name = isset($row[COL_BRANCH]) ? trim($row[COL_BRANCH]) : '';
                         $date = isset($row[COL_DATE]) ? trim($row[COL_DATE]) : '';
-                        $amount_str = isset($row[COL_AMOUNT]) ? trim($row[COL_AMOUNT]) : '0';
-                        $amount_str = str_replace(['₱', 'PHP', '$', ',', ' '], '', $amount_str);
-                        $amount = floatval($amount_str);
+                        // Use the shared helper so every view rounds amounts identically
+                        $amount = parseAmount($row[COL_AMOUNT] ?? '0');
                         
                         // Get branch type from masterdata
                         $branch_type = getBranchType($branch_id);
@@ -267,12 +403,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file_upload'])) {
                     $_SESSION['file_name'] = $file_name;
                     $_SESSION['summary_data'] = $summary_data;
                     $_SESSION['remarks_data'] = $remarks_data;
+                    $_SESSION['skipped_data'] = $skipped_data;
                     $_SESSION['column_mapping'] = $column_mapping;
                     
                     // Show debug info
                     $debug_info = "Fixed column mapping: Region=Column C (index 2), Area=Column D (index 3), Code=Column G (index 6), Amount=Column I (index 8), Branch ID=Column F (index 5)";
                     $unknown_count = count($remarks_data);
-                    $_SESSION['success_message'] = "File <strong>" . htmlspecialchars($file_name) . "</strong> parsed successfully! Previewing " . count($parsed_data) . " rows. Found <strong>$unknown_count</strong> unknown branch types. " . $debug_info;
+                    $skipped_count = count($skipped_data);
+                    $_SESSION['success_message'] = "File <strong>" . htmlspecialchars($file_name) . "</strong> parsed successfully! Previewing " . count($parsed_data) . " rows. Found <strong>$unknown_count</strong> unknown branch types" . ($skipped_count > 0 ? " and <strong>$skipped_count</strong> skipped rows" : "") . ". " . $debug_info;
 
                     $current_page = 1;
                     $success_message = $_SESSION['success_message'];
@@ -283,9 +421,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file_upload'])) {
             } catch (Exception $e) {
                 $error_message = "Error parsing file: " . $e->getMessage();
                 $_SESSION['error_message'] = $error_message;
+                error_log("File parsing error: " . $e->getMessage());
             }
         } else {
-            $error_message = "Invalid file type. Please upload a .csv, .xlsx, or .xls file.";
+            $error_message = "Invalid file type. Please upload a .csv file only.";
             $_SESSION['error_message'] = $error_message;
         }
     } else {
@@ -302,6 +441,7 @@ if (isset($_SESSION['parsed_data']) && empty($parsed_data)) {
     $error_message = $_SESSION['error_message'] ?? '';
     $summary_data = $_SESSION['summary_data'] ?? [];
     $remarks_data = $_SESSION['remarks_data'] ?? [];
+    $skipped_data = $_SESSION['skipped_data'] ?? [];
     $column_mapping = $_SESSION['column_mapping'] ?? [];
 }
 
@@ -316,9 +456,8 @@ if (!empty($summary_data) && !isset($summary_data[0]['branch_total'])) {
         $branch_id = isset($row[COL_BRANCH_ID]) ? trim($row[COL_BRANCH_ID]) : '';
         $branch_type = getBranchType($branch_id);
         
-        $amount_str = isset($row[COL_AMOUNT]) ? trim($row[COL_AMOUNT]) : '0';
-        $amount_str = str_replace(['₱', 'PHP', '$', ',', ' '], '', $amount_str);
-        $amount = floatval($amount_str);
+        // Use the shared helper so this legacy-regeneration path matches the main one
+        $amount = parseAmount($row[COL_AMOUNT] ?? '0');
 
         $key = $region . '|' . $area . '|' . $code . '|' . $branch_type;
         
@@ -372,12 +511,31 @@ $page_rows = array_slice($parsed_data, $offset, $rows_per_page);
 // For summary view, we want to show all data without pagination
 $summary_total_rows = count($summary_data);
 
-// Calculate grand total for raw data view
+// Calculate grand total for raw data view (single pass over parsed_data,
+// using the same rounding helper as every other total in this page)
 $grand_total_amount = 0;
 foreach ($parsed_data as $row) {
-    $amount_str = isset($row[COL_AMOUNT]) ? trim($row[COL_AMOUNT]) : '0';
-    $amount_str = str_replace(['₱', 'PHP', '$', ',', ' '], '', $amount_str);
-    $grand_total_amount += floatval($amount_str);
+    $grand_total_amount += parseAmount($row[COL_AMOUNT] ?? '0');
+}
+
+// Direct branch/showroom/overall breakdown computed straight from parsed_data
+// in a single pass -- this is what the Summary view's "OVERALL GRAND TOTAL"
+// row now uses instead of re-summing already-aggregated region subtotals.
+// Because it walks the same rows, in the same order, with the same rounding
+// as $grand_total_amount above, its Total will always exactly equal the
+// Detailed view's Grand Total -- no floating-point drift possible.
+$grand_branch_total_direct = 0;
+$grand_showroom_total_direct = 0;
+foreach ($parsed_data as $row) {
+    $branch_id = isset($row[COL_BRANCH_ID]) ? trim($row[COL_BRANCH_ID]) : '';
+    $branch_type = getBranchType($branch_id);
+    $amount = parseAmount($row[COL_AMOUNT] ?? '0');
+
+    if (strtolower($branch_type) === 'branch') {
+        $grand_branch_total_direct += $amount;
+    } elseif (strtolower($branch_type) === 'showroom') {
+        $grand_showroom_total_direct += $amount;
+    }
 }
 
 // Clear session messages after displaying
@@ -397,513 +555,9 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
     <title>Raw Data Upload</title>
     <link rel="icon" href="../images/MLW%20Logo.png" type="image/png"/>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-    <link rel="stylesheet" href="css/comparative.css?v=<?= time(); ?>">
+    <link rel="stylesheet" href="css/upload_raw.css?v=<?= time(); ?>">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 
-    <style>
-        .upload-container {
-            max-width: 2000px;
-            margin: -1.5% auto;
-            padding: 0 15px;
-        }
-
-        .drop-zone {
-            border: 2px dashed #f63b3b;
-            border-radius: 12px;
-            padding: 10px 20px;
-            text-align: center;
-            background: #f8fafc;
-            cursor: pointer;
-            transition: all 0.2s ease-in-out;
-            position: relative;
-        }
-        .drop-zone:hover, .drop-zone.dragover {
-            background-color: #eff6ff;
-            border-color: #c50000;
-        }
-        .drop-zone i {
-            font-size: 30px;
-            color: #f63b3b;
-            margin-bottom: 12px;
-        }
-        .drop-zone p {
-            font-size: 16px;
-            color: #475569;
-            margin: 4px 0;
-        }
-        .drop-zone input[type="file"] {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            opacity: 0;
-            cursor: pointer;
-        }
-
-        .btn-submit {
-            background-color: #ff0000;
-            color: white;
-            padding: 10px 20px;
-            border: none;
-            border-radius: 6px;
-            font-weight: 600;
-            cursor: pointer;
-            margin-top: 15px;
-        }
-        .btn-submit:hover {
-            background-color: #aa0000;
-        }
-
-        .btn-reset {
-            background-color: #4c4c4c;
-            color: white;
-            padding: 9px 20px;
-            border: none;
-            border-radius: 6px;
-            font-weight: 600;
-            cursor: pointer;
-            margin-top: 15px;
-            text-decoration: none;
-            display: inline-block;
-            transition: all 0.3s ease;
-        }
-        .btn-reset:hover {
-            background-color: #000000;
-            color: white;
-            text-decoration: none;
-        }
-
-        .button-group {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-            margin-top: -.5%;
-            flex-wrap: wrap;
-        }
-
-        .view-toggle {
-            display: flex;
-            gap: 10px;
-            margin: 15px 0 20px 0;
-            align-items: center;
-            flex-wrap: wrap;
-        }
-        .view-toggle .toggle-label {
-            font-weight: 600;
-            color: #1e293b;
-            margin-right: 10px;
-        }
-        .view-toggle .btn-toggle {
-            padding: 8px 20px;
-            border: 2px solid #e2e8f0;
-            border-radius: 6px;
-            background: white;
-            color: #475569;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s;
-            text-decoration: none;
-        }
-        .view-toggle .btn-toggle.active {
-            background: #ff0000;
-            color: white;
-            border-color: #ff0000;
-        }
-        .view-toggle .btn-toggle:hover:not(.active) {
-            background: #f1f5f9;
-            border-color: #94a3b8;
-        }
-        .view-toggle .btn-toggle.remarks-tab {
-            border-color: #e2e8f0;
-        }
-        .view-toggle .btn-toggle.remarks-tab.active {
-            background: #ff0000;
-            border-color: #ff0000;
-            color: white;
-        }
-        .view-toggle .btn-toggle.remarks-tab:hover:not(.active) {
-            background: #fff6f6;
-            border-color: #797878;
-        }
-
-        .pagination-container {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-top: 20px;
-            padding: 15px 20px;
-            background: #f8fafc;
-            border-radius: 8px;
-            border: 1px solid #e2e8f0;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-        .pagination-controls {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }
-        .pagination-controls button {
-            padding: 8px 20px;
-            border: 1px solid #e2e8f0;
-            border-radius: 6px;
-            background: white;
-            cursor: pointer;
-            font-weight: 600;
-            transition: all 0.2s;
-            color: #1e293b;
-        }
-        .pagination-controls button:hover:not(:disabled) {
-            background: #f1f5f9;
-            border-color: #94a3b8;
-        }
-        .pagination-controls button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-        .pagination-info {
-            color: #64748b;
-            font-size: 14px;
-        }
-        .pagination-info strong {
-            color: #1e293b;
-        }
-        .page-indicator {
-            font-weight: 600;
-            color: #1e293b;
-            padding: 0 15px;
-            font-size: 14px;
-        }
-
-        .alert {
-            padding: 12px 16px;
-            border-radius: 6px;
-            margin-bottom: 20px;
-            font-size: 14px;
-        }
-        .alert-danger { background-color: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
-        .alert-success { background-color: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; }
-        .alert-warning { background-color: #fffbeb; color: #92400e; border: 1px solid #fde68a; }
-
-        .table-wrapper {
-            margin-top: 20px;
-            overflow-x: auto;
-            border: 1px solid #e2e8f0;
-            border-radius: 8px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-            max-height: 550px;
-            overflow-y: auto;
-        }
-        .preview-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 13px;
-            text-align: left;
-        }
-        .preview-table th {
-            background-color: #f1f5f9;
-            color: #ffffff;
-            padding: 12px;
-            font-weight: 600;
-            border-bottom: 2px solid #cbd5e1;
-            white-space: nowrap;
-        }
-        .preview-table thead th {
-            position: sticky;
-            top: 0;
-            background-color: #ff0000;
-            z-index: 10;
-            box-shadow: 0 2px 2px -1px rgba(0, 0, 0, 0.1);
-        }
-        .preview-table td {
-            padding: 10px 12px;
-            border-bottom: 1px solid #e2e8f0;
-            color: #334155;
-            white-space: nowrap;
-        }
-        .preview-table tr:hover {
-            background-color: #f8fafc;
-        }
-        .preview-table tr.subtotal-row {
-            background-color: #fef2f2 !important;
-            font-weight: 600;
-        }
-        .preview-table tr.subtotal-row td {
-            border-top: 2px solid #f63b3b;
-            border-bottom: 2px solid #f63b3b;
-            background-color: #fff5f5;
-        }
-        .preview-table tr.region-separator td {
-            border-top: 3px solid #1e293b;
-            background-color: #f1f5f9;
-        }
-        .preview-table tr.grand-total-row td {
-            border-top: 3px solid #1e293b;
-            background-color: #e5e7eb !important;
-            font-weight: 700;
-        }
-        /* Grand total row for raw data */
-        .preview-table tr.raw-grand-total td {
-            border-top: 3px solid #dc2626;
-            border-bottom: 3px solid #dc2626;
-            background-color: #fef2f2 !important;
-            font-weight: 700;
-            color: #dc2626;
-        }
-        .preview-table tr.raw-grand-total td:last-child {
-            color: #dc2626;
-            font-size: 15px;
-        }
-
-        .badge-header {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 4px;
-            font-size: 11px;
-            margin-left: 5px;
-        }
-
-        .row-number {
-            color: #94a3b8;
-            font-weight: bold;
-            width: 50px;
-            min-width: 50px;
-        }
-
-        .hidden {
-            display: none !important;
-        }
-
-        .summary-stats {
-            background: #f8fafc;
-            padding: 12px 20px;
-            border-radius: 8px;
-            border: 1px solid #e2e8f0;
-            margin-bottom: 15px;
-            display: flex;
-            gap: 30px;
-            flex-wrap: wrap;
-        }
-        .summary-stats .stat-item {
-            font-size: 14px;
-            color: #475569;
-        }
-        .summary-stats .stat-item strong {
-            color: #1e293b;
-        }
-        .summary-stats .stat-item .grand-total-value {
-            color: #dc2626;
-            font-size: 16px;
-        }
-
-        .empty-state {
-            text-align: center;
-            padding: 40px 20px;
-            color: #64748b;
-        }
-        .empty-state i {
-            font-size: 48px;
-            color: #cbd5e1;
-            margin-bottom: 15px;
-        }
-        .empty-state h3 {
-            color: #1e293b;
-            margin-bottom: 10px;
-        }
-        
-        .column-mapping-info {
-            background: #f0f7ff;
-            border: 1px solid #b3d4fc;
-            border-radius: 6px;
-            padding: 10px 15px;
-            margin: 10px 0;
-            font-size: 13px;
-            color: #1e293b;
-        }
-        .column-mapping-info code {
-            background: #e2e8f0;
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-size: 12px;
-        }
-
-        .region-group-header {
-            background-color: #f8fafc !important;
-            border-top: 3px solid #1e293b;
-            border-bottom: 1px solid #cbd5e1;
-        }
-        .region-group-header td {
-            font-weight: 700;
-            font-size: 15px;
-            color: #0f172a !important;
-            padding: 12px 15px !important;
-            background-color: #f1f5f9;
-        }
-        .area-subtotal-row {
-            background-color: #fef2f2 !important;
-        }
-        .area-subtotal-row td {
-            font-weight: 700;
-            color: #991b1b !important;
-            border-top: 2px solid #f63b3b;
-            border-bottom: 2px solid #f63b3b;
-            background-color: #fff5f5;
-        }
-        .region-grand-total {
-            background-color: #e5e7eb !important;
-        }
-        .region-grand-total td {
-            font-weight: 800;
-            font-size: 15px;
-            color: #000 !important;
-            border-top: 3px solid #1e293b;
-            border-bottom: 3px solid #1e293b;
-            background-color: #d1d5db;
-        }
-        .code-row td {
-            padding: 8px 12px !important;
-        }
-        .code-row .code-value {
-            font-weight: 600;
-            color: #1e293b;
-        }
-        .code-row .amount-value {
-            font-weight: 600;
-            color: #0f172a;
-            text-align: right;
-        }
-        .area-name-cell {
-            font-weight: 600;
-            color: #0f172a;
-        }
-        .region-name-cell {
-            font-weight: 700;
-            color: #0f172a;
-        }
-        .subtotal-amount {
-            color: #991b1b !important;
-            font-weight: 700;
-        }
-
-        .branch-type-badge {
-            display: inline-block;
-            padding: 2px 10px;
-            border-radius: 12px;
-            font-size: 11px;
-            font-weight: 600;
-        }
-        .branch-type-badge.branch {
-            background-color: #fedbdb;
-            color: #af1e1e;
-        }
-        .branch-type-badge.showroom {
-            background-color: #ff0000;
-            color: #ffffff;
-        }
-        .branch-type-badge.unknown {
-            background-color: #fef3c7;
-            color: #92400e;
-        }
-        .amount-column {
-            text-align: right;
-            font-weight: 600;
-        }
-        .count-column {
-            text-align: center;
-        }
-        .subtotal-amount-branch {
-            color: #000000 !important;
-        }
-        .subtotal-amount-showroom {
-            color: #000000 !important;
-        }
-        /* Style for negative amounts */
-        .negative-amount {
-            color: #dc2626 !important;
-        }
-        .negative-amount-branch {
-            color: #dc2626 !important;
-        }
-        .negative-amount-showroom {
-            color: #dc2626 !important;
-        }
-
-        /* Remarks Table Styles */
-        .remarks-unknown-badge {
-            display: inline-block;
-            padding: 2px 10px;
-            border-radius: 12px;
-            font-size: 11px;
-            font-weight: 600;
-            background-color: #ffdede;
-            color: #ff0000;
-        }
-        .remarks-table tr:hover {
-            background-color: #fffbeb;
-        }
-        .remarks-table .transaction-details {
-            font-size: 12px;
-            color: #6b7280;
-            margin-top: 4px;
-        }
-        .remarks-table .transaction-details span {
-            display: inline-block;
-            margin-right: 10px;
-        }
-        .remarks-table .expand-btn {
-            background: none;
-            border: none;
-            color: #ff0000;
-            cursor: pointer;
-            font-size: 14px;
-            padding: 2px 6px;
-            border-radius: 4px;
-            transition: all 0.2s;
-        }
-        .remarks-table .expand-btn:hover {
-            background: #fef3c7;
-        }
-        .remarks-table .transaction-row {
-            background-color: #fffbeb;
-        }
-        .remarks-table .transaction-row td {
-            padding: 6px 12px !important;
-            font-size: 12px;
-            color: #6b7280;
-            border-bottom: 1px dashed #fde68a;
-        }
-        .remarks-table .transaction-row .amount-detail {
-            color: #000000;
-            font-weight: 600;
-        }
-
-        @media (max-width: 768px) {
-            .pagination-container {
-                flex-direction: column;
-                align-items: stretch;
-            }
-            .pagination-controls {
-                justify-content: center;
-                flex-wrap: wrap;
-            }
-            .button-group {
-                flex-direction: column;
-                align-items: stretch;
-            }
-            .btn-submit, .btn-reset {
-                width: 100%;
-                text-align: center;
-            }
-            .view-toggle {
-                flex-wrap: wrap;
-            }
-            .summary-stats {
-                flex-direction: column;
-                gap: 5px;
-            }
-        }
-    </style>
 </head>
 <body>
     <main class="main-content">
@@ -918,13 +572,6 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
         <div class="content-wrapper">
             <div class="upload-container">
                 <h2>Upload Raw Data File</h2>
-
-                <!-- Column format information -->
-                <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 10px 15px; margin-bottom: 15px;">
-                    <i class="fa-solid fa-info-circle" style="color: #15803d;"></i>
-                    <strong style="color: #166534;">Column Format (Fixed Positions):</strong>
-                    <span style="color: #166534;">Column A=Date, B=Zone, C=Region, D=Area, E=Branch Name, F=Branch ID, G=GL Code, H=GL Description, I=Total Amount</span>
-                </div>
 
                 <?php if (!empty($error_message)): ?>
                     <div class="alert alert-danger" id="errorAlert">
@@ -942,10 +589,10 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                 <form id="uploadForm" action="" method="POST" enctype="multipart/form-data">
                     <div class="drop-zone" id="dropZone">
                         <i class="fa-solid fa-cloud-arrow-up"></i>
-                        <p><strong>Drag & drop your CSV or Excel file here</strong></p>
-                        <p style="font-size: 13px; color: #94a3b8;">or click to browse from your computer</p>
+                        <p><strong>Drag & drop your CSV file here</strong></p>
+                        <p style="font-size: 13px; color: #94a3b8;">or click to browse from your computer (CSV files only)</p>
                         <span id="file-name-display" style="margin-top: 10px; display: block; font-weight: 600; color: #2563eb;"></span>
-                        <input type="file" name="file_upload" id="fileInput" accept=".csv, .xlsx, .xls" required>
+                        <input type="file" name="file_upload" id="fileInput" accept=".csv" required>
                     </div>
                     <div class="button-group">
                         <button type="submit" class="btn-submit" id="submitBtn">
@@ -972,6 +619,14 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                         <?php if (!empty($remarks_data)): ?>
                             <span class="badge" style="background: #fec7c7; color: #ff0000; padding: 2px 8px; border-radius: 12px; font-size: 11px; margin-left: 5px;">
                                 <?= count($remarks_data) ?>
+                            </span>
+                        <?php endif; ?>
+                    </a>
+                    <a href="?view=skipped" class="btn-toggle skipped-tab <?= $view_mode === 'skipped' ? 'active' : '' ?>">
+                        <i class="fa-solid fa-ban"></i> Skipped Rows
+                        <?php if (!empty($skipped_data)): ?>
+                            <span class="badge" style="background: #fde3b0; color: #b45309; padding: 2px 8px; border-radius: 12px; font-size: 11px; margin-left: 5px;">
+                                <?= count($skipped_data) ?>
                             </span>
                         <?php endif; ?>
                     </a>
@@ -1071,23 +726,6 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                             <span class="stat-item"><i class="fa-solid fa-file"></i> File: <strong><?= htmlspecialchars($_SESSION['file_name'] ?? '') ?></strong></span>
                         </div>
 
-                        <!-- Show column mapping for debugging -->
-                        <?php if (!empty($column_mapping)): ?>
-                        <div class="column-mapping-info">
-                            <i class="fa-solid fa-info-circle"></i> 
-                            <strong>Fixed column mapping (positions):</strong> 
-                            Region → <code>Column C (index 2)</code>, 
-                            Area → <code>Column D (index 3)</code>, 
-                            Code → <code>Column G (index 6)</code>, 
-                            Amount → <code>Column I (index 8)</code>,
-                            Branch ID → <code>Column F (index 5)</code>
-                            <br>
-                            <span style="font-size: 12px; color: #64748b;">
-                                <i class="fa-solid fa-arrow-right"></i> Branch type is determined from masterdata.branch_profile using Branch ID
-                            </span>
-                        </div>
-                        <?php endif; ?>
-
                         <div class="table-wrapper">
                             <table class="preview-table">
                                 <thead>
@@ -1097,12 +735,12 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                         <th style="width: 12%;">Area</th>
                                         <th style="width: 12%;">Code</th>
                                         <th style="width: 10%;">Branch Type</th>
-                                        <th style="width: 13%; text-align: right;">Branch Amount</th>
-                                        <th style="width: 8%; text-align: center;">Branch Count</th>
-                                        <th style="width: 13%; text-align: right;">Showroom Amount</th>
-                                        <th style="width: 8%; text-align: center;">Showroom Count</th>
-                                        <th style="width: 12%; text-align: right;">Total Amount</th>
-                                        <th style="width: 8%; text-align: center;">Total Rows</th>
+                                        <th style="width: 13%;">Branch Amount</th>
+                                        <th style="width: 8%;">Branch Count</th>
+                                        <th style="width: 13%;">Showroom Amount</th>
+                                        <th style="width: 8%;">Showroom Count</th>
+                                        <th style="width: 12%;">Total Amount</th>
+                                        <th style="width: 8%;">Total Rows</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -1300,9 +938,9 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                                     <i class="fa-solid fa-crown"></i> 
                                                     OVERALL GRAND TOTAL (All Regions)
                                                     <span style="float: right; font-weight: 800; color: #ffffff;">
-                                                        Branch: ₱<?= number_format($grand_branch_total, 2) ?> | 
-                                                        Showroom: ₱<?= number_format($grand_showroom_total, 2) ?> | 
-                                                        Total: ₱<?= number_format($grand_total_all, 2) ?>
+                                                        Branch: ₱<?= number_format($grand_branch_total_direct, 2) ?> | 
+                                                        Showroom: ₱<?= number_format($grand_showroom_total_direct, 2) ?> | 
+                                                        Total: ₱<?= number_format($grand_total_amount, 2) ?>
                                                     </span>
                                                 </td>
                                             </tr>
@@ -1323,24 +961,17 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
 
                         <div style="margin-top: 15px; padding: 10px 15px; background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
                             <span style="color: #64748b; font-size: 13px;">
-                                <i class="fa-solid fa-list"></i> Showing <strong><?= isset($row_counter) ? $row_counter - 1 : 0 ?></strong> unique code-branch type entries across <strong><?= isset($grouped_data) ? count($grouped_data) : 0 ?></strong> regions
-                            </span>
-                            <span style="color: #64748b; font-size: 13px;">
-                                <i class="fa-solid fa-info-circle"></i> Each code is broken down by Branch Type (Branch vs Showroom)
+                                <i class="fa-solid fa-info-circle"></i> Each code is broken down by Branch Type (Branch vs Showroom).
                             </span>
                         </div>
 
                     <?php elseif ($view_mode === 'remarks' && !empty($remarks_data)): ?>
                         <!-- REMARKS VIEW - Unknown Branch Types (Display Only) -->
-                        <div style="background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 15px 20px; margin-bottom: 15px;">
+                        <div style="background: #ffebeb; border: 1px solid #ffabab; border-radius: 8px; padding: 15px 20px; margin-bottom: 15px;">
                             <div style="display: flex; align-items: center; gap: 10px;">
-                                <i class="fa-solid fa-triangle-exclamation" style="color: #92400e; font-size: 20px;"></i>
+                                <i class="fa-solid fa-triangle-exclamation" style="color: #ad0000; font-size: 20px;"></i>
                                 <div>
-                                    <strong style="color: #92400e;">Unknown Branch Types</strong>
-                                    <p style="margin: 5px 0 0 0; color: #78350f; font-size: 13px;">
-                                        These transactions have Branch IDs that are not recognized in the masterdata. 
-                                        Listed below are unique Region-Area-Code-Branch ID combinations with their totals.
-                                    </p>
+                                    <strong style="color: #ff0000;">Unknown Branch Types</strong>
                                 </div>
                             </div>
                         </div>
@@ -1362,8 +993,8 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                         <th style="width: 12%;">GL Code</th>
                                         <th style="width: 15%;">Branch ID</th>
                                         <th style="width: 12%;">Branch Name</th>
-                                        <th style="width: 10%; text-align: right;">Total Amount</th>
-                                        <th style="width: 8%; text-align: center;">Transactions</th>
+                                        <th style="width: 10%;">Total Amount</th>
+                                        <th style="width: 8%;">Transactions</th>
                                         <th style="width: 18%;">Transaction Details</th>
                                     </tr>
                                 </thead>
@@ -1446,23 +1077,68 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                             </table>
                         </div>
 
-                        <div style="margin-top: 15px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
-                            <div style="padding: 10px 15px; background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0;">
-                                <span style="color: #64748b; font-size: 13px;">
-                                    <i class="fa-solid fa-info-circle"></i> 
-                                    <strong><?= count($remarks_data) ?></strong> unique combinations found with unknown branch types
-                                </span>
-                            </div>
-                            <div style="padding: 10px 15px; background: #ffd7d7; border-radius: 6px; border: 1px solid #fd8a8a;">
-                                <span style="color: #64748b; font-size: 13px;">
-                                    <i class="fa-solid fa-flag"></i> 
-                                    <span style="color: #92400e; font-weight: 600;">Total Unknown Amount: ₱<?= number_format($grand_unknown_total, 2) ?></span>
-                                    <span style="color: #92400e; font-weight: 600; margin-left: 15px;">
-                                        (<?= $grand_unknown_count ?> transactions)
-                                    </span>
-                                </span>
+                    <?php elseif ($view_mode === 'skipped'): ?>
+                        <!-- SKIPPED ROWS VIEW -->
+                        <div style="background: #ffe5e5; border: 1px solid #c80000; border-radius: 8px; padding: 15px 20px; margin-bottom: 15px;">
+                            <div style="display: flex; align-items: center; gap: 10px;">
+                                <i class="fa-solid fa-ban" style="color: #c20c0c; font-size: 20px;"></i>
+                                <div>
+                                    <strong style="color: #c20c0c;">Skipped Rows</strong>
+                                    <div style="font-size: 13px; color: #d00202; margin-top: 2px;">
+                                        Rows excluded from the import due to some conditions.
+                                    </div>
+                                </div>
                             </div>
                         </div>
+
+                        <?php if (!empty($skipped_data)): ?>
+                        <div class="summary-stats">
+                            <span class="stat-item"><i class="fa-solid fa-ban"></i> <strong><?= count($skipped_data) ?></strong> skipped rows</span>
+                            <span class="stat-item"><i class="fa-solid fa-file"></i> File: <strong><?= htmlspecialchars($_SESSION['file_name'] ?? '') ?></strong></span>
+                        </div>
+
+                        <div class="table-wrapper">
+                            <table class="preview-table skipped-table">
+                                <thead>
+                                    <tr>
+                                        <th style="width: 60px;">Row # base on CSV file</th>
+                                        <th style="width: 28%;">Reason</th>
+                                        <?php foreach ($display_headers as $col_header): ?>
+                                            <th><?= htmlspecialchars($col_header) ?></th>
+                                        <?php endforeach; ?>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php foreach ($skipped_data as $item): ?>
+                                        <tr>
+                                            <td style="text-align: center; color: #94a3b8;"><?= $item['row_number'] ?></td>
+                                            <td>
+                                                <span class="remarks-unknown-badge" style="background: #ffedd5; color: #c2410c;">
+                                                    <i class="fa-solid fa-triangle-exclamation"></i> <?= htmlspecialchars($item['reason']) ?>
+                                                </span>
+                                            </td>
+                                            <?php foreach ($item['raw_data'] as $val): ?>
+                                                <td><?= htmlspecialchars($val ?? '') ?></td>
+                                            <?php endforeach; ?>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                        <?php else: ?>
+                        <div class="table-wrapper">
+                            <table class="preview-table">
+                                <tbody>
+                                    <tr>
+                                        <td style="text-align: center; padding: 40px; color: #484848;">
+                                            <i class="fa-solid fa-check-circle" style="font-size: 24px; color: #10b981; display: block; margin-bottom: 10px;"></i>
+                                            No rows were skipped during the preview.
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <?php endif; ?>
 
                     <?php endif; ?>
                 </div>
@@ -1528,8 +1204,14 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
         const dt = e.dataTransfer;
         const files = dt.files;
         if (files.length) {
+            const file = files[0];
+            const fileExt = file.name.split('.').pop().toLowerCase();
+            if (fileExt !== 'csv') {
+                alert('Please upload a CSV file only.');
+                return;
+            }
             fileInput.files = files;
-            updateFileName(files[0].name);
+            updateFileName(file.name);
             setTimeout(() => {
                 if (document.getElementById('uploadForm').checkValidity()) {
                     document.getElementById('uploadForm').submit();
@@ -1540,7 +1222,16 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
 
     fileInput.addEventListener('change', () => {
         if (fileInput.files.length > 0) {
-            updateFileName(fileInput.files[0].name);
+            const file = fileInput.files[0];
+            const fileExt = file.name.split('.').pop().toLowerCase();
+            if (fileExt !== 'csv') {
+                alert('Please upload a CSV file only.');
+                fileInput.value = '';
+                fileNameDisplay.textContent = '';
+                fileNameDisplay.style.color = '#2563eb';
+                return;
+            }
+            updateFileName(file.name);
         }
     });
 

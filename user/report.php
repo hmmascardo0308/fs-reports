@@ -139,7 +139,7 @@ if (!empty($filter_areas)) {
 <body>
     <main class="main-content">
         <header class="top-bar">
-            <h2><a href="comparative_report.php" style="font-size: 16px; text-decoration: none;">⬅ Back</a></h2>
+            <h2><a href="user_dashboard.php" style="font-size: 16px; text-decoration: none;">⬅ Back</a></h2>
             <div class="user-badge">
                 <span><?php echo htmlspecialchars($username); ?> (<?php echo htmlspecialchars($user_type); ?>)</span>
                 <div class="avatar"><?php echo strtoupper(substr($full_name, 0, 1)); ?></div>

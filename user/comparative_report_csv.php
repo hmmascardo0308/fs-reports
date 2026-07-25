@@ -800,7 +800,7 @@ if (!empty($regionID) && !empty($area)) {
 <body>
     <main class="main-content">
         <header class="top-bar">
-            <a href="user_dashboard.php" style="font-size: 16px; text-decoration: none; font-weight: bold;">Back</a>
+            <a href="user_dashboard.php" style="font-size: 16px; text-decoration: none; font-weight: bold;">⬅ Back</a>
             <div class="user-badge">
                 <span><?php echo htmlspecialchars($username); ?> (<?php echo htmlspecialchars($user_type); ?>)</span>
                 <div class="avatar"><?php echo strtoupper(substr($full_name, 0, 1)); ?></div>
