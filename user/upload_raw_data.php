@@ -48,19 +48,29 @@ if (isset($_SERVER['HTTP_REFERER']) && !empty($_SERVER['HTTP_REFERER'])) {
     }
 }
 
-// Check if we need to clear data
+// Check if we need to clear data - ONLY when navigating to a different page
 if (isset($_SESSION['clear_on_next_load']) && $_SESSION['clear_on_next_load'] === true) {
-    unset($_SESSION['parsed_data']);
-    unset($_SESSION['uploaded_headers']);
-    unset($_SESSION['total_rows']);
-    unset($_SESSION['file_name']);
-    unset($_SESSION['success_message']);
-    unset($_SESSION['error_message']);
-    unset($_SESSION['summary_data']);
-    unset($_SESSION['column_mapping']);
-    unset($_SESSION['remarks_data']);
-    unset($_SESSION['skipped_data']);
-    unset($_SESSION['clear_on_next_load']);
+    // Check if we're still on the same page (pagination or view change)
+    $current_page = isset($_GET['page']) ? $_GET['page'] : '';
+    $current_view = isset($_GET['view']) ? $_GET['view'] : '';
+    
+    // Only clear if not on upload_raw_data.php with view/page parameters
+    if (empty($current_page) && empty($current_view)) {
+        unset($_SESSION['parsed_data']);
+        unset($_SESSION['uploaded_headers']);
+        unset($_SESSION['total_rows']);
+        unset($_SESSION['file_name']);
+        unset($_SESSION['success_message']);
+        unset($_SESSION['error_message']);
+        unset($_SESSION['summary_data']);
+        unset($_SESSION['column_mapping']);
+        unset($_SESSION['remarks_data']);
+        unset($_SESSION['skipped_data']);
+        unset($_SESSION['clear_on_next_load']);
+    } else {
+        // We're still on the same page, don't clear
+        unset($_SESSION['clear_on_next_load']);
+    }
 }
 
 if (!isset($_SESSION['username'])) {
@@ -736,7 +746,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                             </table>
                         </div>
 
-                        <!-- Raw Pagination Controls -->
+                        <!-- Raw Pagination Controls - FIXED -->
                         <div class="pagination-container">
                             <div class="pagination-info">
                                 Showing <strong><?= $offset + 1 ?></strong> - 
@@ -745,19 +755,31 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                             </div>
                             
                             <div class="pagination-controls">
-                                <button onclick="changePage(1, 'raw')" <?= $current_page <= 1 ? 'disabled' : '' ?>>
-                                    <i class="fa-solid fa-angles-left"></i>
-                                </button>
-                                <button onclick="changePage(<?= $current_page - 1 ?>, 'raw')" <?= $current_page <= 1 ? 'disabled' : '' ?>>
-                                    <i class="fa-solid fa-chevron-left"></i> Previous
-                                </button>
+                                <?php if ($current_page > 1): ?>
+                                    <a href="?view=raw&page=1" class="pagination-link">
+                                        <i class="fa-solid fa-angles-left"></i>
+                                    </a>
+                                    <a href="?view=raw&page=<?= $current_page - 1 ?>" class="pagination-link">
+                                        <i class="fa-solid fa-chevron-left"></i> Previous
+                                    </a>
+                                <?php else: ?>
+                                    <span class="pagination-disabled"><i class="fa-solid fa-angles-left"></i></span>
+                                    <span class="pagination-disabled"><i class="fa-solid fa-chevron-left"></i> Previous</span>
+                                <?php endif; ?>
+                                
                                 <span class="page-indicator">Page <?= $current_page ?> of <?= $total_pages ?></span>
-                                <button onclick="changePage(<?= $current_page + 1 ?>, 'raw')" <?= $current_page >= $total_pages ? 'disabled' : '' ?>>
-                                    Next <i class="fa-solid fa-chevron-right"></i>
-                                </button>
-                                <button onclick="changePage(<?= $total_pages ?>, 'raw')" <?= $current_page >= $total_pages ? 'disabled' : '' ?>>
-                                    <i class="fa-solid fa-angles-right"></i>
-                                </button>
+                                
+                                <?php if ($current_page < $total_pages): ?>
+                                    <a href="?view=raw&page=<?= $current_page + 1 ?>" class="pagination-link">
+                                        Next <i class="fa-solid fa-chevron-right"></i>
+                                    </a>
+                                    <a href="?view=raw&page=<?= $total_pages ?>" class="pagination-link">
+                                        <i class="fa-solid fa-angles-right"></i>
+                                    </a>
+                                <?php else: ?>
+                                    <span class="pagination-disabled">Next <i class="fa-solid fa-chevron-right"></i></span>
+                                    <span class="pagination-disabled"><i class="fa-solid fa-angles-right"></i></span>
+                                <?php endif; ?>
                             </div>
                         </div>
 
@@ -1194,13 +1216,13 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
 <?php include '../footer.php'; ?>
 
 <script>
-    // Pagination functions
+    // Pagination functions - FIXED
     function changePage(pageNumber, view) {
         if (pageNumber < 1) return;
         const urlParams = new URLSearchParams(window.location.search);
         urlParams.set('page', pageNumber);
         urlParams.set('view', view || 'raw');
-        window.location.search = urlParams.toString();
+        window.location.href = window.location.pathname + '?' + urlParams.toString();
     }
 
     function changeSummaryPage(pageNumber) {
@@ -1208,7 +1230,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
         const urlParams = new URLSearchParams(window.location.search);
         urlParams.set('spage', pageNumber);
         urlParams.set('view', 'summary');
-        window.location.search = urlParams.toString();
+        window.location.href = window.location.pathname + '?' + urlParams.toString();
     }
 
     // Toggle transaction details in Remarks view
@@ -1312,25 +1334,16 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
     });
 
     // ============================================
-    // AUTO-CLEAR SESSION ON NAVIGATION AWAY
+    // SESSION MANAGEMENT - IMPROVED
     // ============================================
     
-    // Clear session when navigating away from this page
-    window.addEventListener('beforeunload', function(e) {
-        // Send a beacon to clear session data
-        if (navigator.sendBeacon) {
-            navigator.sendBeacon('clear_session.php');
-        } else {
-            // Fallback for older browsers - use synchronous XHR (not recommended but works)
-            try {
-                const xhr = new XMLHttpRequest();
-                xhr.open('GET', 'clear_session.php', false);
-                xhr.send();
-            } catch (err) {
-                // Silent fail
-            }
-        }
-    });
+    // REMOVED: Auto-clear on beforeunload - was causing issues with pagination
+    // The session is now only cleared when explicitly reset or when navigating
+    // to a completely different page (handled by PHP)
+    
+    console.log('Raw Data Upload page loaded successfully');
+    console.log('Session data persists for pagination and view switching');
+    console.log('Session will timeout after 30 minutes of inactivity');
 
     // ============================================
     // SESSION TIMEOUT WITH INACTIVITY
@@ -1365,9 +1378,38 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
     // Start the timer when page loads
     resetInactivityTimer();
 
-    console.log('Raw Data Upload page loaded successfully');
-    console.log('Session will auto-clear when navigating away');
-    console.log('Session will timeout after ' + TIMEOUT_MINUTES + ' minutes of inactivity');
+    // Add CSS for pagination links
+    const style = document.createElement('style');
+    style.textContent = `
+        .pagination-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 8px 14px;
+            background: #f1f5f9;
+            color: #1e293b;
+            border-radius: 6px;
+            text-decoration: none;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        .pagination-link:hover {
+            background: #eb2525;
+            color: white;
+        }
+        .pagination-disabled {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 8px 14px;
+            background: #e2e8f0;
+            color: #94a3b8;
+            border-radius: 6px;
+            font-size: 14px;
+            cursor: not-allowed;
+        }
+    `;
+    document.head.appendChild(style);
 </script>
 </body>
 </html>

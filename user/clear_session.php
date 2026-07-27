@@ -14,6 +14,7 @@ unset($_SESSION['column_mapping']);
 unset($_SESSION['remarks_data']);
 unset($_SESSION['skipped_data']);
 unset($_SESSION['clear_on_next_load']);
+unset($_SESSION['last_activity']);
 
 // Return a simple response
 header('Content-Type: application/json');
