@@ -30,6 +30,7 @@ if (isset($_GET['reset']) && $_GET['reset'] == '1') {
     unset($_SESSION['remarks_data']);
     unset($_SESSION['skipped_data']);
     unset($_SESSION['last_activity']);
+    unset($_SESSION['file_names']);
     header("Location: upload_raw_data.php");
     exit;
 }
@@ -67,6 +68,7 @@ if (isset($_SESSION['clear_on_next_load']) && $_SESSION['clear_on_next_load'] ==
         unset($_SESSION['remarks_data']);
         unset($_SESSION['skipped_data']);
         unset($_SESSION['clear_on_next_load']);
+        unset($_SESSION['file_names']);
     } else {
         // We're still on the same page, don't clear
         unset($_SESSION['clear_on_next_load']);
@@ -218,272 +220,432 @@ function cleanRowData(array $row, int $expectedColumns = 9): array
     return $row;
 }
 
+// Function to process a single file and return its data
+function processSingleFile(string $filePath, string $fileName): array
+{
+    $result = [
+        'parsed_data' => [],
+        'uploaded_headers' => [],
+        'skipped_data' => [],
+        'summary_data' => [],
+        'remarks_data' => [],
+        'column_mapping' => [],
+        'total_rows' => 0,
+        'error' => null
+    ];
+    
+    try {
+        $rows = parseCsvFile($filePath);
+
+        if (!empty($rows)) {
+            // Get headers from first row
+            $first_row = array_shift($rows);
+            // Clean headers
+            $uploaded_headers = array_map('trim', array_filter($first_row, function($val) {
+                return !empty(trim($val));
+            }));
+            $uploaded_headers = array_values($uploaded_headers);
+            
+            // Ensure headers match expected count
+            if (count($uploaded_headers) < 9) {
+                while (count($uploaded_headers) < 9) {
+                    $uploaded_headers[] = 'Column ' . (count($uploaded_headers) + 1);
+                }
+            }
+
+            // Fixed column mapping based on position
+            $region_idx = COL_REGION;
+            $area_idx = COL_AREA;
+            $code_idx = COL_CODE;
+            $amount_idx = COL_AMOUNT;
+            $branch_id_idx = COL_BRANCH_ID;
+            
+            $column_mapping = [
+                'region' => $region_idx,
+                'area' => $area_idx,
+                'code' => $code_idx,
+                'amount' => $amount_idx,
+                'branch_id' => $branch_id_idx,
+                'date' => COL_DATE,
+                'zone' => COL_ZONE,
+                'branch' => COL_BRANCH,
+                'description' => COL_DESCRIPTION
+            ];
+            
+            $parsed_data = [];
+            $skipped_data = [];
+            $skipped_rows = 0;
+            $malformed_rows = 0;
+            $processed_rows = 0;
+
+            foreach ($rows as $row_index => $row) {
+                $original_col_count = count($row);
+                $row = cleanRowData($row);
+                
+                $hasData = false;
+                foreach ($row as $cell) {
+                    if (!empty(trim($cell))) {
+                        $hasData = true;
+                        break;
+                    }
+                }
+                
+                if (!$hasData) {
+                    $skipped_rows++;
+                    $skipped_data[] = [
+                        'row_number' => $row_index + 2,
+                        'reason' => 'Empty row (no data in any column)',
+                        'raw_data' => array_pad(array_slice(array_map('trim', $row), 0, 9), 9, '')
+                    ];
+                    continue;
+                }
+                
+                $row_data = [];
+                for ($i = 0; $i < 9; $i++) {
+                    $row_data[] = isset($row[$i]) ? trim($row[$i]) : '';
+                }
+                
+                if (empty($row_data[COL_AMOUNT]) && empty($row_data[COL_BRANCH_ID])) {
+                    $malformed_rows++;
+                    $reason = 'Missing both Amount and Branch ID';
+                    if ($original_col_count !== 9) {
+                        $reason .= " (row had {$original_col_count} columns instead of 9)";
+                    }
+                    $skipped_data[] = [
+                        'row_number' => $row_index + 2,
+                        'reason' => $reason,
+                        'raw_data' => $row_data
+                    ];
+                    continue;
+                }
+                
+                $parsed_data[] = $row_data;
+                $processed_rows++;
+            }
+
+            // Build summary data
+            $summary_data = [];
+            $remarks_data = [];
+            
+            foreach ($parsed_data as $row_index => $row) {
+                $region = isset($row[COL_REGION]) ? trim($row[COL_REGION]) : 'Unknown Region';
+                $area = isset($row[COL_AREA]) ? trim($row[COL_AREA]) : 'Unknown Area';
+                $code = isset($row[COL_CODE]) ? trim($row[COL_CODE]) : 'Unknown Code';
+                $branch_id = isset($row[COL_BRANCH_ID]) ? trim($row[COL_BRANCH_ID]) : '';
+                $branch_name = isset($row[COL_BRANCH]) ? trim($row[COL_BRANCH]) : '';
+                $date = isset($row[COL_DATE]) ? trim($row[COL_DATE]) : '';
+                $amount = parseAmount($row[COL_AMOUNT] ?? '0');
+                
+                $branch_type = getBranchType($branch_id);
+                
+                if ($branch_type === 'Unknown' && !empty($branch_id)) {
+                    $key = $region . '|' . $area . '|' . $code . '|' . $branch_id;
+                    
+                    if (!isset($remarks_data[$key])) {
+                        $remarks_data[$key] = [
+                            'region' => $region,
+                            'area' => $area,
+                            'code' => $code,
+                            'branch_id' => $branch_id,
+                            'branch_name' => $branch_name,
+                            'date' => $date,
+                            'total_amount' => 0,
+                            'row_count' => 0,
+                            'transactions' => []
+                        ];
+                    }
+                    
+                    $remarks_data[$key]['total_amount'] += $amount;
+                    $remarks_data[$key]['row_count']++;
+                    $remarks_data[$key]['transactions'][] = [
+                        'date' => $date,
+                        'branch_name' => $branch_name,
+                        'amount' => $amount
+                    ];
+                }
+
+                $summary_key = $region . '|' . $area . '|' . $code . '|' . $branch_type;
+                
+                if (!isset($summary_data[$summary_key])) {
+                    $summary_data[$summary_key] = [
+                        'region' => $region,
+                        'area' => $area,
+                        'code' => $code,
+                        'branch_type' => $branch_type,
+                        'branch_total' => 0,
+                        'branch_count' => 0,
+                        'showroom_total' => 0,
+                        'showroom_count' => 0,
+                        'total_amount' => 0,
+                        'total_count' => 0
+                    ];
+                }
+                
+                if (strtolower($branch_type) === 'branch' || $branch_type === 'Branch') {
+                    $summary_data[$summary_key]['branch_total'] += $amount;
+                    $summary_data[$summary_key]['branch_count']++;
+                } elseif (strtolower($branch_type) === 'showroom' || $branch_type === 'Showroom') {
+                    $summary_data[$summary_key]['showroom_total'] += $amount;
+                    $summary_data[$summary_key]['showroom_count']++;
+                }
+                
+                $summary_data[$summary_key]['total_amount'] += $amount;
+                $summary_data[$summary_key]['total_count']++;
+            }
+
+            // Sort summary
+            usort($summary_data, function($a, $b) {
+                if ($a['region'] != $b['region']) return strcmp($a['region'], $b['region']);
+                if ($a['area'] != $b['area']) return strcmp($a['area'], $b['area']);
+                if ($a['code'] != $b['code']) return strcmp($a['code'], $b['code']);
+                return strcmp($a['branch_type'], $b['branch_type']);
+            });
+            
+            usort($remarks_data, function($a, $b) {
+                if ($a['region'] != $b['region']) return strcmp($a['region'], $b['region']);
+                if ($a['area'] != $b['area']) return strcmp($a['area'], $b['area']);
+                if ($a['code'] != $b['code']) return strcmp($a['code'], $b['code']);
+                return strcmp($a['branch_id'], $b['branch_id']);
+            });
+
+            $result['parsed_data'] = $parsed_data;
+            $result['uploaded_headers'] = $uploaded_headers;
+            $result['skipped_data'] = $skipped_data;
+            $result['summary_data'] = $summary_data;
+            $result['remarks_data'] = $remarks_data;
+            $result['column_mapping'] = $column_mapping;
+            $result['total_rows'] = count($parsed_data);
+        }
+    } catch (Exception $e) {
+        $result['error'] = $e->getMessage();
+        error_log("File parsing error for $fileName: " . $e->getMessage());
+    }
+    
+    return $result;
+}
+
+// Function to merge multiple parsed data sets
+function mergeParsedData(array $all_data): array
+{
+    $merged = [
+        'parsed_data' => [],
+        'skipped_data' => [],
+        'summary_data' => [],
+        'remarks_data' => [],
+        'total_rows' => 0,
+        'file_names' => [],
+        'uploaded_headers' => []
+    ];
+    
+    // Collect all parsed data and skipped data
+    foreach ($all_data as $file_result) {
+        if (!empty($file_result['parsed_data'])) {
+            $merged['parsed_data'] = array_merge($merged['parsed_data'], $file_result['parsed_data']);
+        }
+        if (!empty($file_result['skipped_data'])) {
+            $merged['skipped_data'] = array_merge($merged['skipped_data'], $file_result['skipped_data']);
+        }
+        if (!empty($file_result['uploaded_headers'])) {
+            $merged['uploaded_headers'] = $file_result['uploaded_headers'];
+        }
+    }
+    
+    // Rebuild summary data from all merged parsed data
+    $summary_data = [];
+    $remarks_data = [];
+    
+    foreach ($merged['parsed_data'] as $row) {
+        $region = isset($row[COL_REGION]) ? trim($row[COL_REGION]) : 'Unknown Region';
+        $area = isset($row[COL_AREA]) ? trim($row[COL_AREA]) : 'Unknown Area';
+        $code = isset($row[COL_CODE]) ? trim($row[COL_CODE]) : 'Unknown Code';
+        $branch_id = isset($row[COL_BRANCH_ID]) ? trim($row[COL_BRANCH_ID]) : '';
+        $branch_name = isset($row[COL_BRANCH]) ? trim($row[COL_BRANCH]) : '';
+        $date = isset($row[COL_DATE]) ? trim($row[COL_DATE]) : '';
+        $amount = parseAmount($row[COL_AMOUNT] ?? '0');
+        
+        $branch_type = getBranchType($branch_id);
+        
+        if ($branch_type === 'Unknown' && !empty($branch_id)) {
+            $key = $region . '|' . $area . '|' . $code . '|' . $branch_id;
+            
+            if (!isset($remarks_data[$key])) {
+                $remarks_data[$key] = [
+                    'region' => $region,
+                    'area' => $area,
+                    'code' => $code,
+                    'branch_id' => $branch_id,
+                    'branch_name' => $branch_name,
+                    'date' => $date,
+                    'total_amount' => 0,
+                    'row_count' => 0,
+                    'transactions' => []
+                ];
+            }
+            
+            $remarks_data[$key]['total_amount'] += $amount;
+            $remarks_data[$key]['row_count']++;
+            $remarks_data[$key]['transactions'][] = [
+                'date' => $date,
+                'branch_name' => $branch_name,
+                'amount' => $amount
+            ];
+        }
+
+        $summary_key = $region . '|' . $area . '|' . $code . '|' . $branch_type;
+        
+        if (!isset($summary_data[$summary_key])) {
+            $summary_data[$summary_key] = [
+                'region' => $region,
+                'area' => $area,
+                'code' => $code,
+                'branch_type' => $branch_type,
+                'branch_total' => 0,
+                'branch_count' => 0,
+                'showroom_total' => 0,
+                'showroom_count' => 0,
+                'total_amount' => 0,
+                'total_count' => 0
+            ];
+        }
+        
+        if (strtolower($branch_type) === 'branch' || $branch_type === 'Branch') {
+            $summary_data[$summary_key]['branch_total'] += $amount;
+            $summary_data[$summary_key]['branch_count']++;
+        } elseif (strtolower($branch_type) === 'showroom' || $branch_type === 'Showroom') {
+            $summary_data[$summary_key]['showroom_total'] += $amount;
+            $summary_data[$summary_key]['showroom_count']++;
+        }
+        
+        $summary_data[$summary_key]['total_amount'] += $amount;
+        $summary_data[$summary_key]['total_count']++;
+    }
+    
+    // Sort summary
+    usort($summary_data, function($a, $b) {
+        if ($a['region'] != $b['region']) return strcmp($a['region'], $b['region']);
+        if ($a['area'] != $b['area']) return strcmp($a['area'], $b['area']);
+        if ($a['code'] != $b['code']) return strcmp($a['code'], $b['code']);
+        return strcmp($a['branch_type'], $b['branch_type']);
+    });
+    
+    usort($remarks_data, function($a, $b) {
+        if ($a['region'] != $b['region']) return strcmp($a['region'], $b['region']);
+        if ($a['area'] != $b['area']) return strcmp($a['area'], $b['area']);
+        if ($a['code'] != $b['code']) return strcmp($a['code'], $b['code']);
+        return strcmp($a['branch_id'], $b['branch_id']);
+    });
+    
+    $merged['summary_data'] = $summary_data;
+    $merged['remarks_data'] = $remarks_data;
+    $merged['total_rows'] = count($merged['parsed_data']);
+    
+    return $merged;
+}
+
 $parsed_data = [];
 $uploaded_headers = [];
 $error_message = '';
 $success_message = '';
-$view_mode = isset($_GET['view']) ? $_GET['view'] : 'raw'; // raw, summary, or remarks
+$view_mode = isset($_GET['view']) ? $_GET['view'] : 'raw';
 $summary_data = [];
 $remarks_data = [];
 $skipped_data = [];
 $column_mapping = [];
+$file_names = [];
 
 // Pagination variables
 $rows_per_page = 50;
 $current_page = isset($_GET['page']) ? (int)$_GET['page'] : 1;
 $current_page = max(1, $current_page);
 
-// Handle File Processing
+// Handle File Processing - Multiple Files
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file_upload'])) {
-    $file = $_FILES['file_upload'];
-
-    if ($file['error'] === UPLOAD_ERR_OK) {
-        $file_tmp  = $file['tmp_name'];
-        $file_name = $file['name'];
-        $file_ext  = strtolower(pathinfo($file_name, PATHINFO_EXTENSION));
-
-        // Only allow CSV files
-        if ($file_ext === 'csv') {
-            try {
-                $rows = [];
+    $files = $_FILES['file_upload'];
+    $all_results = [];
+    $uploaded_files = [];
+    $has_errors = false;
+    
+    // Check if multiple files were uploaded
+    if (is_array($files['name'])) {
+        // Multiple files
+        $file_count = count($files['name']);
+        
+        for ($i = 0; $i < $file_count; $i++) {
+            if ($files['error'][$i] === UPLOAD_ERR_OK) {
+                $file_tmp = $files['tmp_name'][$i];
+                $file_name = $files['name'][$i];
+                $file_ext = strtolower(pathinfo($file_name, PATHINFO_EXTENSION));
                 
-                // Use custom CSV parser
-                $rows = parseCsvFile($file_tmp);
-
-                if (!empty($rows)) {
-                    // Get headers from first row
-                    $first_row = array_shift($rows);
-                    // Clean headers
-                    $uploaded_headers = array_map('trim', array_filter($first_row, function($val) {
-                        return !empty(trim($val));
-                    }));
-                    $uploaded_headers = array_values($uploaded_headers);
-                    
-                    // Ensure headers match expected count
-                    if (count($uploaded_headers) < 9) {
-                        // Pad headers if needed
-                        while (count($uploaded_headers) < 9) {
-                            $uploaded_headers[] = 'Column ' . (count($uploaded_headers) + 1);
-                        }
+                if ($file_ext === 'csv') {
+                    $result = processSingleFile($file_tmp, $file_name);
+                    if ($result['error']) {
+                        $has_errors = true;
+                        $error_message .= "Error processing '$file_name': " . $result['error'] . "<br>";
+                    } else {
+                        $all_results[] = $result;
+                        $uploaded_files[] = $file_name;
                     }
-
-                    // Fixed column mapping based on position
-                    $region_idx = COL_REGION;  // Column C (index 2)
-                    $area_idx = COL_AREA;       // Column D (index 3)
-                    $code_idx = COL_CODE;       // Column G (index 6)
-                    $amount_idx = COL_AMOUNT;   // Column I (index 8)
-                    $branch_id_idx = COL_BRANCH_ID; // Column F (index 5)
-                    
-                    $column_mapping = [
-                        'region' => $region_idx,
-                        'area' => $area_idx,
-                        'code' => $code_idx,
-                        'amount' => $amount_idx,
-                        'branch_id' => $branch_id_idx,
-                        'date' => COL_DATE,
-                        'zone' => COL_ZONE,
-                        'branch' => COL_BRANCH,
-                        'description' => COL_DESCRIPTION
-                    ];
-                    
-                    error_log("Fixed Column Mapping: " . print_r($column_mapping, true));
-                    error_log("Headers: " . print_r($uploaded_headers, true));
-
-                    $skipped_rows = 0;
-                    $malformed_rows = 0;
-                    $processed_rows = 0;
-                    $skipped_data = [];
-
-                    foreach ($rows as $row_index => $row) {
-                        // Remember the column count BEFORE padding/truncating --
-                        // a count that doesn't match 9 is a strong signal that a
-                        // stray character (commonly an unescaped ") in the source
-                        // file shifted the columns during parsing.
-                        $original_col_count = count($row);
-
-                        // Clean and normalize the row
-                        $row = cleanRowData($row);
-                        
-                        // Check if row has any actual data (not just empty strings)
-                        $hasData = false;
-                        foreach ($row as $cell) {
-                            if (!empty(trim($cell))) {
-                                $hasData = true;
-                                break;
-                            }
-                        }
-                        
-                        if (!$hasData) {
-                            $skipped_rows++;
-                            error_log("Skipping empty row " . ($row_index + 2));
-                            $skipped_data[] = [
-                                'row_number' => $row_index + 2,
-                                'reason' => 'Empty row (no data in any column)',
-                                'raw_data' => array_pad(array_slice(array_map('trim', $row), 0, 9), 9, '')
-                            ];
-                            continue;
-                        }
-                        
-                        // Build row data with proper column mapping
-                        $row_data = [];
-                        for ($i = 0; $i < 9; $i++) {
-                            $row_data[] = isset($row[$i]) ? trim($row[$i]) : '';
-                        }
-                        
-                        // Validate that we have the minimum required data
-                        // At minimum, we need Amount (index 8) and Branch ID (index 5)
-                        if (empty($row_data[COL_AMOUNT]) && empty($row_data[COL_BRANCH_ID])) {
-                            $malformed_rows++;
-                            error_log("Skipping malformed row " . ($row_index + 2) . " - missing amount and branch ID: " . print_r($row_data, true));
-
-                            $reason = 'Missing both Amount and Branch ID';
-                            if ($original_col_count !== 9) {
-                                $reason .= " (row had {$original_col_count} columns instead of 9 -- likely an unescaped \" character in a field, e.g. a description like Standard 16\", shifted the remaining columns)";
-                            }
-
-                            $skipped_data[] = [
-                                'row_number' => $row_index + 2,
-                                'reason' => $reason,
-                                'raw_data' => $row_data
-                            ];
-                            continue;
-                        }
-                        
-                        $parsed_data[] = $row_data;
-                        $processed_rows++;
-                    }
-
-                    error_log("Total rows from file: " . count($rows));
-                    error_log("Processed rows: " . $processed_rows);
-                    error_log("Skipped empty rows: " . $skipped_rows);
-                    error_log("Malformed rows: " . $malformed_rows);
-
-                    // Build summary data from ALL rows - Group by Region, Area, Code, Branch Type
-                    $summary_data = [];
-                    $remarks_data = [];
-                    
-                    foreach ($parsed_data as $row_index => $row) {
-                        // Get values using fixed column positions
-                        $region = isset($row[COL_REGION]) ? trim($row[COL_REGION]) : 'Unknown Region';
-                        $area = isset($row[COL_AREA]) ? trim($row[COL_AREA]) : 'Unknown Area';
-                        $code = isset($row[COL_CODE]) ? trim($row[COL_CODE]) : 'Unknown Code';
-                        $branch_id = isset($row[COL_BRANCH_ID]) ? trim($row[COL_BRANCH_ID]) : '';
-                        $branch_name = isset($row[COL_BRANCH]) ? trim($row[COL_BRANCH]) : '';
-                        $date = isset($row[COL_DATE]) ? trim($row[COL_DATE]) : '';
-                        // Use the shared helper so every view rounds amounts identically
-                        $amount = parseAmount($row[COL_AMOUNT] ?? '0');
-                        
-                        // Get branch type from masterdata
-                        $branch_type = getBranchType($branch_id);
-                        
-                        // If branch type is Unknown, add to remarks data
-                        if ($branch_type === 'Unknown' && !empty($branch_id)) {
-                            $key = $region . '|' . $area . '|' . $code . '|' . $branch_id;
-                            
-                            if (!isset($remarks_data[$key])) {
-                                $remarks_data[$key] = [
-                                    'region' => $region,
-                                    'area' => $area,
-                                    'code' => $code,
-                                    'branch_id' => $branch_id,
-                                    'branch_name' => $branch_name,
-                                    'date' => $date,
-                                    'total_amount' => 0,
-                                    'row_count' => 0,
-                                    'transactions' => [] // Store individual transactions for reference
-                                ];
-                            }
-                            
-                            $remarks_data[$key]['total_amount'] += $amount;
-                            $remarks_data[$key]['row_count']++;
-                            $remarks_data[$key]['transactions'][] = [
-                                'date' => $date,
-                                'branch_name' => $branch_name,
-                                'amount' => $amount
-                            ];
-                        }
-
-                        // Continue with summary data for non-unknown branch types
-                        $summary_key = $region . '|' . $area . '|' . $code . '|' . $branch_type;
-                        
-                        if (!isset($summary_data[$summary_key])) {
-                            $summary_data[$summary_key] = [
-                                'region' => $region,
-                                'area' => $area,
-                                'code' => $code,
-                                'branch_type' => $branch_type,
-                                'branch_total' => 0,
-                                'branch_count' => 0,
-                                'showroom_total' => 0,
-                                'showroom_count' => 0,
-                                'total_amount' => 0,
-                                'total_count' => 0
-                            ];
-                        }
-                        
-                        // Add to appropriate totals based on branch type
-                        if (strtolower($branch_type) === 'branch' || $branch_type === 'Branch') {
-                            $summary_data[$summary_key]['branch_total'] += $amount;
-                            $summary_data[$summary_key]['branch_count']++;
-                        } elseif (strtolower($branch_type) === 'showroom' || $branch_type === 'Showroom') {
-                            $summary_data[$summary_key]['showroom_total'] += $amount;
-                            $summary_data[$summary_key]['showroom_count']++;
-                        }
-                        
-                        // Always add to total
-                        $summary_data[$summary_key]['total_amount'] += $amount;
-                        $summary_data[$summary_key]['total_count']++;
-                    }
-
-                    // Sort summary by Region, then Area, then Code, then Branch Type
-                    usort($summary_data, function($a, $b) {
-                        if ($a['region'] != $b['region']) return strcmp($a['region'], $b['region']);
-                        if ($a['area'] != $b['area']) return strcmp($a['area'], $b['area']);
-                        if ($a['code'] != $b['code']) return strcmp($a['code'], $b['code']);
-                        return strcmp($a['branch_type'], $b['branch_type']);
-                    });
-                    
-                    // Sort remarks data by Region, Area, Code
-                    usort($remarks_data, function($a, $b) {
-                        if ($a['region'] != $b['region']) return strcmp($a['region'], $b['region']);
-                        if ($a['area'] != $b['area']) return strcmp($a['area'], $b['area']);
-                        if ($a['code'] != $b['code']) return strcmp($a['code'], $b['code']);
-                        return strcmp($a['branch_id'], $b['branch_id']);
-                    });
-
-                    $_SESSION['parsed_data'] = $parsed_data;
-                    $_SESSION['uploaded_headers'] = $uploaded_headers;
-                    $_SESSION['total_rows'] = count($parsed_data);
-                    $_SESSION['file_name'] = $file_name;
-                    $_SESSION['summary_data'] = $summary_data;
-                    $_SESSION['remarks_data'] = $remarks_data;
-                    $_SESSION['skipped_data'] = $skipped_data;
-                    $_SESSION['column_mapping'] = $column_mapping;
-                    
-                    // Show debug info
-                    $debug_info = "Fixed column mapping: Region=Column C (index 2), Area=Column D (index 3), Code=Column G (index 6), Amount=Column I (index 8), Branch ID=Column F (index 5)";
-                    $unknown_count = count($remarks_data);
-                    $skipped_count = count($skipped_data);
-                    $_SESSION['success_message'] = "File <strong>" . htmlspecialchars($file_name) . "</strong> parsed successfully! Previewing " . count($parsed_data) . " rows. Found <strong>$unknown_count</strong> unknown branch types" . ($skipped_count > 0 ? " and <strong>$skipped_count</strong> skipped rows" : "") . ". " . $debug_info;
-
-                    $current_page = 1;
-                    $success_message = $_SESSION['success_message'];
                 } else {
-                    $error_message = "The uploaded file appears to be empty.";
-                    $_SESSION['error_message'] = $error_message;
+                    $has_errors = true;
+                    $error_message .= "Invalid file type: '$file_name'. Please upload CSV files only.<br>";
                 }
-            } catch (Exception $e) {
-                $error_message = "Error parsing file: " . $e->getMessage();
-                $_SESSION['error_message'] = $error_message;
-                error_log("File parsing error: " . $e->getMessage());
+            } else {
+                $has_errors = true;
+                $error_message .= "File upload failed for file " . ($i + 1) . " with error code: " . $files['error'][$i] . "<br>";
             }
-        } else {
-            $error_message = "Invalid file type. Please upload a .csv file only.";
-            $_SESSION['error_message'] = $error_message;
         }
     } else {
-        $error_message = "File upload failed with error code: " . $file['error'];
-        $_SESSION['error_message'] = $error_message;
+        // Single file
+        if ($files['error'] === UPLOAD_ERR_OK) {
+            $file_tmp = $files['tmp_name'];
+            $file_name = $files['name'];
+            $file_ext = strtolower(pathinfo($file_name, PATHINFO_EXTENSION));
+            
+            if ($file_ext === 'csv') {
+                $result = processSingleFile($file_tmp, $file_name);
+                if ($result['error']) {
+                    $has_errors = true;
+                    $error_message = "Error processing file: " . $result['error'];
+                } else {
+                    $all_results[] = $result;
+                    $uploaded_files[] = $file_name;
+                }
+            } else {
+                $has_errors = true;
+                $error_message = "Invalid file type. Please upload a .csv file only.";
+            }
+        } else {
+            $has_errors = true;
+            $error_message = "File upload failed with error code: " . $files['error'];
+        }
+    }
+    
+    // Merge all results
+    if (!empty($all_results)) {
+        $merged = mergeParsedData($all_results);
+        
+        // Store in session
+        $_SESSION['parsed_data'] = $merged['parsed_data'];
+        $_SESSION['uploaded_headers'] = $merged['uploaded_headers'];
+        $_SESSION['total_rows'] = $merged['total_rows'];
+        $_SESSION['summary_data'] = $merged['summary_data'];
+        $_SESSION['remarks_data'] = $merged['remarks_data'];
+        $_SESSION['skipped_data'] = $merged['skipped_data'];
+        $_SESSION['column_mapping'] = isset($all_results[0]['column_mapping']) ? $all_results[0]['column_mapping'] : [];
+        $_SESSION['file_names'] = $uploaded_files;
+        
+        $file_count = count($uploaded_files);
+        $unknown_count = count($merged['remarks_data']);
+        $skipped_count = count($merged['skipped_data']);
+        $success_message = "Successfully processed <strong>$file_count</strong> file(s)! Total: " . $merged['total_rows'] . " rows. Found <strong>$unknown_count</strong> unknown branch types" . ($skipped_count > 0 ? " and <strong>$skipped_count</strong> skipped rows" : "") . ".";
+        $_SESSION['success_message'] = $success_message;
+        
+        $current_page = 1;
+    } else {
+        if (empty($error_message)) {
+            $error_message = "No data was processed. Please check your files.";
+            $_SESSION['error_message'] = $error_message;
+        }
     }
 }
 
@@ -497,6 +659,7 @@ if (isset($_SESSION['parsed_data']) && empty($parsed_data)) {
     $remarks_data = $_SESSION['remarks_data'] ?? [];
     $skipped_data = $_SESSION['skipped_data'] ?? [];
     $column_mapping = $_SESSION['column_mapping'] ?? [];
+    $file_names = $_SESSION['file_names'] ?? [];
 }
 
 // If summary_data has old structure (without branch keys), regenerate it
@@ -510,7 +673,6 @@ if (!empty($summary_data) && !isset($summary_data[0]['branch_total'])) {
         $branch_id = isset($row[COL_BRANCH_ID]) ? trim($row[COL_BRANCH_ID]) : '';
         $branch_type = getBranchType($branch_id);
         
-        // Use the shared helper so this legacy-regeneration path matches the main one
         $amount = parseAmount($row[COL_AMOUNT] ?? '0');
 
         $key = $region . '|' . $area . '|' . $code . '|' . $branch_type;
@@ -565,19 +727,13 @@ $page_rows = array_slice($parsed_data, $offset, $rows_per_page);
 // For summary view, we want to show all data without pagination
 $summary_total_rows = count($summary_data);
 
-// Calculate grand total for raw data view (single pass over parsed_data,
-// using the same rounding helper as every other total in this page)
+// Calculate grand total for raw data view
 $grand_total_amount = 0;
 foreach ($parsed_data as $row) {
     $grand_total_amount += parseAmount($row[COL_AMOUNT] ?? '0');
 }
 
 // Direct branch/showroom/overall breakdown computed straight from parsed_data
-// in a single pass -- this is what the Summary view's "OVERALL GRAND TOTAL"
-// row now uses instead of re-summing already-aggregated region subtotals.
-// Because it walks the same rows, in the same order, with the same rounding
-// as $grand_total_amount above, its Total will always exactly equal the
-// Detailed view's Grand Total -- no floating-point drift possible.
 $grand_branch_total_direct = 0;
 $grand_showroom_total_direct = 0;
 foreach ($parsed_data as $row) {
@@ -625,7 +781,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
 
         <div class="content-wrapper">
             <div class="upload-container">
-                <h2>Upload Raw Data File</h2>
+                <h2>Upload Raw Data Files</h2>
 
                 <?php if (!empty($error_message)): ?>
                     <div class="alert alert-danger" id="errorAlert">
@@ -639,14 +795,14 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                     </div>
                 <?php endif; ?>
 
-                <!-- Drag & Drop Upload Form -->
+                <!-- Drag & Drop Upload Form - Multiple Files -->
                 <form id="uploadForm" action="" method="POST" enctype="multipart/form-data">
                     <div class="drop-zone" id="dropZone">
                         <i class="fa-solid fa-cloud-arrow-up"></i>
-                        <p><strong>Drag & drop your CSV file here</strong></p>
-                        <p style="font-size: 13px; color: #94a3b8;">or click to browse from your computer (CSV files only)</p>
-                        <span id="file-name-display" style="margin-top: 10px; display: block; font-weight: 600; color: #2563eb;"></span>
-                        <input type="file" name="file_upload" id="fileInput" accept=".csv" required>
+                        <p><strong>Drag & drop your CSV files here</strong></p>
+                        <p style="font-size: 13px; color: #94a3b8;">or click to browse from your computer (CSV files only, multiple allowed)</p>
+                        <div id="file-list-display" style="margin-top: 10px; display: block; font-weight: 600; color: #2563eb;"></div>
+                        <input type="file" name="file_upload[]" id="fileInput" accept=".csv" multiple required>
                     </div>
                     <div class="button-group">
                         <button type="submit" class="btn-submit" id="submitBtn">
@@ -695,10 +851,13 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                         <div class="summary-stats">
                             <span class="stat-item"><i class="fa-solid fa-file-lines"></i> <strong><?= $total_rows ?></strong> total rows</span>
                             <span class="stat-item"><i class="fa-solid fa-columns"></i> <strong><?= count($display_headers) ?></strong> columns</span>
-                            <span class="stat-item"><i class="fa-solid fa-file"></i> File: <strong><?= htmlspecialchars($_SESSION['file_name'] ?? '') ?></strong></span>
+                            <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
                             <span class="stat-item"><i class="fa-solid fa-calculator"></i> Grand Total: <strong class="grand-total-value">₱<?= number_format($grand_total_amount, 2) ?></strong></span>
+                            <span class="stat-item"><?php if (!empty($file_names)): ?>
+                            <div><i class="fa-solid fa-file"></i> Processed files: <?= implode(', ', array_map('htmlspecialchars', $file_names)) ?></div>
+                                <?php endif; ?>
+                        </span> 
                         </div>
-
                         <div class="table-wrapper">
                             <table class="preview-table">
                                 <thead>
@@ -732,7 +891,6 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                     <tr class="raw-grand-total">
                                         <td class="row-number"></td>
                                         <?php 
-                                        // Empty cells for all columns except the last one (Total Amount)
                                         $total_columns = count($display_headers);
                                         for ($i = 0; $i < $total_columns - 1; $i++): 
                                         ?>
@@ -746,7 +904,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                             </table>
                         </div>
 
-                        <!-- Raw Pagination Controls - FIXED -->
+                        <!-- Raw Pagination Controls -->
                         <div class="pagination-container">
                             <div class="pagination-info">
                                 Showing <strong><?= $offset + 1 ?></strong> - 
@@ -789,8 +947,13 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                             <span class="stat-item"><i class="fa-solid fa-layer-group"></i> <strong><?= count(array_unique(array_column($summary_data, 'region'))) ?></strong> regions</span>
                             <span class="stat-item"><i class="fa-solid fa-cubes"></i> <strong><?= count(array_unique(array_column($summary_data, 'area'))) ?></strong> areas</span>
                             <span class="stat-item"><i class="fa-solid fa-tag"></i> <strong><?= $summary_total_rows ?></strong> unique Region-Area-Code-BranchType combinations</span>
-                            <span class="stat-item"><i class="fa-solid fa-file"></i> File: <strong><?= htmlspecialchars($_SESSION['file_name'] ?? '') ?></strong></span>
+                            <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
+                             <span class="stat-item"><?php if (!empty($file_names)): ?>
+                            <div><i class="fa-solid fa-file"></i> Processed files: <?= implode(', ', array_map('htmlspecialchars', $file_names)) ?></div>
+                                <?php endif; ?>
+                        </span> 
                         </div>
+                      
 
                         <div class="table-wrapper">
                             <table class="preview-table">
@@ -815,7 +978,6 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                         // Group data by Region, then Area, then Code
                                         $grouped_data = [];
                                         foreach ($summary_data as $item) {
-                                            // Ensure all required keys exist
                                             $region = isset($item['region']) ? $item['region'] : 'Unknown Region';
                                             $area = isset($item['area']) ? $item['area'] : 'Unknown Area';
                                             $code = isset($item['code']) ? $item['code'] : 'Unknown Code';
@@ -832,7 +994,6 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                             $grouped_data[$region][$area][$code][] = $item;
                                         }
 
-                                        // Sort regions
                                         ksort($grouped_data);
                                         
                                         $row_counter = 1;
@@ -841,10 +1002,8 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                         $grand_showroom_total = 0;
                                         
                                         foreach ($grouped_data as $region => $areas):
-                                            // Sort areas within region
                                             ksort($areas);
                                             
-                                            // Calculate region totals
                                             $region_branch_total = 0;
                                             $region_showroom_total = 0;
                                             $region_total = 0;
@@ -865,7 +1024,6 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                                 }
                                             }
                                     ?>
-                                            <!-- Region Header Row -->
                                             <tr class="region-group-header">
                                                 <td colspan="11" style="font-size: 16px; color: #0f172a;">
                                                     <i class="fa-solid fa-folder-open"></i> 
@@ -880,7 +1038,6 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                             
                                             <?php 
                                             foreach ($areas as $area => $code_items):
-                                                // Calculate area totals
                                                 $area_branch_total = 0;
                                                 $area_showroom_total = 0;
                                                 $area_total = 0;
@@ -899,7 +1056,6 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                                     }
                                                 }
                                             ?>
-                                                <!-- Area Subtotal Row -->
                                                 <tr class="area-subtotal-row">
                                                     <td colspan="11" style="font-weight: 700; color: #0f172a; padding: 8px 15px !important;">
                                                         <i class="fa-solid fa-caret-right"></i> 
@@ -912,11 +1068,9 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                                     </td>
                                                 </tr>
                                                 
-                                                <!-- Code Rows for this Area -->
                                                 <?php 
                                                 ksort($code_items);
                                                 foreach ($code_items as $code => $items):
-                                                    // Sort items by branch type
                                                     usort($items, function($a, $b) {
                                                         return strcmp($a['branch_type'], $b['branch_type']);
                                                     });
@@ -930,7 +1084,6 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                                         $total_amount = isset($item['total_amount']) ? $item['total_amount'] : 0;
                                                         $total_count = isset($item['total_count']) ? $item['total_count'] : 0;
                                                         
-                                                        // Check if amounts are negative for styling
                                                         $branch_negative = $branch_total < 0;
                                                         $showroom_negative = $showroom_total < 0;
                                                         $total_negative = $total_amount < 0;
@@ -972,9 +1125,8 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                                 endforeach; 
                                                 ?>
                                             <?php 
-                                            endforeach; // End areas
+                                            endforeach;
                                             
-                                            // Region Grand Total
                                             ?>
                                             <tr class="region-grand-total">
                                                 <td colspan="11" style="font-size: 15px; padding: 12px 15px !important;">
@@ -987,16 +1139,14 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                                     </span>
                                                 </td>
                                             </tr>
-                                            <!-- Spacer row -->
                                             <tr style="height: 5px;"><td colspan="11" style="padding: 0; border: none;"></td></tr>
                                             
                                             <?php 
                                             $grand_branch_total += $region_branch_total;
                                             $grand_showroom_total += $region_showroom_total;
                                             $grand_total_all += $region_total;
-                                        endforeach; // End regions
+                                        endforeach;
                                         
-                                        // Overall Grand Total (all regions)
                                         if (count($grouped_data) > 1):
                                         ?>
                                             <tr style="background-color: #ff5656 !important;">
@@ -1032,7 +1182,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                         </div>
 
                     <?php elseif ($view_mode === 'remarks' && !empty($remarks_data)): ?>
-                        <!-- REMARKS VIEW - Unknown Branch Types (Display Only) -->
+                        <!-- REMARKS VIEW - Unknown Branch Types -->
                         <div style="background: #ffebeb; border: 1px solid #ffabab; border-radius: 8px; padding: 15px 20px; margin-bottom: 15px;">
                             <div style="display: flex; align-items: center; gap: 10px;">
                                 <i class="fa-solid fa-triangle-exclamation" style="color: #ad0000; font-size: 20px;"></i>
@@ -1046,8 +1196,14 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                             <span class="stat-item"><i class="fa-solid fa-question-circle"></i> <strong><?= count($remarks_data) ?></strong> unique unknown branch ID combinations</span>
                             <span class="stat-item"><i class="fa-solid fa-layer-group"></i> <strong><?= count(array_unique(array_column($remarks_data, 'region'))) ?></strong> regions affected</span>
                             <span class="stat-item"><i class="fa-solid fa-cubes"></i> <strong><?= count(array_unique(array_column($remarks_data, 'area'))) ?></strong> areas affected</span>
-                            <span class="stat-item"><i class="fa-solid fa-file"></i> File: <strong><?= htmlspecialchars($_SESSION['file_name'] ?? '') ?></strong></span>
+                            <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
+                             <span class="stat-item"><?php if (!empty($file_names)): ?>
+                            <div><i class="fa-solid fa-file"></i> Processed files: <?= implode(', ', array_map('htmlspecialchars', $file_names)) ?></div>
+                                <?php endif; ?>
+                        </span> 
                         </div>
+                        
+                       
 
                         <div class="table-wrapper">
                             <table class="preview-table remarks-table">
@@ -1116,7 +1272,6 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                         $row_counter++;
                                         endforeach; 
                                     ?>
-                                        <!-- Grand Total for Unknown Branch Types -->
                                         <tr style="background-color: #ffdede !important; border-top: 3px solid #ff0000;">
                                             <td colspan="6" style="text-align: right; font-weight: 800; color: #ae0000; font-size: 14px; padding: 12px;">
                                                 <i class="fa-solid fa-calculator"></i> TOTAL UNKNOWN:
@@ -1160,7 +1315,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                         <?php if (!empty($skipped_data)): ?>
                         <div class="summary-stats">
                             <span class="stat-item"><i class="fa-solid fa-ban"></i> <strong><?= count($skipped_data) ?></strong> skipped rows</span>
-                            <span class="stat-item"><i class="fa-solid fa-file"></i> File: <strong><?= htmlspecialchars($_SESSION['file_name'] ?? '') ?></strong></span>
+                            <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
                         </div>
 
                         <div class="table-wrapper">
@@ -1216,7 +1371,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
 <?php include '../footer.php'; ?>
 
 <script>
-    // Pagination functions - FIXED
+    // Pagination functions
     function changePage(pageNumber, view) {
         if (pageNumber < 1) return;
         const urlParams = new URLSearchParams(window.location.search);
@@ -1247,10 +1402,10 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
         }
     }
 
-    // Drag and drop functionality
+    // Drag and drop functionality - Multiple Files
     const dropZone = document.getElementById('dropZone');
     const fileInput = document.getElementById('fileInput');
-    const fileNameDisplay = document.getElementById('file-name-display');
+    const fileListDisplay = document.getElementById('file-list-display');
 
     ['dragenter', 'dragover'].forEach(eventName => {
         dropZone.addEventListener(eventName, (e) => {
@@ -1270,40 +1425,67 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
         const dt = e.dataTransfer;
         const files = dt.files;
         if (files.length) {
-            const file = files[0];
-            const fileExt = file.name.split('.').pop().toLowerCase();
-            if (fileExt !== 'csv') {
-                alert('Please upload a CSV file only.');
-                return;
-            }
-            fileInput.files = files;
-            updateFileName(file.name);
-            setTimeout(() => {
-                if (document.getElementById('uploadForm').checkValidity()) {
-                    document.getElementById('uploadForm').submit();
+            let allValid = true;
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                const fileExt = file.name.split('.').pop().toLowerCase();
+                if (fileExt !== 'csv') {
+                    alert('Please upload CSV files only. Invalid file: ' + file.name);
+                    allValid = false;
+                    break;
                 }
-            }, 500);
+            }
+            if (allValid) {
+                fileInput.files = files;
+                updateFileList(files);
+                setTimeout(() => {
+                    if (document.getElementById('uploadForm').checkValidity()) {
+                        document.getElementById('uploadForm').submit();
+                    }
+                }, 500);
+            }
         }
     });
 
     fileInput.addEventListener('change', () => {
         if (fileInput.files.length > 0) {
-            const file = fileInput.files[0];
-            const fileExt = file.name.split('.').pop().toLowerCase();
-            if (fileExt !== 'csv') {
-                alert('Please upload a CSV file only.');
-                fileInput.value = '';
-                fileNameDisplay.textContent = '';
-                fileNameDisplay.style.color = '#2563eb';
-                return;
+            const files = fileInput.files;
+            let allValid = true;
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                const fileExt = file.name.split('.').pop().toLowerCase();
+                if (fileExt !== 'csv') {
+                    alert('Please upload CSV files only. Invalid file: ' + file.name);
+                    allValid = false;
+                    break;
+                }
             }
-            updateFileName(file.name);
+            if (allValid) {
+                updateFileList(files);
+            } else {
+                fileInput.value = '';
+                fileListDisplay.textContent = '';
+                fileListDisplay.style.color = '#2563eb';
+            }
+        } else {
+            fileListDisplay.textContent = '';
+            fileListDisplay.style.color = '#2563eb';
         }
     });
 
-    function updateFileName(name) {
-        fileNameDisplay.textContent = `Selected File: ${name}`;
-        fileNameDisplay.style.color = '#16a34a';
+    function updateFileList(files) {
+        if (files.length === 0) {
+            fileListDisplay.textContent = '';
+            return;
+        }
+        
+        let fileNames = [];
+        for (let i = 0; i < files.length; i++) {
+            fileNames.push(files[i].name);
+        }
+        
+        fileListDisplay.innerHTML = `<i class="fa-solid fa-check-circle" style="color: #16a34a;"></i> ${files.length} file(s) selected: ${fileNames.join(', ')}`;
+        fileListDisplay.style.color = '#16a34a';
     }
 
     document.getElementById('resetBtn').addEventListener('click', function(e) {
@@ -1333,29 +1515,17 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
         }, 30000);
     });
 
-    // ============================================
-    // SESSION MANAGEMENT - IMPROVED
-    // ============================================
-    
-    // REMOVED: Auto-clear on beforeunload - was causing issues with pagination
-    // The session is now only cleared when explicitly reset or when navigating
-    // to a completely different page (handled by PHP)
-    
-    console.log('Raw Data Upload page loaded successfully');
+    console.log('Raw Data Upload page loaded successfully - Multiple file support enabled');
     console.log('Session data persists for pagination and view switching');
     console.log('Session will timeout after 30 minutes of inactivity');
 
-    // ============================================
-    // SESSION TIMEOUT WITH INACTIVITY
-    // ============================================
-    
+    // Session timeout with inactivity
     let inactivityTimer;
-    const TIMEOUT_MINUTES = 30; // 30 minutes
+    const TIMEOUT_MINUTES = 30;
     
     function resetInactivityTimer() {
         clearTimeout(inactivityTimer);
         inactivityTimer = setTimeout(function() {
-            // Show a warning and redirect to reset
             const shouldReset = confirm(
                 'Your session has been inactive for ' + TIMEOUT_MINUTES + ' minutes.\n\n' +
                 'Click OK to reset the page and clear uploaded data, or Cancel to stay.'
@@ -1363,19 +1533,16 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
             if (shouldReset) {
                 window.location.href = '?reset=1';
             } else {
-                // Reset the timer if user cancels
                 resetInactivityTimer();
             }
         }, TIMEOUT_MINUTES * 60 * 1000);
     }
 
-    // Reset timer on user activity
     const activityEvents = ['click', 'keypress', 'scroll', 'mousemove', 'touchstart', 'touchmove'];
     activityEvents.forEach(event => {
         document.addEventListener(event, resetInactivityTimer);
     });
 
-    // Start the timer when page loads
     resetInactivityTimer();
 
     // Add CSS for pagination links
@@ -1407,6 +1574,13 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
             border-radius: 6px;
             font-size: 14px;
             cursor: not-allowed;
+        }
+        #file-list-display {
+            font-size: 13px;
+            line-height: 1.6;
+        }
+        #file-list-display i {
+            margin-right: 5px;
         }
     `;
     document.head.appendChild(style);
