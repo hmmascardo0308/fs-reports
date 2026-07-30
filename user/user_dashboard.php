@@ -324,7 +324,7 @@ if (isset($_SESSION['password_change_success']) && $_SESSION['password_change_su
                     <ul class="dropdown-menu">
                         <li>
                             <a href="javascript:void(0)" onclick="openFileUploadModal()">
-                                <i class="fas fa-upload"></i> Upload Report
+                                <i class="fas fa-upload"></i> Upload Per Region-Area
                             </a>
                         </li>
 
@@ -341,7 +341,7 @@ if (isset($_SESSION['password_change_success']) && $_SESSION['password_change_su
                         </li>
                         <?php if ($user_type === "admin" || $user_type === "reports") : ?>
                             <li>
-                                <a href="settings.php">
+                                <a href="javascript:void(0)" onclick="openComparativeReportModal()">
                                     <i class="fas fa-chart-pie"></i> Comparative Report
                                 </a>
                             </li>
@@ -525,6 +525,26 @@ if (isset($_SESSION['password_change_success']) && $_SESSION['password_change_su
         </div>
     </div>
 
+    <!-- Comparative Report Selection Modal -->
+    <div id="comparativeReportModal" class="password-modal">
+        <div class="password-modal-content" style="max-width: 450px; text-align: center; position: relative;">
+            <span onclick="closeComparativeReportModal()" style="position: absolute; right: 15px; top: 15px; cursor: pointer; font-size: 24px; color: #888; line-height: 1;">&times;</span>
+            <h2 style="margin-top: 10px; margin-bottom: 20px; color: #333; font-size: 1.5rem;">
+                <i class="fas fa-chart-pie" style="color: #007bff; margin-right: 10px;"></i>Comparative Report
+            </h2>
+            <p style="margin-bottom: 30px; color: #666; font-size: 1rem;">Please select the data source for the comparative report:</p>
+            
+            <div style="display: flex; flex-direction: column; gap: 15px;">
+                <a href="settings.php" class="btn" style="background-color: #007bff; color: white; text-decoration: none; padding: 12px; border-radius: 6px; font-weight: 600; transition: background 0.3s; display: block;">
+                    <i class="fas fa-file-excel" style="margin-right: 8px;"></i> Comparative Report (From Per Region-Area)
+                </a>
+                <a href="comparative_report_raw_data.php" class="btn" style="background-color: #6f42c1; color: white; text-decoration: none; padding: 12px; border-radius: 6px; font-weight: 600; transition: background 0.3s; display: block;">
+                    <i class="fas fa-database" style="margin-right: 8px;"></i> Comparative Report (From Raw Data)
+                </a>
+            </div>
+        </div>
+    </div>
+
     <script>
         // Toggle password visibility
         function togglePassword(inputId, button) {
@@ -561,6 +581,15 @@ if (isset($_SESSION['password_change_success']) && $_SESSION['password_change_su
 
         function closeUploadFileModal() {
             document.getElementById('uploadFileModal').classList.remove('show');
+        }
+
+        // Comparative Report Modal functions
+        function openComparativeReportModal() {
+            document.getElementById('comparativeReportModal').classList.add('show');
+        }
+
+        function closeComparativeReportModal() {
+            document.getElementById('comparativeReportModal').classList.remove('show');
         }
         
         // Dropdown toggle functionality
@@ -606,6 +635,20 @@ if (isset($_SESSION['password_change_success']) && $_SESSION['password_change_su
                         icon.classList.remove('rotate');
                     });
                 }
+            });
+            
+            // Close modals when clicking outside
+            const modals = document.querySelectorAll('.password-modal');
+            modals.forEach(modal => {
+                modal.addEventListener('click', function(e) {
+                    if (e.target === modal) {
+                        // Don't close if it's the password change modal with default password
+                        if (modal.id === 'passwordChangeModal' && <?php echo $is_default_password ? 'true' : 'false'; ?>) {
+                            return;
+                        }
+                        modal.classList.remove('show');
+                    }
+                });
             });
             
             // Real-time password validation
