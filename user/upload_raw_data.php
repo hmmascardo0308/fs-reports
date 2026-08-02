@@ -458,7 +458,7 @@ function insertSummaryData(array $summary_data, string $uploaded_by): array
         $now = new DateTime('now', $timezone);
         $uploaded_date = $now->format('Y-m-d H:i:s');
 
-        // Prepare the insert statement - includes mlmatic_zone
+        // Prepare the insert statement - ADD branch_id and branch_name columns
         $query = "INSERT INTO fs_reports.fs_raw_data_summary (
             transaction_month, transaction_year,
             mainzone, mlmatic_zone, zone,
@@ -468,8 +468,9 @@ function insertSummaryData(array $summary_data, string $uploaded_by): array
             gl_code, gl_desc,
             amount, row_counts,
             transaction_type,
+            branch_id, branch_name,
             uploaded_by, uploaded_date
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
         $stmt = $conn->prepare($query);
         
@@ -486,6 +487,8 @@ function insertSummaryData(array $summary_data, string $uploaded_by): array
             $transaction_type = isset($item['branch_type']) ? trim($item['branch_type']) : '';
             $amount = isset($item['total_amount']) ? $item['total_amount'] : 0;
             $row_count = isset($item['total_count']) ? $item['total_count'] : 0;
+            $branch_id = isset($item['branch_id']) ? trim($item['branch_id']) : '';
+            $branch_name = isset($item['branch_name']) ? trim($item['branch_name']) : '';
             
             // Get the zone from the item (should be from the uploaded data)
             $zone_from_upload = isset($item['zone']) ? trim($item['zone']) : '';
@@ -534,9 +537,9 @@ function insertSummaryData(array $summary_data, string $uploaded_by): array
             // Create variables for bind_param (don't pass literal strings)
             $mlmatic_zone = $zone_from_upload; // Use the zone from the raw data as mlmatic_zone
             
-            // Bind parameters - using variables instead of literal strings
+            // Bind parameters - ADD branch_id and branch_name
             $stmt->bind_param(
-                "ssssssssssssssdsss",
+                "ssssssssssssssdsssss",
                 $transaction_month,
                 $transaction_year,
                 $mainzone,
@@ -553,6 +556,8 @@ function insertSummaryData(array $summary_data, string $uploaded_by): array
                 $amount,
                 $row_count,
                 $transaction_type,
+                $branch_id,
+                $branch_name,
                 $uploaded_by,
                 $uploaded_date
             );
@@ -635,7 +640,7 @@ function cleanRowData(array $row, int $expectedColumns = 10): array
     return $row;
 }
 
-// Function to process a single file and return its data - UPDATE to include Category
+// Function to process a single file and return its data - UPDATE to include Category, Branch ID, Branch Name in summary
 function processSingleFile(string $filePath, string $fileName): array
 {
     $result = [
@@ -740,7 +745,7 @@ function processSingleFile(string $filePath, string $fileName): array
                 $processed_rows++;
             }
 
-            // Build summary data with zone included
+            // Build summary data with zone included - ADD branch_id and branch_name
             $summary_data = [];
             $remarks_data = [];
             
@@ -785,7 +790,8 @@ function processSingleFile(string $filePath, string $fileName): array
                     ];
                 }
 
-                $summary_key = $region . '|' . $area . '|' . $zone . '|' . $code . '|' . $branch_type;
+                // Summary key now includes branch_id and branch_name
+                $summary_key = $region . '|' . $area . '|' . $zone . '|' . $code . '|' . $branch_type . '|' . $branch_id . '|' . $branch_name;
                 
                 if (!isset($summary_data[$summary_key])) {
                     $summary_data[$summary_key] = [
@@ -794,6 +800,8 @@ function processSingleFile(string $filePath, string $fileName): array
                         'zone' => $zone,
                         'code' => $code,
                         'gl_description' => $gl_description,
+                        'branch_id' => $branch_id,
+                        'branch_name' => $branch_name,
                         'branch_type' => $branch_type,
                         'branch_total' => 0,
                         'branch_count' => 0,
@@ -816,13 +824,14 @@ function processSingleFile(string $filePath, string $fileName): array
                 $summary_data[$summary_key]['total_count']++;
             }
 
-            // Sort summary
+            // Sort summary with additional sorting by branch_id
             usort($summary_data, function($a, $b) {
                 if ($a['region'] != $b['region']) return strcmp($a['region'], $b['region']);
                 if ($a['area'] != $b['area']) return strcmp($a['area'], $b['area']);
                 if ($a['zone'] != $b['zone']) return strcmp($a['zone'], $b['zone']);
                 if ($a['code'] != $b['code']) return strcmp($a['code'], $b['code']);
-                return strcmp($a['branch_type'], $b['branch_type']);
+                if ($a['branch_type'] != $b['branch_type']) return strcmp($a['branch_type'], $b['branch_type']);
+                return strcmp($a['branch_id'], $b['branch_id']);
             });
             
             usort($remarks_data, function($a, $b) {
@@ -875,7 +884,7 @@ function mergeParsedData(array $all_data): array
         }
     }
     
-    // Rebuild summary data from all merged parsed data with zone included
+    // Rebuild summary data from all merged parsed data with zone included - ADD branch_id and branch_name
     $summary_data = [];
     $remarks_data = [];
     
@@ -919,7 +928,8 @@ function mergeParsedData(array $all_data): array
             ];
         }
 
-        $summary_key = $region . '|' . $area . '|' . $zone . '|' . $code . '|' . $branch_type;
+        // Summary key with branch_id and branch_name
+        $summary_key = $region . '|' . $area . '|' . $zone . '|' . $code . '|' . $branch_type . '|' . $branch_id . '|' . $branch_name;
         
         if (!isset($summary_data[$summary_key])) {
             $summary_data[$summary_key] = [
@@ -928,6 +938,8 @@ function mergeParsedData(array $all_data): array
                 'zone' => $zone,
                 'code' => $code,
                 'gl_description' => $gl_description,
+                'branch_id' => $branch_id,
+                'branch_name' => $branch_name,
                 'branch_type' => $branch_type,
                 'branch_total' => 0,
                 'branch_count' => 0,
@@ -950,13 +962,14 @@ function mergeParsedData(array $all_data): array
         $summary_data[$summary_key]['total_count']++;
     }
     
-    // Sort summary
+    // Sort summary with branch_id
     usort($summary_data, function($a, $b) {
         if ($a['region'] != $b['region']) return strcmp($a['region'], $b['region']);
         if ($a['area'] != $b['area']) return strcmp($a['area'], $b['area']);
         if ($a['zone'] != $b['zone']) return strcmp($a['zone'], $b['zone']);
         if ($a['code'] != $b['code']) return strcmp($a['code'], $b['code']);
-        return strcmp($a['branch_type'], $b['branch_type']);
+        if ($a['branch_type'] != $b['branch_type']) return strcmp($a['branch_type'], $b['branch_type']);
+        return strcmp($a['branch_id'], $b['branch_id']);
     });
     
     usort($remarks_data, function($a, $b) {
@@ -1081,8 +1094,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file_upload'])) {
     }
 }
 
-// Handle Save to Database
+// Handle Save to Database - WITH UNKNOWN BRANCH CHECK
 if (isset($_POST['save_to_database']) && !empty($_SESSION['parsed_data'])) {
+    // Check if there are unknown branch types
+    $remarks_data_check = $_SESSION['remarks_data'] ?? [];
+    
+    if (!empty($remarks_data_check)) {
+        // There are unknown branch types - prevent saving
+        $unknown_count = count($remarks_data_check);
+        $error_message = "❌ Cannot save to database. Found <strong>$unknown_count</strong> unknown branch type(s) that are not in the masterdata branch profile.<br>";
+        $error_message .= "Please fix these unknown branch IDs first before saving:<br>";
+        $error_message .= "<ul style='margin: 10px 0 0 20px;'>";
+        
+        // Show first 5 unknown branch IDs
+        $display_count = 0;
+        foreach ($remarks_data_check as $item) {
+            if ($display_count >= 5) {
+                $remaining = count($remarks_data_check) - 5;
+                if ($remaining > 0) {
+                    $error_message .= "<li>... and $remaining more unknown branch IDs</li>";
+                }
+                break;
+            }
+            $error_message .= "<li><strong>Branch ID:</strong> " . htmlspecialchars($item['branch_id']) . 
+                            " | <strong>Branch Name:</strong> " . htmlspecialchars($item['branch_name'] ?: 'N/A') . 
+                            " | <strong>GL Code:</strong> " . htmlspecialchars($item['code']) . "</li>";
+            $display_count++;
+        }
+        $error_message .= "</ul>";
+        $error_message .= "<br><strong>Please check the Remarks tab for more details.</strong>";
+        
+        $_SESSION['error_message'] = $error_message;
+        header("Location: upload_raw_data.php?view=remarks");
+        exit;
+    }
+    
+    // Proceed with saving if no unknown branches
     $parsed_data = $_SESSION['parsed_data'];
     $summary_data = $_SESSION['summary_data'] ?? [];
     
@@ -1094,7 +1141,7 @@ if (isset($_POST['save_to_database']) && !empty($_SESSION['parsed_data'])) {
     
     // Set success/error messages
     if ($detailed_result['inserted'] > 0 || $summary_result['inserted'] > 0) {
-        $success_message = "Data successfully saved to database!<br>";
+        $success_message = "✅ Data successfully saved to database!<br>";
         $success_message .= "✅ Detailed: " . $detailed_result['inserted'] . " rows inserted";
         if ($detailed_result['errors'] > 0) {
             $success_message .= " (⚠️ " . $detailed_result['errors'] . " errors)";
@@ -1106,7 +1153,7 @@ if (isset($_POST['save_to_database']) && !empty($_SESSION['parsed_data'])) {
         }
         $_SESSION['success_message'] = $success_message;
     } else {
-        $error_message = "Failed to save data to database.<br>";
+        $error_message = "❌ Failed to save data to database.<br>";
         if (!empty($detailed_result['error_messages'])) {
             $error_message .= "Detailed errors: " . implode("<br>", $detailed_result['error_messages']);
         }
@@ -1136,7 +1183,7 @@ if (isset($_SESSION['parsed_data']) && empty($parsed_data)) {
 
 // If summary_data has old structure (without zone and branch keys), regenerate it
 if (!empty($summary_data) && !isset($summary_data[0]['branch_total'])) {
-    // Regenerate summary data with branch breakdown and zone
+    // Regenerate summary data with branch breakdown, zone, branch_id, and branch_name
     $new_summary_data = [];
     foreach ($parsed_data as $row) {
         $region = isset($row[COL_REGION]) ? trim($row[COL_REGION]) : 'Unknown Region';
@@ -1145,11 +1192,12 @@ if (!empty($summary_data) && !isset($summary_data[0]['branch_total'])) {
         $code = isset($row[COL_CODE]) ? trim($row[COL_CODE]) : 'Unknown Code';
         $gl_description = isset($row[COL_DESCRIPTION]) ? trim($row[COL_DESCRIPTION]) : '';
         $branch_id = isset($row[COL_BRANCH_ID]) ? trim($row[COL_BRANCH_ID]) : '';
+        $branch_name = isset($row[COL_BRANCH]) ? trim($row[COL_BRANCH]) : '';
         $branch_type = getBranchType($branch_id);
         
         $amount = parseAmount($row[COL_AMOUNT] ?? '0');
 
-        $key = $region . '|' . $area . '|' . $zone . '|' . $code . '|' . $branch_type;
+        $key = $region . '|' . $area . '|' . $zone . '|' . $code . '|' . $branch_type . '|' . $branch_id . '|' . $branch_name;
         
         if (!isset($new_summary_data[$key])) {
             $new_summary_data[$key] = [
@@ -1158,6 +1206,8 @@ if (!empty($summary_data) && !isset($summary_data[0]['branch_total'])) {
                 'zone' => $zone,
                 'code' => $code,
                 'gl_description' => $gl_description,
+                'branch_id' => $branch_id,
+                'branch_name' => $branch_name,
                 'branch_type' => $branch_type,
                 'branch_total' => 0,
                 'branch_count' => 0,
@@ -1185,7 +1235,8 @@ if (!empty($summary_data) && !isset($summary_data[0]['branch_total'])) {
         if ($a['area'] != $b['area']) return strcmp($a['area'], $b['area']);
         if ($a['zone'] != $b['zone']) return strcmp($a['zone'], $b['zone']);
         if ($a['code'] != $b['code']) return strcmp($a['code'], $b['code']);
-        return strcmp($a['branch_type'], $b['branch_type']);
+        if ($a['branch_type'] != $b['branch_type']) return strcmp($a['branch_type'], $b['branch_type']);
+        return strcmp($a['branch_id'], $b['branch_id']);
     });
     
     $summary_data = $new_summary_data;
@@ -1232,6 +1283,9 @@ if (isset($_SESSION['success_message']) && empty($_POST)) {
 if (isset($_SESSION['error_message']) && empty($_POST)) {
     unset($_SESSION['error_message']);
 }
+
+// Check if there are unknown branches for UI display
+$has_unknown_branches = !empty($remarks_data);
 ?>
 
 <!DOCTYPE html>
@@ -1291,13 +1345,24 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                     </div>
                 </form>
 
-                <!-- Save to Database Button -->
+                <!-- Save to Database Button - WITH UNKNOWN BRANCH CHECK -->
                 <?php if (!empty($parsed_data) && $view_mode === 'raw'): ?>
-                <form action="" method="POST" style="margin: 15px 0;">
+                <form action="" method="POST" style="margin: 15px 0;" id="saveForm">
                     <input type="hidden" name="save_to_database" value="1">
-                    <button type="submit" class="btn-save-database" onclick="return confirm('Are you sure you want to save this data to the database? This will insert <?= $total_rows ?> detailed rows and <?= $summary_total_rows ?> summary rows.');">
-                        <i class="fa-solid fa-database"></i> Save to Database
+                    <button type="submit" class="btn-save-database" <?= $has_unknown_branches ? 'disabled style="opacity: 0.5; cursor: not-allowed;"' : '' ?> 
+                        onclick="<?= $has_unknown_branches ? 'alert(\'❌ Cannot save to database. Please fix unknown branch types first. Check the Remarks tab for details.\'); return false;' : 'return confirm(\'Are you sure you want to save this data to the database? This will insert ' . $total_rows . ' detailed rows and ' . $summary_total_rows . ' summary rows.\');' ?>">
+                        <i class="fa-solid fa-database"></i> 
+                        <?= $has_unknown_branches ? 'Saving Disabled (Please fix remarks)' : 'Save to Database' ?>
                     </button>
+                    <?php if ($has_unknown_branches): ?>
+                        <div style="margin-top: 8px; padding: 10px; background: #ffebeb; border-radius: 6px; border: 1px solid #ffabab;">
+                            <i class="fa-solid fa-triangle-exclamation" style="color: #dc2626;"></i>
+                            <span style="color: #dc2626; font-size: 14px;">
+                                <strong> Cannot save:</strong> Found <strong><?= count($remarks_data) ?></strong> unknown branch type(s). 
+                                Please check the <a href="?view=remarks" style="color: #dc2626; font-weight: 600; text-decoration: underline;">Remarks tab</a> for details.
+                            </span>
+                        </div>
+                    <?php endif; ?>
                 </form>
                 <?php endif; ?>
 
@@ -1429,12 +1494,12 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                         </div>
 
                     <?php elseif ($view_mode === 'summary' && !empty($summary_data)): ?>
-                        <!-- SUMMARY VIEW - Grouped by Region, Area, Zone, Code with Branch Type Breakdown -->
+                        <!-- SUMMARY VIEW - Grouped by Region, Area, Zone, Code, Branch Type, Branch ID, Branch Name -->
                         <div class="summary-stats">
                             <span class="stat-item"><i class="fa-solid fa-layer-group"></i> <strong><?= count(array_unique(array_column($summary_data, 'region'))) ?></strong> regions</span>
                             <span class="stat-item"><i class="fa-solid fa-cubes"></i> <strong><?= count(array_unique(array_column($summary_data, 'area'))) ?></strong> areas</span>
                             <span class="stat-item"><i class="fa-solid fa-map-pin"></i> <strong><?= count(array_unique(array_column($summary_data, 'zone'))) ?></strong> zones</span>
-                            <span class="stat-item"><i class="fa-solid fa-tag"></i> <strong><?= $summary_total_rows ?></strong> unique Region-Area-Zone-Code-BranchType combinations</span>
+                            <span class="stat-item"><i class="fa-solid fa-tag"></i> <strong><?= $summary_total_rows ?></strong> unique combinations</span>
                             <span class="stat-item"><i class="fa-solid fa-file-lines"></i> <strong><?= count(array_unique(array_column($summary_data, 'gl_description'))) ?></strong> unique GL Descriptions</span>
                             <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
                             <span class="stat-item"><?php if (!empty($file_names)): ?>
@@ -1448,17 +1513,19 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                 <thead>
                                     <tr>
                                         <th style="width: 40px;">#</th>
-                                        <th style="width: 8%;">Region</th>
-                                        <th style="width: 8%;">Area</th>
-                                        <th style="width: 8%;">Zone</th>
+                                        <th style="width: 7%;">Region</th>
+                                        <th style="width: 7%;">Area</th>
+                                        <th style="width: 7%;">Zone</th>
                                         <th style="width: 4%;">Code</th>
-                                        <th style="width: 28%;">GL Description</th>
+                                        <th style="width: 14%;">GL Description</th>
+                                        <th style="width: 8%;">Branch ID</th>
+                                        <th style="width: 10%;">Branch Name</th>
                                         <th style="width: 8%;">Branch Type</th>
-                                        <th style="width: 10%;">Branch Amount</th>
+                                        <th style="width: 9%;">Branch Amount</th>
                                         <th style="width: 4%;">Branch Count</th>
-                                        <th style="width: 10%;">Showroom Amount</th>
+                                        <th style="width: 9%;">Showroom Amount</th>
                                         <th style="width: 4%;">Showroom Count</th>
-                                        <th style="width: 10%;">Total Amount</th>
+                                        <th style="width: 9%;">Total Amount</th>
                                         <th style="width: 7%;">Total Rows</th>
                                     </tr>
                                 </thead>
@@ -1521,7 +1588,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                             }
                                     ?>
                                             <tr class="region-group-header">
-                                                <td colspan="13" style="font-size: 16px; color: #0f172a;">
+                                                <td colspan="15" style="font-size: 16px; color: #0f172a;">
                                                     <i class="fa-solid fa-folder-open"></i> 
                                                     <strong>REGION: <?= htmlspecialchars($region) ?></strong>
                                                     <span style="float: right; font-weight: 600; color: #1e293b;">
@@ -1555,7 +1622,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                                 }
                                             ?>
                                                 <tr class="area-subtotal-row">
-                                                    <td colspan="13" style="font-weight: 700; color: #0f172a; padding: 8px 15px !important;">
+                                                    <td colspan="15" style="font-weight: 700; color: #0f172a; padding: 8px 15px !important;">
                                                         <i class="fa-solid fa-caret-right"></i> 
                                                         <strong>AREA: <?= htmlspecialchars($area) ?></strong>
                                                         <span style="float: right; font-weight: 600; color: #1e293b;">
@@ -1589,7 +1656,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                                     if (!empty($zone)):
                                                 ?>
                                                     <tr class="zone-subtotal-row">
-                                                        <td colspan="13" style="font-weight: 600; color: #0f172a; padding: 6px 15px !important; background: #f1f5f9;">
+                                                        <td colspan="15" style="font-weight: 600; color: #0f172a; padding: 6px 15px !important; background: #f1f5f9;">
                                                             <i class="fa-solid fa-location-dot"></i> 
                                                             <strong>ZONE: <?= htmlspecialchars($zone) ?></strong>
                                                             <span style="float: right; font-weight: 600; color: #1e293b;">
@@ -1604,7 +1671,8 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                                     ksort($code_items);
                                                     foreach ($code_items as $code => $items):
                                                         usort($items, function($a, $b) {
-                                                            return strcmp($a['branch_type'], $b['branch_type']);
+                                                            if ($a['branch_type'] != $b['branch_type']) return strcmp($a['branch_type'], $b['branch_type']);
+                                                            return strcmp($a['branch_id'], $b['branch_id']);
                                                         });
                                                         
                                                         foreach ($items as $idx => $item):
@@ -1616,6 +1684,8 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                                             $total_amount = isset($item['total_amount']) ? $item['total_amount'] : 0;
                                                             $total_count = isset($item['total_count']) ? $item['total_count'] : 0;
                                                             $gl_description = isset($item['gl_description']) ? $item['gl_description'] : '';
+                                                            $branch_id = isset($item['branch_id']) ? $item['branch_id'] : '';
+                                                            $branch_name = isset($item['branch_name']) ? $item['branch_name'] : '';
                                                             
                                                             $branch_negative = $branch_total < 0;
                                                             $showroom_negative = $showroom_total < 0;
@@ -1639,6 +1709,12 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                                                 color: #475569;
                                                             ">
                                                                 <?= htmlspecialchars($gl_description ?: '-') ?>
+                                                            </td>
+                                                            <td style="font-size: 12px; font-weight: 600; color: #1e293b;">
+                                                                <?= htmlspecialchars($branch_id ?: '-') ?>
+                                                            </td>
+                                                            <td style="font-size: 12px; color: #475569;">
+                                                                <?= htmlspecialchars($branch_name ?: '-') ?>
                                                             </td>
                                                             <td>
                                                                 <span class="branch-type-badge <?= $branch_type_class ?>">
@@ -1675,7 +1751,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                             
                                             ?>
                                             <tr class="region-grand-total">
-                                                <td colspan="13" style="font-size: 15px; padding: 12px 15px !important;">
+                                                <td colspan="15" style="font-size: 15px; padding: 12px 15px !important;">
                                                     <i class="fa-solid fa-calculator"></i> 
                                                     <strong>GRAND TOTAL - <?= htmlspecialchars($region) ?></strong>
                                                     <span style="float: right; font-weight: 800; color: #000;">
@@ -1685,7 +1761,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                                     </span>
                                                 </td>
                                             </tr>
-                                            <tr style="height: 5px;"><td colspan="13" style="padding: 0; border: none;"></td></tr>
+                                            <tr style="height: 5px;"><td colspan="15" style="padding: 0; border: none;"></td></tr>
                                             
                                             <?php 
                                             $grand_branch_total += $region_branch_total;
@@ -1696,7 +1772,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                         if (count($grouped_data) > 1):
                                         ?>
                                             <tr style="background-color: #ff5656 !important;">
-                                                <td colspan="13" style="padding: 15px 15px !important; color: white !important; font-size: 17px; font-weight: 800;">
+                                                <td colspan="15" style="padding: 15px 15px !important; color: white !important; font-size: 17px; font-weight: 800;">
                                                     <i class="fa-solid fa-crown"></i> 
                                                     OVERALL GRAND TOTAL (All Regions)
                                                     <span style="float: right; font-weight: 800; color: #ffffff;">
@@ -1711,7 +1787,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
                                     else: 
                                         ?>
                                         <tr>
-                                            <td colspan="13" style="text-align: center; padding: 40px; color: #94a3b8;">
+                                            <td colspan="15" style="text-align: center; padding: 40px; color: #94a3b8;">
                                                 <i class="fa-solid fa-inbox" style="font-size: 24px; display: block; margin-bottom: 10px;"></i>
                                                 No summary data available.
                                             </td>
@@ -1723,7 +1799,7 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
 
                         <div style="margin-top: 15px; padding: 10px 15px; background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
                             <span style="color: #64748b; font-size: 13px;">
-                                <i class="fa-solid fa-info-circle"></i> Each code is broken down by Branch Type (Branch vs Showroom) and grouped by Zone.
+                                <i class="fa-solid fa-info-circle"></i> Each code is broken down by Branch Type, Branch ID, and Branch Name.
                             </span>
                         </div>
 
@@ -2122,6 +2198,22 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
         }, 30000);
     });
 
+    // Prevent saving if there are unknown branches
+    document.addEventListener('DOMContentLoaded', function() {
+        const saveForm = document.getElementById('saveForm');
+        if (saveForm) {
+            saveForm.addEventListener('submit', function(e) {
+                const hasUnknownBranches = <?= $has_unknown_branches ? 'true' : 'false' ?>;
+                if (hasUnknownBranches) {
+                    e.preventDefault();
+                    alert('❌ Cannot save to database. Please fix unknown branch types first.\n\nCheck the Remarks tab for details on which branch IDs are not in the masterdata.');
+                    window.location.href = '?view=remarks';
+                    return false;
+                }
+            });
+        }
+    });
+
     console.log('Raw Data Upload page loaded successfully - Multiple file support enabled');
     console.log('Session data persists for pagination and view switching');
     console.log('Session will timeout after 30 minutes of inactivity');
@@ -2214,13 +2306,17 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
             width: 100%;
             justify-content: center;
         }
-        .btn-save-database:hover {
+        .btn-save-database:hover:not(:disabled) {
             transform: translateY(-2px);
             box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4);
             background: linear-gradient(135deg, #1d4ed8, #1e40af);
         }
-        .btn-save-database:active {
+        .btn-save-database:active:not(:disabled) {
             transform: translateY(0);
+        }
+        .btn-save-database:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
         }
         
         .zone-subtotal-row {

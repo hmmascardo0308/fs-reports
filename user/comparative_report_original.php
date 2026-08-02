@@ -887,7 +887,7 @@ if (!empty($selected_regions)) {
         </header>
 
         <div class="content-wrapper">
-            <div class="page-title">Comparative Report (No Manual Adjustment)</div>
+            <div class="page-title">Comparative Report (No Manual Adjustment) - Per Region & Area</div>
 
             <!-- Error Banner for validation issues -->
             <?php if ($show_error && !empty($error_message)): ?>
