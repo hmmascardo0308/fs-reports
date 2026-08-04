@@ -28,7 +28,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_adjusted_amount') {
     
     if ($id > 0) {
         // Get the original amount to calculate new amount
-        $query = "SELECT amount FROM comparative_report WHERE id = ?";
+        $query = "SELECT amount FROM comparative_report WHERE id = ? AND (status_void IS NULL OR status_void = '')";
         $stmt = $conn->prepare($query);
         $stmt->bind_param("i", $id);
         $stmt->execute();
@@ -41,7 +41,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_adjusted_amount') {
             // Update the record
             $update = "UPDATE comparative_report 
                        SET adjusted_amount = ?, new_amount = ? 
-                       WHERE id = ?";
+                       WHERE id = ? AND (status_void IS NULL OR status_void = '')";
             $stmt = $conn->prepare($update);
             $stmt->bind_param("ddi", $adjusted_amount, $new_amount, $id);
             
@@ -67,7 +67,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'get_areas') {
     $areas = [];
     
     if (!empty($region)) {
-        $query = "SELECT DISTINCT area FROM comparative_report WHERE region = ? ORDER BY area ASC";
+        $query = "SELECT DISTINCT area FROM comparative_report WHERE region = ? AND (status_void IS NULL OR status_void = '') ORDER BY area ASC";
         $stmt = $conn->prepare($query);
         $stmt->bind_param("s", $region);
         $stmt->execute();
@@ -82,9 +82,9 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'get_areas') {
     exit;
 }
 
-// Fetch filter options
-$regions = $conn->query("SELECT DISTINCT region FROM comparative_report ORDER BY region ASC");
-$areas = $conn->query("SELECT DISTINCT area FROM comparative_report ORDER BY area ASC");
+// Fetch filter options - only show data where status_void is empty or null
+$regions = $conn->query("SELECT DISTINCT region FROM comparative_report WHERE (status_void IS NULL OR status_void = '') ORDER BY region ASC");
+$areas = $conn->query("SELECT DISTINCT area FROM comparative_report WHERE (status_void IS NULL OR status_void = '') ORDER BY area ASC");
 
 // Initialize filter variables
 $filter_region = $_GET['region'] ?? '';
@@ -121,6 +121,9 @@ if (!empty($filter_areas)) {
     }, $filter_areas);
     $areas_in = " AND area IN (" . implode(',', $sanitized_areas) . ")";
 }
+
+// Add status_void filter to all WHERE clauses
+$status_void_where = " AND (status_void IS NULL OR status_void = '')";
 ?>
 
 <!DOCTYPE html>
@@ -232,7 +235,7 @@ if (!empty($filter_areas)) {
                         $branch_where = "transaction_type = 'Branch'";
                         $sql_groups = "SELECT DISTINCT area, region 
                                        FROM comparative_report 
-                                       WHERE $branch_where $region_where $month_where $areas_in 
+                                       WHERE $branch_where $region_where $month_where $areas_in $status_void_where
                                        ORDER BY region ASC, area ASC";
                         $result_groups = $conn->query($sql_groups);
 
@@ -245,7 +248,7 @@ if (!empty($filter_areas)) {
                                              FROM comparative_report 
                                              WHERE area = '" . $conn->real_escape_string($current_area) . "'
                                              AND region = '" . $conn->real_escape_string($current_region) . "'
-                                             AND $branch_where $region_where $month_where
+                                             AND $branch_where $region_where $month_where $status_void_where
                                              ORDER BY gl_code ASC";
                                 $results = $conn->query($sql_data);
                         ?>
@@ -335,7 +338,7 @@ if (!empty($filter_areas)) {
                         $showroom_where = "transaction_type = 'Showroom'";
                         $sql_groups = "SELECT DISTINCT area, region 
                                        FROM comparative_report 
-                                       WHERE $showroom_where $region_where $month_where $areas_in 
+                                       WHERE $showroom_where $region_where $month_where $areas_in $status_void_where
                                        ORDER BY region ASC, area ASC";
                         $result_groups = $conn->query($sql_groups);
 
@@ -348,7 +351,7 @@ if (!empty($filter_areas)) {
                                              FROM comparative_report 
                                              WHERE area = '" . $conn->real_escape_string($current_area) . "'
                                              AND region = '" . $conn->real_escape_string($current_region) . "'
-                                             AND $showroom_where $region_where $month_where
+                                             AND $showroom_where $region_where $month_where $status_void_where
                                              ORDER BY gl_code ASC";
                                 $results = $conn->query($sql_data);
                         ?>

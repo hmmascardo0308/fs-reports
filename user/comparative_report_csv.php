@@ -95,7 +95,7 @@ function maxCsvColumns(array $rows): int
 }
 
 // Helper function to clean CSV values - COMPLETELY REWORKED
-function cleanCsvValue($value, $prefixes = []) {
+function cleanCsvValue(mixed $value, array $prefixes = []): mixed {
     if (!is_string($value)) {
         return $value;
     }
@@ -129,7 +129,7 @@ function cleanCsvValue($value, $prefixes = []) {
 }
 
 // Enhanced function to extract numeric amount from various formats
-function extractNumericAmount($value) {
+function extractNumericAmount(mixed $value): float {
     if (!is_string($value) && !is_numeric($value)) {
         return 0;
     }
@@ -298,7 +298,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                     $descriptionCol = 2;
                 }
 
-                // Find where NET Income appears to stop - but keep processing until we find it
+                // Find where NET Income appears - but keep processing until we find it
                 $cutoffRow = count($rows) - 1;
                 $foundNetIncome = false;
                 foreach ($rows as $rowIndex => $row) {
@@ -431,6 +431,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
         $debugInfo = [];
         $skippedRows = [];
         $processedRows = [];
+        $blockedReasons = [];
 
         try {
             // Prepare the INSERT statement with correct column mapping
@@ -442,9 +443,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ");
 
-            $checkStatusStmt = $conn->prepare("SELECT status FROM comparative_report WHERE region_id = ? AND area = ? AND transaction_type = ? AND transaction_month <=> ? AND status_void IS NULL LIMIT 1");
+            // MODIFIED: Check for status, reported_status, and unlock_by
+            $checkStatusStmt = $conn->prepare("
+                SELECT status, reported_status, unlock_by 
+                FROM comparative_report 
+                WHERE region_id = ? AND area = ? AND transaction_type = ? 
+                AND transaction_month <=> ? AND status_void IS NULL 
+                LIMIT 1
+            ");
             
-            $voidStmt = $conn->prepare("UPDATE comparative_report SET status = 'Locked', locked_by = ?, locked_date = ?, status_void = 'Void', voided_by = ?, voided_at = ? WHERE region_id = ? AND area = ? AND transaction_type = ? AND transaction_month <=> ? AND status_void IS NULL");
+            // MODIFIED: Update statement to set lock and void status
+            $voidStmt = $conn->prepare("
+                UPDATE comparative_report 
+                SET status = 'Locked', 
+                    locked_by = ?, 
+                    locked_date = ?, 
+                    status_void = 'Void', 
+                    voided_by = ?, 
+                    voided_at = ? 
+                WHERE region_id = ? AND area = ? AND transaction_type = ? 
+                AND transaction_month <=> ? AND status_void IS NULL
+            ");
 
             foreach ($paths as $path) {
                 if (!file_exists($path)) {
@@ -821,66 +840,97 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
 
                 $debugInfo[] = "Transaction types: " . implode(', ', array_column($transactionTypes, 'type'));
 
-                // Check for existing records
+                // MODIFIED: Check for existing records with enhanced status checking
                 foreach ($transactionTypes as $tt) {
                     $groupKey = $regionID . '|' . $area . '|' . $tt['type'] . '|' . ($dbTransactionMonth ?? 'NULL');
                     
                     if (!in_array($groupKey, $checkedGroups)) {
                         $existingStatus = null;
+                        $existingReportedStatus = null;
+                        $existingUnlockedBy = null;
+                        
                         $checkStatusStmt->bind_param("ssss", $regionID, $area, $tt['type'], $dbTransactionMonth);
                         $checkStatusStmt->execute();
                         $checkStatusStmt->store_result();
 
                         if ($checkStatusStmt->num_rows > 0) {
-                            $checkStatusStmt->bind_result($existingStatus);
+                            $checkStatusStmt->bind_result($existingStatus, $existingReportedStatus, $existingUnlockedBy);
                             $checkStatusStmt->fetch();
 
-                            if ($existingStatus === 'Locked') {
+                            // MODIFIED: Block if status is 'Locked' OR reported_status is 'Reported'
+                            if ($existingStatus === 'Locked' || $existingReportedStatus === 'Reported') {
                                 $lockedRegions[] = $regionID . '-' . $area . '-' . $tt['type'];
-                                $debugInfo[] = "Region is LOCKED for " . $tt['type'];
-                            } elseif (!$forceInsert) {
+                                $blockedReasons[] = "Region $regionID-$area-{$tt['type']} is BLOCKED - Status: '$existingStatus', Reported Status: '$existingReportedStatus'";
+                                $debugInfo[] = "🚫 Region is BLOCKED - Status: '$existingStatus', Reported Status: '$existingReportedStatus'";
+                            } 
+                            // MODIFIED: Allow if status is NULL/empty AND unlock_by is NULL/empty/Unlocked AND reported_status is NULL/empty
+                            else if ((empty($existingStatus) || $existingStatus === '') && 
+                                    (empty($existingReportedStatus) || $existingReportedStatus === '') && 
+                                    (empty($existingUnlockedBy) || $existingUnlockedBy === 'Unlocked' || $existingUnlockedBy === '')) {
+                                // This is the condition where we allow uploading
                                 $existingRegions[] = $regionID . '-' . $area . '-' . $tt['type'];
-                                $debugInfo[] = "Records already exist for " . $tt['type'];
+                                $debugInfo[] = "✓ Records exist but can be replaced - Status: '$existingStatus', Unlocked By: '$existingUnlockedBy', Reported Status: '$existingReportedStatus'";
+                            } else {
+                                // Any other state - block by default for safety
+                                $lockedRegions[] = $regionID . '-' . $area . '-' . $tt['type'];
+                                $blockedReasons[] = "Region $regionID-$area-{$tt['type']} is BLOCKED - Unknown state - Status: '$existingStatus', Unlocked By: '$existingUnlockedBy', Reported Status: '$existingReportedStatus'";
+                                $debugInfo[] = "🚫 Region is BLOCKED - Unknown state - Status: '$existingStatus', Unlocked By: '$existingUnlockedBy', Reported Status: '$existingReportedStatus'";
                             }
+                        } else {
+                            $debugInfo[] = "No existing records found for " . $tt['type'];
                         }
                         $checkStatusStmt->free_result();
                         $checkedGroups[] = $groupKey;
                     }
                 }
 
-                $regionLocked = false;
+                // Check if any region is locked or blocked
+                $regionBlocked = false;
                 foreach ($transactionTypes as $tt) {
                     if (in_array($regionID . '-' . $area . '-' . $tt['type'], $lockedRegions)) {
-                        $regionLocked = true;
+                        $regionBlocked = true;
                         break;
                     }
                 }
-                if ($regionLocked) {
-                    $debugInfo[] = "✗ SKIPPING - Region is locked";
+                if ($regionBlocked) {
+                    $debugInfo[] = "✗ SKIPPING - Region is blocked (Locked or Reported)";
                     continue;
                 }
 
+                // MODIFIED: Handle force insert - void and lock existing records
                 if ($forceInsert) {
                     foreach ($transactionTypes as $tt) {
                         $groupKey = $regionID . '|' . $area . '|' . $tt['type'] . '|' . ($dbTransactionMonth ?? 'NULL');
                         if (!in_array($groupKey, $voidedGroups)) {
-                            $voidStmt->bind_param(
-                                "ssssssss",
-                                $uploadedBy,
-                                $uploadedDate,
-                                $uploadedBy,
-                                $uploadedDate,
-                                $regionID,
-                                $area,
-                                $tt['type'],
-                                $dbTransactionMonth
-                            );
-                            $voidStmt->execute();
-                            $voidedGroups[] = $groupKey;
-                            $debugInfo[] = "Voided existing records for " . $tt['type'] . " (force insert enabled)";
+                            // Check if records exist before voiding
+                            $checkExists = $conn->prepare("SELECT COUNT(*) FROM comparative_report WHERE region_id = ? AND area = ? AND transaction_type = ? AND transaction_month <=> ? AND status_void IS NULL");
+                            $checkExists->bind_param("ssss", $regionID, $area, $tt['type'], $dbTransactionMonth);
+                            $checkExists->execute();
+                            $count = 0;
+                            $checkExists->bind_result($count);
+                            $checkExists->fetch();
+                            $checkExists->close();
+                            
+                            if ($count > 0) {
+                                $voidStmt->bind_param(
+                                    "ssssssss",
+                                    $uploadedBy,
+                                    $uploadedDate,
+                                    $uploadedBy,
+                                    $uploadedDate,
+                                    $regionID,
+                                    $area,
+                                    $tt['type'],
+                                    $dbTransactionMonth
+                                );
+                                $voidStmt->execute();
+                                $voidedGroups[] = $groupKey;
+                                $debugInfo[] = "✓ Voided and locked existing records for " . $tt['type'] . " (force insert enabled)";
+                            }
                         }
                     }
                 } else {
+                    // Check if any existing regions exist without force insert
                     $hasExisting = false;
                     foreach ($transactionTypes as $tt) {
                         if (in_array($regionID . '-' . $area . '-' . $tt['type'], $existingRegions)) {
@@ -889,8 +939,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                         }
                     }
                     if ($hasExisting) {
-                        $debugInfo[] = "✗ SKIPPING - Records already exist and force_insert is not enabled";
-                        continue;
+                        $debugInfo[] = "⚠ Records already exist and force_insert is not enabled - will ask for confirmation";
+                        // Don't skip - let it go to the confirmation modal
                     }
                 }
 
@@ -1009,11 +1059,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
             $dateObj = ($dbTransactionMonth) ? DateTime::createFromFormat('Y-m-d', $dbTransactionMonth) : false;
             $monthDisplay = $dateObj ? $dateObj->format('F Y') : ($transactionMonth ? date('F', mktime(0, 0, 0, (int)$transactionMonth, 1)) . ' ' . $transactionYear : $transactionYear);
 
+            // MODIFIED: Check if any regions are blocked
             if (!empty($lockedRegions)) {
                 $conn->rollback();
                 $lockedRegions = array_unique($lockedRegions);
                 $regionList = implode(', ', $lockedRegions);
-                $_SESSION['upload_message'] = "<div class='error'>The following regions are locked for {$monthDisplay}: {$regionList}. Please unlock to upload.</div>";
+                $blockedReasonsList = implode('<br>', array_unique($blockedReasons));
+                
+                $_SESSION['upload_message'] = "<div class='error'>
+                    <strong>⛔ Upload Blocked!</strong><br><br>
+                    The following regions cannot be updated: <strong>{$regionList}</strong>. They are either <strong>LOCKED</strong> or have been <strong>REPORTED</strong>.<br><br>
+                </div>";
+                
+                //  <strong>Blocked Regions Details:</strong><br>
+                //     <div style='background:#f5f5f5;padding:10px;border-radius:5px;font-size:13px;'>$blockedReasonsList</div>
+
+
                 foreach ($paths as $p) {
                     if (file_exists($p)) {
                         unlink($p);
@@ -1021,7 +1082,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                 }
                 header("Location: comparative_report_csv.php");
                 exit;
-            } elseif (!empty($existingRegions) && !$forceInsert) {
+            } 
+            // MODIFIED: Check if we have any existing regions that can be replaced
+            else if (!empty($existingRegions) && !$forceInsert) {
                 $conn->rollback();
                 $existingRegions = array_unique($existingRegions);
                 $regionList = implode(', ', $existingRegions);
@@ -1029,7 +1092,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                 $confirmMonth = $transactionMonth;
                 $confirmYear = $transactionYear;
                 $confirmPaths = $paths;
-                $duplicateMessage = "Transactions for the following regions already exist for {$monthDisplay}: {$regionList}.";
+                $duplicateMessage = "📋 <strong>Existing Records Found</strong><br>
+                    Transactions for the following regions already exist for {$monthDisplay}:<br>
+                    <strong>{$regionList}</strong><br><br>
+                    These records are currently in an <strong>editable state</strong> (unlocked, not yet reported).<br>
+                    Do you want to <strong>replace</strong> them?<br>
+                    <span style='color:#e53e3e;font-size:13px;'>This will mark the old records as VOID and LOCK them.</span>";
             } else {
                 $conn->commit();
                 foreach ($paths as $p) {
@@ -1216,6 +1284,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
         .btn-cancel:hover {
             background: #5a6268;
         }
+        .modal-message ul {
+            margin: 10px 0;
+            padding-left: 20px;
+        }
+        .modal-message ul li {
+            margin: 5px 0;
+        }
     </style>
 </head>
 <body>
@@ -1330,10 +1405,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
             <div class="modal-icon">
                 <i class="fas fa-exclamation-triangle"></i>
             </div>
-            <div class="modal-title">Duplicate Transactions Detected</div>
+            <div class="modal-title">Confirm Replacement?</div>
             <div class="modal-message">
-                <?php echo isset($duplicateMessage) ? htmlspecialchars($duplicateMessage) : "Some of these transactions are already recorded."; ?> <br>
-                Proceed anyway?
+                <?php echo isset($duplicateMessage) ? $duplicateMessage : "Some of these transactions are already recorded."; ?>
+                <br><br>
+                <strong>What will happen:</strong>
+                <ul>
+                    <li>New records will be inserted with the updated data</li>
+                    <li>Old records will be marked as <strong>VOID</strong></li>
+                    <li>Old records will be <strong>LOCKED</strong></li>
+                    <!-- <li>Old records will have <strong>locked_by</strong>, <strong>locked_date</strong>, <strong>voided_by</strong>, and <strong>voided_at</strong> set</li> -->
+                </ul>
+                <strong style="color:#e53e3e;">Do you want to proceed with replacing these records?</strong>
             </div>
             <form method="post">
                 <input type="hidden" name="do_insert" value="1">
@@ -1344,7 +1427,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                 <?php endforeach; ?>
                 <input type="hidden" name="force_insert" value="1">
                 <div class="modal-actions">
-                    <button type="submit" class="btn-confirm">Yes, Proceed</button>
+                    <button type="submit" class="btn-confirm">Yes, Replace Records</button>
                     <button type="button" class="btn-cancel" onclick="closeModal()">Cancel</button>
                 </div>
             </form>

@@ -231,6 +231,8 @@ $result = $stmt->get_result();
             <form method="POST" id="actionForm">
                 <div class="action-buttons-container">
                     <!-- <span id="selectedCount" class="selection-count">0 items selected</span> -->
+                    <a href="mark_reported.php" class="btn-report" style="text-decoration: none;"><i class="fas fa-check-circle"></i> Mark as Reported</a>
+                     
                     <button type="submit" name="action_type" value="lock" class="btn-lock" onclick="return confirmLockAction('lock')">
                         <i class="fas fa-lock"></i> Lock
                     </button>

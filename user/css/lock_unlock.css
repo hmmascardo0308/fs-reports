@@ -247,7 +247,7 @@ justify-content: flex-end;
 margin-bottom: 15px;
 }
 
-.btn-lock, .btn-unlock {
+.btn-lock, .btn-unlock, .btn-report {
 padding: 10px 20px;
 border: none;
 border-radius: 4px;
@@ -276,6 +276,15 @@ color: white;
 
 .btn-unlock:hover {
 background-color: #218838;
+}
+
+.btn-report {
+background-color: #650005;
+color: white;
+}
+
+.btn-report:hover {
+background-color: #d73434;
 }
 
 .btn-lock:disabled, .btn-unlock:disabled {

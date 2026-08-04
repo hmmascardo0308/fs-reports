@@ -334,11 +334,25 @@ if (isset($_SESSION['password_change_success']) && $_SESSION['password_change_su
                                 </a>
                             </li>
 
+                            <li>
+                                <a href="per_region_area.php">
+                                    <i class="fa-solid fa-database"></i> Generate Per Region-Area Report
+                                </a>
+                            </li>
+
                         <li>
                             <a href="javascript:void(0)" onclick="openLockUnlockModal()">
                                 <i class="fas fa-lock"></i> Lock / Unlock Period
                             </a>
                         </li>
+
+                         <li>
+                                <a href="mark_reported.php">
+                                    <i class="fa-solid fa-check"></i> Reported Transactions
+                                </a>
+                            </li>
+
+
                         <?php if ($user_type === "admin" || $user_type === "reports") : ?>
                             <li>
                                 <a href="javascript:void(0)" onclick="openComparativeReportModal()">

@@ -31,6 +31,14 @@ if (isset($_GET['reset']) && $_GET['reset'] == '1') {
     unset($_SESSION['skipped_data']);
     unset($_SESSION['last_activity']);
     unset($_SESSION['file_names']);
+    
+    // Clear duplicate-related session variables
+    unset($_SESSION['pending_save']);
+    unset($_SESSION['duplicate_check']);
+    unset($_SESSION['parsed_data_for_save']);
+    unset($_SESSION['summary_data_for_save']);
+    unset($_SESSION['duplicate_pending']);
+    
     header("Location: upload_raw_data.php");
     exit;
 }
@@ -987,6 +995,64 @@ function mergeParsedData(array $all_data): array
     return $merged;
 }
 
+// Function to check if data already exists for a given zone and month
+function checkExistingData(array $parsed_data): array
+{
+    global $conn;
+    
+    $existing_records = [];
+    $checked_combinations = [];
+    
+    // Get unique combinations of zone and transaction_month from parsed data
+    foreach ($parsed_data as $row) {
+        $zone = isset($row[COL_ZONE]) ? trim($row[COL_ZONE]) : '';
+        $date_str = isset($row[COL_DATE]) ? trim($row[COL_DATE]) : '';
+        
+        if (empty($zone) || empty($date_str)) {
+            continue;
+        }
+        
+        $date_info = parseTransactionDate($date_str);
+        $transaction_month = $date_info['month'];
+        
+        if (empty($transaction_month)) {
+            continue;
+        }
+        
+        $key = $zone . '|' . $transaction_month;
+        
+        // Only check each unique combination once
+        if (in_array($key, $checked_combinations)) {
+            continue;
+        }
+        
+        $checked_combinations[] = $key;
+        
+        // Check if this combination exists in the database
+        try {
+            $query = "SELECT COUNT(*) as count FROM fs_reports.fs_raw_data 
+                      WHERE mlmatic_zone = ? AND transaction_month = ?";
+            $stmt = $conn->prepare($query);
+            $stmt->bind_param("ss", $zone, $transaction_month);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            $row_count = $result->fetch_assoc();
+            
+            if ($row_count['count'] > 0) {
+                $existing_records[] = [
+                    'zone' => $zone,
+                    'transaction_month' => $transaction_month,
+                    'count' => $row_count['count']
+                ];
+            }
+        } catch (Exception $e) {
+            error_log("Error checking existing data: " . $e->getMessage());
+        }
+    }
+    
+    return $existing_records;
+}
+
 $parsed_data = [];
 $uploaded_headers = [];
 $error_message = '';
@@ -1094,7 +1160,182 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file_upload'])) {
     }
 }
 
-// Handle Save to Database - WITH UNKNOWN BRANCH CHECK
+// Handle duplicate actions (Replace, Skip, Cancel)
+if (isset($_POST['duplicate_action']) && isset($_SESSION['pending_save']) && $_SESSION['pending_save'] === true) {
+    $action = $_POST['duplicate_action'];
+    $parsed_data = $_SESSION['parsed_data_for_save'] ?? [];
+    $summary_data = $_SESSION['summary_data_for_save'] ?? [];
+    $existing_data = $_SESSION['duplicate_check'] ?? [];
+    
+    if (empty($parsed_data)) {
+        $_SESSION['error_message'] = "No data to save. Please upload a file first.";
+        header("Location: upload_raw_data.php");
+        exit;
+    }
+    
+    if ($action === 'cancel') {
+        // Cancel - clear everything and return
+        unset($_SESSION['pending_save']);
+        unset($_SESSION['duplicate_check']);
+        unset($_SESSION['parsed_data_for_save']);
+        unset($_SESSION['summary_data_for_save']);
+        unset($_SESSION['duplicate_pending']);
+        $_SESSION['error_message'] = "Save operation cancelled.";
+        header("Location: upload_raw_data.php");
+        exit;
+    }
+    
+    if ($action === 'replace') {
+        // Delete existing data for the affected combinations
+        $deleted_count = 0;
+        foreach ($existing_data as $item) {
+            try {
+                $query = "DELETE FROM fs_reports.fs_raw_data 
+                          WHERE mlmatic_zone = ? AND transaction_month = ?";
+                $stmt = $conn->prepare($query);
+                $stmt->bind_param("ss", $item['zone'], $item['transaction_month']);
+                $stmt->execute();
+                $deleted_count += $stmt->affected_rows;
+            } catch (Exception $e) {
+                error_log("Error deleting existing data: " . $e->getMessage());
+            }
+        }
+        
+        // Now insert the new data
+        $detailed_result = insertDetailedData($parsed_data, $username);
+        $summary_result = insertSummaryData($summary_data, $username);
+        
+        if ($detailed_result['inserted'] > 0 || $summary_result['inserted'] > 0) {
+            $success_message = "✅ Data saved to database!<br>";
+            $success_message .= "✅ Replaced " . $deleted_count . " existing records<br>";
+            $success_message .= "✅ Inserted " . $detailed_result['inserted'] . " new detailed rows";
+            if ($detailed_result['errors'] > 0) {
+                $success_message .= " (⚠️ " . $detailed_result['errors'] . " errors)";
+            }
+            $success_message .= "<br>";
+            $success_message .= "✅ Summary: " . $summary_result['inserted'] . " rows inserted";
+            if ($summary_result['errors'] > 0) {
+                $success_message .= " (⚠️ " . $summary_result['errors'] . " errors)";
+            }
+            $_SESSION['success_message'] = $success_message;
+        } else {
+            $_SESSION['error_message'] = "❌ Failed to save data to database.";
+        }
+        
+        // Clear pending flags
+        unset($_SESSION['pending_save']);
+        unset($_SESSION['duplicate_check']);
+        unset($_SESSION['parsed_data_for_save']);
+        unset($_SESSION['summary_data_for_save']);
+        unset($_SESSION['duplicate_pending']);
+        
+        header("Location: upload_raw_data.php?view=raw");
+        exit;
+    }
+    
+    if ($action === 'skip') {
+        // Skip duplicate entries - filter out rows that would be duplicates
+        $filtered_data = [];
+        $skipped_duplicates = 0;
+        
+        foreach ($parsed_data as $row) {
+            $zone = isset($row[COL_ZONE]) ? trim($row[COL_ZONE]) : '';
+            $date_str = isset($row[COL_DATE]) ? trim($row[COL_DATE]) : '';
+            
+            if (empty($zone) || empty($date_str)) {
+                $filtered_data[] = $row;
+                continue;
+            }
+            
+            $date_info = parseTransactionDate($date_str);
+            $transaction_month = $date_info['month'];
+            
+            if (empty($transaction_month)) {
+                $filtered_data[] = $row;
+                continue;
+            }
+            
+            // Check if this combination exists in the duplicate list
+            $is_duplicate = false;
+            foreach ($existing_data as $dup) {
+                if ($dup['zone'] === $zone && $dup['transaction_month'] === $transaction_month) {
+                    $is_duplicate = true;
+                    break;
+                }
+            }
+            
+            if (!$is_duplicate) {
+                $filtered_data[] = $row;
+            } else {
+                $skipped_duplicates++;
+            }
+        }
+        
+        if (empty($filtered_data)) {
+            $_SESSION['error_message'] = "❌ All rows were duplicates. No new data to insert.";
+            unset($_SESSION['pending_save']);
+            unset($_SESSION['duplicate_check']);
+            unset($_SESSION['parsed_data_for_save']);
+            unset($_SESSION['summary_data_for_save']);
+            unset($_SESSION['duplicate_pending']);
+            header("Location: upload_raw_data.php");
+            exit;
+        }
+        
+        // Insert only the filtered data
+        $detailed_result = insertDetailedData($filtered_data, $username);
+        
+        // Also filter summary data
+        $filtered_summary = [];
+        foreach ($summary_data as $item) {
+            $zone = $item['zone'] ?? '';
+            $month = $item['transaction_month'] ?? date('Y-m-01');
+            
+            $is_duplicate = false;
+            foreach ($existing_data as $dup) {
+                if ($dup['zone'] === $zone && $dup['transaction_month'] === $month) {
+                    $is_duplicate = true;
+                    break;
+                }
+            }
+            
+            if (!$is_duplicate) {
+                $filtered_summary[] = $item;
+            }
+        }
+        
+        $summary_result = insertSummaryData($filtered_summary, $username);
+        
+        if ($detailed_result['inserted'] > 0 || $summary_result['inserted'] > 0) {
+            $success_message = "✅ Data saved to database!<br>";
+            $success_message .= "✅ Skipped " . $skipped_duplicates . " duplicate records<br>";
+            $success_message .= "✅ Inserted " . $detailed_result['inserted'] . " new detailed rows";
+            if ($detailed_result['errors'] > 0) {
+                $success_message .= " (⚠️ " . $detailed_result['errors'] . " errors)";
+            }
+            $success_message .= "<br>";
+            $success_message .= "✅ Summary: " . $summary_result['inserted'] . " rows inserted";
+            if ($summary_result['errors'] > 0) {
+                $success_message .= " (⚠️ " . $summary_result['errors'] . " errors)";
+            }
+            $_SESSION['success_message'] = $success_message;
+        } else {
+            $_SESSION['error_message'] = "❌ Failed to save data to database.";
+        }
+        
+        // Clear pending flags
+        unset($_SESSION['pending_save']);
+        unset($_SESSION['duplicate_check']);
+        unset($_SESSION['parsed_data_for_save']);
+        unset($_SESSION['summary_data_for_save']);
+        unset($_SESSION['duplicate_pending']);
+        
+        header("Location: upload_raw_data.php?view=raw");
+        exit;
+    }
+}
+
+// Handle Save to Database - WITH UNKNOWN BRANCH CHECK AND DUPLICATE CHECK
 if (isset($_POST['save_to_database']) && !empty($_SESSION['parsed_data'])) {
     // Check if there are unknown branch types
     $remarks_data_check = $_SESSION['remarks_data'] ?? [];
@@ -1129,8 +1370,50 @@ if (isset($_POST['save_to_database']) && !empty($_SESSION['parsed_data'])) {
         exit;
     }
     
-    // Proceed with saving if no unknown branches
+    // Check for existing data by zone and month
     $parsed_data = $_SESSION['parsed_data'];
+    $existing_data = checkExistingData($parsed_data);
+    
+    if (!empty($existing_data)) {
+        // Build a detailed message showing what data already exists
+        $duplicate_message = "<strong>Duplicate Data Detected!</strong><br><br>";
+        $duplicate_message .= "The following Zone and Month combinations already exist in the database:<br><br>";
+        $duplicate_message .= "<div style='background: #f8fafc; padding: 15px; border-radius: 8px; margin: 10px 0;'>";
+        $duplicate_message .= "<table style='width: 100%; border-collapse: collapse;'>";
+        $duplicate_message .= "<tr style='background: #e2e8f0;'><th style='padding: 8px; text-align: left;'>Zone</th><th style='padding: 8px; text-align: left;'>Transaction Month</th><th style='padding: 8px; text-align: left;'>Existing Records</th></tr>";
+        
+        foreach ($existing_data as $item) {
+            $month_display = date('F Y', strtotime($item['transaction_month']));
+            $duplicate_message .= "<tr><td style='padding: 8px; border-bottom: 1px solid #e2e8f0;'><strong>" . htmlspecialchars($item['zone']) . "</strong></td>";
+            $duplicate_message .= "<td style='padding: 8px; border-bottom: 1px solid #e2e8f0;'>" . htmlspecialchars($month_display) . "</td>";
+            $duplicate_message .= "<td style='padding: 8px; border-bottom: 1px solid #e2e8f0; text-align: center;'>" . $item['count'] . " records</td></tr>";
+        }
+        
+        $duplicate_message .= "</table></div><br>";
+        $duplicate_message .= "Do you want to:<br><br>";
+        $duplicate_message .= "<strong>Cancel</strong> - Return to the upload page without saving<br>";
+        $duplicate_message .= "<strong>Skip & Continue</strong> - Skip duplicate entries and only insert new data<br>";
+        $duplicate_message .= "<strong>Replace</strong> - Delete existing data and insert new data (will remove old records)<br><br>";
+        
+        // Store the duplicate check in session for the confirmation
+        $_SESSION['duplicate_check'] = $existing_data;
+        $_SESSION['pending_save'] = true;
+        $_SESSION['duplicate_action'] = 'pending';
+        
+        // Store the parsed data to use later
+        $_SESSION['parsed_data_for_save'] = $parsed_data;
+        $_SESSION['summary_data_for_save'] = $summary_data;
+        
+        // Show the duplicate warning
+        $_SESSION['error_message'] = $duplicate_message;
+        $_SESSION['duplicate_pending'] = true;
+        
+        // Redirect to show the warning
+        header("Location: upload_raw_data.php?view=raw&duplicate_check=1");
+        exit;
+    }
+    
+    // If no duplicates found, proceed with saving
     $summary_data = $_SESSION['summary_data'] ?? [];
     
     // Insert detailed data
@@ -1350,7 +1633,7 @@ $has_unknown_branches = !empty($remarks_data);
                 <form action="" method="POST" style="margin: 15px 0;" id="saveForm">
                     <input type="hidden" name="save_to_database" value="1">
                     <button type="submit" class="btn-save-database" <?= $has_unknown_branches ? 'disabled style="opacity: 0.5; cursor: not-allowed;"' : '' ?> 
-                        onclick="<?= $has_unknown_branches ? 'alert(\'❌ Cannot save to database. Please fix unknown branch types first. Check the Remarks tab for details.\'); return false;' : 'return confirm(\'Are you sure you want to save this data to the database? This will insert ' . $total_rows . ' detailed rows and ' . $summary_total_rows . ' summary rows.\');' ?>">
+                        onclick="<?= $has_unknown_branches ? 'alert(\' Cannot save to database. Please fix unknown branch types first. Check the Remarks tab for details.\'); return false;' : 'return confirm(\'Are you sure you want to save this data to the database? This will insert ' . $total_rows . ' detailed rows and ' . $summary_total_rows . ' summary rows.\');' ?>">
                         <i class="fa-solid fa-database"></i> 
                         <?= $has_unknown_branches ? 'Saving Disabled (Please fix remarks)' : 'Save to Database' ?>
                     </button>
@@ -1364,6 +1647,32 @@ $has_unknown_branches = !empty($remarks_data);
                         </div>
                     <?php endif; ?>
                 </form>
+                <?php endif; ?>
+
+                <!-- Duplicate Action Buttons -->
+                <?php if (isset($_SESSION['duplicate_pending']) && $_SESSION['duplicate_pending'] === true): ?>
+                <div style="margin-top: 15px; padding: 20px; background: #ffebeb; border: 2px solid #ff0000; border-radius: 8px;">
+                    <div style="display: flex; gap: 15px; flex-wrap: wrap; justify-content: center;">
+                        <form action="" method="POST" style="display: inline;">
+                            <input type="hidden" name="duplicate_action" value="cancel">
+                            <button type="submit" class="btn-cancel" style="background: #e2e8f0; color: #1e293b; padding: 10px 24px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; transition: all 0.2s;">
+                                <i class="fa-solid fa-times"></i> Cancel
+                            </button>
+                        </form>
+                        <form action="" method="POST" style="display: inline;">
+                            <input type="hidden" name="duplicate_action" value="skip">
+                            <button type="submit" class="btn-skip" style="background: #ba3838; color: white; padding: 10px 24px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; transition: all 0.2s;">
+                                <i class="fa-solid fa-forward"></i> Skip & Continue
+                            </button>
+                        </form>
+                        <form action="" method="POST" style="display: inline;">
+                            <input type="hidden" name="duplicate_action" value="replace">
+                            <button type="submit" class="btn-replace" style="background: #dc2626; color: white; padding: 10px 24px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; transition: all 0.2s;">
+                                <i class="fa-solid fa-arrows-rotate"></i> Replace Existing
+                            </button>
+                        </form>
+                    </div>
+                </div>
                 <?php endif; ?>
 
                 <!-- View Toggle Buttons -->
@@ -1444,13 +1753,15 @@ $has_unknown_branches = !empty($remarks_data);
                                         <td class="row-number"></td>
                                         <?php 
                                         $total_columns = count($display_headers);
-                                        for ($i = 0; $i < $total_columns - 1; $i++): 
+                                        for ($i = 0; $i < $total_columns - 2; $i++): 
                                         ?>
                                             <td></td>
                                         <?php endfor; ?>
                                         <td style="text-align: right; font-weight: 700; color: #dc2626; font-size: 15px;">
                                             ₱<?= number_format($grand_total_amount, 2) ?>
                                         </td>
+                                            <td></td>
+
                                     </tr>
                                 </tfoot>
                             </table>
@@ -2186,7 +2497,7 @@ $has_unknown_branches = !empty($remarks_data);
                 alert.style.display = 'none';
             }, 500);
         });
-    }, 10000);
+    }, 15000);
 
     document.getElementById('uploadForm').addEventListener('submit', function(e) {
         const submitBtn = document.getElementById('submitBtn');
@@ -2206,7 +2517,7 @@ $has_unknown_branches = !empty($remarks_data);
                 const hasUnknownBranches = <?= $has_unknown_branches ? 'true' : 'false' ?>;
                 if (hasUnknownBranches) {
                     e.preventDefault();
-                    alert('❌ Cannot save to database. Please fix unknown branch types first.\n\nCheck the Remarks tab for details on which branch IDs are not in the masterdata.');
+                    alert('Cannot save to database. Please fix unknown branch types first.\n\nCheck the Remarks tab for details on which branch IDs are not in the masterdata.');
                     window.location.href = '?view=remarks';
                     return false;
                 }
@@ -2294,7 +2605,7 @@ $has_unknown_branches = !empty($remarks_data);
             align-items: center;
             gap: 10px;
             padding: 12px 24px;
-            background: linear-gradient(135deg, #2563eb, #1d4ed8);
+            background: linear-gradient(135deg, #a70707, #49010a);
             color: white;
             border: none;
             border-radius: 8px;
@@ -2309,7 +2620,7 @@ $has_unknown_branches = !empty($remarks_data);
         .btn-save-database:hover:not(:disabled) {
             transform: translateY(-2px);
             box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4);
-            background: linear-gradient(135deg, #1d4ed8, #1e40af);
+            background: linear-gradient(135deg, #671010, #4c0404);
         }
         .btn-save-database:active:not(:disabled) {
             transform: translateY(0);
@@ -2326,6 +2637,18 @@ $has_unknown_branches = !empty($remarks_data);
             padding: 6px 15px !important;
             border-top: 1px solid #e2e8f0;
             border-bottom: 1px solid #e2e8f0;
+        }
+
+        .btn-cancel:hover {
+            background: #cbd5e1 !important;
+        }
+
+        .btn-skip:hover {
+            background: #750000 !important;
+        }
+
+        .btn-replace:hover {
+            background: #b91c1c !important;
         }
     `;
     document.head.appendChild(style);

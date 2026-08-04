@@ -33,11 +33,12 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action_type'])) {
     if (isset($_POST['selected_groups']) && is_array($_POST['selected_groups'])) {
         $success_count = 0;
         $already_processed_count = 0;
+        $reported_count = 0;
         $total_selected = count($_POST['selected_groups']);
         $action = $_POST['action_type']; // 'unlock'
         
         // Prepare check statement
-        $check_stmt = $conn->prepare("SELECT status, status_void FROM comparative_report WHERE region <=> ? AND mainzone <=> ? AND zone <=> ? AND transaction_type <=> ? AND uploaded_date <=> ? LIMIT 1");
+        $check_stmt = $conn->prepare("SELECT status, status_void, reported_status FROM comparative_report WHERE region <=> ? AND mainzone <=> ? AND zone <=> ? AND transaction_type <=> ? AND uploaded_date <=> ? LIMIT 1");
         $update_stmt = null;
 
         if ($action === 'unlock') {
@@ -54,19 +55,28 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action_type'])) {
                     // Check current status
                     $current_status = null;
                     $current_status_void = null;
+                    $current_reported_status = null;
                     $check_stmt->bind_param("sssss", $parts[0], $parts[1], $parts[2], $parts[3], $parts[4]);
                     $check_stmt->execute();
-                    $check_stmt->bind_result($current_status, $current_status_void);
+                    $check_stmt->bind_result($current_status, $current_status_void, $current_reported_status);
                     $check_stmt->fetch();
                     $check_stmt->free_result();
 
+                    // Skip if already unlocked
                     if ($action === 'unlock' && $current_status !== 'Locked') {
                         $already_processed_count++;
                         continue;
                     }
 
+                    // Skip if void
                     if ($action === 'unlock' && $current_status_void === 'Void') {
                         $already_processed_count++;
+                        continue;
+                    }
+
+                    // Skip if reported_status is 'Reported' - CANNOT UNLOCK REPORTED TRANSACTIONS
+                    if ($action === 'unlock' && $current_reported_status === 'Reported') {
+                        $reported_count++;
                         continue;
                     }
 
@@ -74,8 +84,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action_type'])) {
                     
                     $update_stmt->bind_param("ssssssss", 
                         $new_status,           // status
-                        $username,              // by
-                        $current_datetime,      // date
+                        $username,              // unlock_by
+                        $current_datetime,      // unlock_date
                         $parts[0],              // region
                         $parts[1],              // mainzone
                         $parts[2],              // zone
@@ -93,11 +103,21 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action_type'])) {
         
         $check_stmt->close();
         
+        // Build appropriate message
         if ($success_count > 0) {
             $message = "$success_count group(s) unlocked successfully.";
+            if ($reported_count > 0) {
+                $message .= " $reported_count group(s) skipped because they are marked as Reported.";
+            }
+            if ($already_processed_count > 0) {
+                $message .= " $already_processed_count group(s) skipped because they are already unlocked or void.";
+            }
             $message_type = "success";
+        } elseif ($reported_count == $total_selected) {
+            $message = "Cannot unlock transactions that are marked as Reported. Please unmark them as Reported first.";
+            $message_type = "error";
         } elseif ($already_processed_count == $total_selected) {
-            $message = "Transactions are already unlocked or have no status. No changes made.";
+            $message = "Transactions are already unlocked, void, or not locked. No changes made.";
             $message_type = "error";
         } else {
             $message = "No records updated.";
@@ -132,7 +152,10 @@ $query = "SELECT DISTINCT
             MAX(locked_by) as locked_by,
             MAX(locked_date) as locked_date,
             MAX(unlock_by) as unlock_by,
-            MAX(unlock_date) as unlock_date
+            MAX(unlock_date) as unlock_date,
+            MAX(reported_status) as reported_status,
+            MAX(reported_status_by) as reported_status_by,
+            MAX(reported_status_date) as reported_status_date
           FROM comparative_report 
           WHERE transaction_month BETWEEN ? AND ?";
 
@@ -172,6 +195,35 @@ $result = $stmt->get_result();
             background-color: #fef3c7;
             color: #702b00;
             border: 1px solid #6c5600;
+        }
+        .badge-reported {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #28a745;
+            border-radius: 4px;
+            padding: 8px;
+            font-size: 12px;
+        }
+        .badge-not-reported {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #dc3545;
+            border-radius: 4px;
+            padding: 8px;
+            font-size: 12px;
+        }
+        .badge-reported-blocked {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffc107;
+        }
+        /* Disable checkbox style for reported items */
+        .row-checkbox:disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+        .reported-row {
+            background-color: #fffdf0 !important;
         }
     </style>
 </head>
@@ -244,6 +296,8 @@ $result = $stmt->get_result();
             $unique_types = [];
             $locked_count = 0;
             $unlocked_count = 0;
+            $reported_count = 0;
+            $not_reported_count = 0;
             
             if ($result && $result->num_rows > 0) {
                 $result->data_seek(0); // Reset pointer
@@ -258,6 +312,12 @@ $result = $stmt->get_result();
                         $locked_count++;
                     } elseif ($row['status'] === 'Unlocked') {
                         $unlocked_count++;
+                    }
+                    
+                    if ($row['reported_status'] === 'Reported') {
+                        $reported_count++;
+                    } else {
+                        $not_reported_count++;
                     }
                 }
                 $result->data_seek(0); // Reset pointer again for display
@@ -293,10 +353,16 @@ $result = $stmt->get_result();
                     <div class="stat-label">Unlocked Groups</div>
                     <div class="stat-value" style="color: #28a745;"><?php echo $unlocked_count; ?></div>
                 </div>
+                <div class="stat-item">
+                    <div class="stat-label">Reported Groups</div>
+                    <div class="stat-value" style="color: #155724;"><?php echo $reported_count; ?></div>
+                </div>
             </div>
 
             <form method="POST" id="actionForm">
                 <div class="action-buttons-container">
+                    <a href="mark_reported.php" class="btn-report" style="text-decoration: none;"><i class="fas fa-check-circle"></i> Mark as Reported</a>
+
                     <a href="lock_period.php" class="btn-lock" style="text-decoration: none;"><i class="fas fa-lock"></i> Lock</a>
 
                     <button type="submit" name="action_type" value="unlock" class="btn-unlock" onclick="return confirmAction('unlock')">
@@ -304,32 +370,40 @@ $result = $stmt->get_result();
                     </button>
                 </div>
 
+            
+
                 <!-- Data Table -->
                 <div class="table-container">
                     <table>
                         <thead>
                             <tr>
-                               <th><i class="fa-solid fa-layer-group"></i> Main Zone</th>
-<th><i class="fa-solid fa-map"></i> Zone</th>
-<th><i class="fa-solid fa-earth-asia"></i> Region</th>
-<th><i class="fa-solid fa-code-branch"></i> Branch Type</th>
-<th><i class="fa-solid fa-calendar-days"></i> Uploaded Date</th>
-<th><i class="fa-solid fa-database"></i> Record Count</th>
-<th><i class="fa-solid fa-user"></i> Uploaded By</th>
-<th><i class="fa-solid fa-circle-check"></i> Status</th>
-<th><i class="fa-solid fa-list-check"></i> Additional Status</th>
-<th><i class="fa-solid fa-unlock-keyhole"></i> Unlocked By / Date</th>
-<th style="text-align: center;">
-    <i class="fa-solid fa-gears"></i> Action
-    <input type="checkbox" id="checkAll" onclick="toggleAll(this)"
-           style="vertical-align: middle; margin-left: 5px;">
-</th>
+                                <th><i class="fa-solid fa-layer-group"></i> Main Zone</th>
+                                <th><i class="fa-solid fa-map"></i> Zone</th>
+                                <th><i class="fa-solid fa-earth-asia"></i> Region</th>
+                                <th><i class="fa-solid fa-code-branch"></i> Branch Type</th>
+                                <th><i class="fa-solid fa-calendar-days"></i> Uploaded Date</th>
+                                <th><i class="fa-solid fa-database"></i> Record Count</th>
+                                <th><i class="fa-solid fa-user"></i> Uploaded By</th>
+                                <th><i class="fa-solid fa-circle-check"></i> Status</th>
+                                <th><i class="fa-solid fa-list-check"></i> Additional Status</th>
+                                <th><i class="fa-solid fa-flag"></i> Reported Status</th>
+                                <th><i class="fa-solid fa-user-check"></i> Reported By / Date</th>
+                                <th><i class="fa-solid fa-unlock-keyhole"></i> Unlocked By / Date</th>
+                                <th style="text-align: center;">
+                                    <i class="fa-solid fa-gears"></i> Action
+                                    <input type="checkbox" id="checkAll" onclick="toggleAll(this)"
+                                           style="vertical-align: middle; margin-left: 5px;">
+                                </th>
                             </tr>
                         </thead>
                         <tbody>
                             <?php if ($result && $result->num_rows > 0): ?>
-                                <?php while ($row = $result->fetch_assoc()): ?>
-                                    <tr>
+                                <?php while ($row = $result->fetch_assoc()): 
+                                    $is_reported = ($row['reported_status'] === 'Reported');
+                                    $is_locked = ($row['status'] === 'Locked');
+                                    $can_unlock = $is_locked && !$is_reported;
+                                ?>
+                                    <tr class="<?php echo $is_reported ? 'reported-row' : ''; ?>">
                                         <td style="text-align: center;"><span class="badge badge-primary"><?php echo htmlspecialchars($row['mainzone'] ?: 'N/A'); ?></span></td>
                                         <td><?php echo htmlspecialchars($row['zone'] ?: 'N/A'); ?></td>
                                         <td><?php echo htmlspecialchars($row['region'] ?: 'N/A'); ?></td>
@@ -360,6 +434,23 @@ $result = $stmt->get_result();
                                                 <span>-</span>
                                             <?php endif; ?>
                                         </td>
+                                        <td style="text-align: center;">
+                                            <?php if ($row['reported_status'] === 'Reported'): ?>
+                                                <span class="badge-reported"><i class="fas fa-check-circle"></i> Reported</span>
+                                            <?php else: ?>
+                                                <span class="badge-not-reported"><i class="fas fa-times-circle"></i> Not Reported</span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <?php if (!empty($row['reported_status_by']) && !empty($row['reported_status_date'])): ?>
+                                                <span class="audit-info">
+                                                    <i class="fas fa-user-check"></i> <?php echo htmlspecialchars($row['reported_status_by']); ?><br>
+                                                    <small><?php echo date('M d, Y h:i A', strtotime($row['reported_status_date'])); ?></small>
+                                                </span>
+                                            <?php else: ?>
+                                                <span class="audit-info text-muted">—</span>
+                                            <?php endif; ?>
+                                        </td>
                                         <td>
                                             <?php if (!empty($row['unlock_by']) && !empty($row['unlock_date'])): ?>
                                                 <span class="audit-info">
@@ -383,13 +474,19 @@ $result = $stmt->get_result();
                                                     ])); ?>"
                                                    data-status="<?php echo $row['status']; ?>"
                                                    data-void="<?php echo htmlspecialchars($row['status_void'] ?? ''); ?>"
+                                                   data-reported="<?php echo htmlspecialchars($row['reported_status'] ?? ''); ?>"
+                                                   <?php echo $is_reported ? 'disabled' : ''; ?>
+                                                   <?php echo $is_reported ? 'title="Cannot unlock: This transaction is marked as Reported"' : ''; ?>
                                                    onchange="updateSelectionCount()">
+                                            <?php if ($is_reported): ?>
+                                                <br><small style="color: #856404; font-size: 9px;">Reported</small>
+                                            <?php endif; ?>
                                         </td>
                                     </tr>
                                 <?php endwhile; ?>
                             <?php else: ?>
                                 <tr>
-                                    <td colspan="10" class="no-data">
+                                    <td colspan="13" class="no-data">
                                         <i class="fas fa-inbox" style="font-size: 48px; color: #dee2e6; margin-bottom: 10px;"></i>
                                         <br>
                                         No uploaded reports found for <?php echo date('F Y', strtotime($selected_month . '-01')); ?>.
@@ -431,12 +528,14 @@ $result = $stmt->get_result();
 
         // Update selection count
         function updateSelectionCount() {
-            // This function can be expanded if a selection count display is added
+            const checkboxes = document.querySelectorAll('.row-checkbox:checked');
+            const total = document.querySelectorAll('.row-checkbox').length;
+            // You can add a counter display here if needed
         }
 
-        // Toggle all checkboxes
+        // Toggle all checkboxes (only enabled ones)
         function toggleAll(source) {
-            const checkboxes = document.querySelectorAll('.row-checkbox');
+            const checkboxes = document.querySelectorAll('.row-checkbox:not(:disabled)');
             checkboxes.forEach(checkbox => {
                 checkbox.checked = source.checked;
             });
@@ -451,8 +550,9 @@ $result = $stmt->get_result();
             if (rowCheckboxes.length > 0 && checkAll) {
                 rowCheckboxes.forEach(checkbox => {
                     checkbox.addEventListener('change', function() {
-                        const allChecked = Array.from(rowCheckboxes).every(cb => cb.checked);
-                        checkAll.checked = allChecked;
+                        const enabledCheckboxes = document.querySelectorAll('.row-checkbox:not(:disabled)');
+                        const checkedEnabled = document.querySelectorAll('.row-checkbox:not(:disabled):checked');
+                        checkAll.checked = (enabledCheckboxes.length > 0 && checkedEnabled.length === enabledCheckboxes.length);
                         updateSelectionCount();
                     });
                 });
@@ -472,14 +572,24 @@ $result = $stmt->get_result();
 
             // Check for voided items
             let hasVoid = false;
+            let hasReported = false;
+            
             checkboxes.forEach(cb => {
                 if (cb.getAttribute('data-void') === 'Void') {
                     hasVoid = true;
+                }
+                if (cb.getAttribute('data-reported') === 'Reported') {
+                    hasReported = true;
                 }
             });
 
             if (hasVoid && action === 'unlock') {
                 alert("These transactions are already void and can't be edited (unlock) anymore.");
+                return false;
+            }
+
+            if (hasReported && action === 'unlock') {
+                alert("Cannot unlock transactions that are marked as 'Reported'. Please unmark them as Reported first.");
                 return false;
             }
             
