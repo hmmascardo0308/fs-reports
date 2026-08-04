@@ -23,6 +23,7 @@ $mainzone = $_GET['mainzone'] ?? '';
 $zone = $_GET['zone'] ?? '';
 $selected_regions = $_GET['region'] ?? [];
 $selected_areas = $_GET['area'] ?? [];
+$selected_branches = $_GET['branch'] ?? []; // NEW: Branch filter
 $transaction_year = $_GET['transaction_year'] ?? '';
 $primary_period = $_GET['primary_period'] ?? '';
 $previous_period = $_GET['previous_period'] ?? '';
@@ -94,8 +95,12 @@ if (!is_array($selected_regions)) {
 if (!is_array($selected_areas)) {
     $selected_areas = $selected_areas !== '' ? [$selected_areas] : [];
 }
+if (!is_array($selected_branches)) {
+    $selected_branches = $selected_branches !== '' ? [$selected_branches] : [];
+}
 $selected_regions = array_values(array_filter(array_map('trim', $selected_regions), fn($v) => $v !== ''));
 $selected_areas = array_values(array_filter(array_map('trim', $selected_areas), fn($v) => $v !== ''));
+$selected_branches = array_values(array_filter(array_map('trim', $selected_branches), fn($v) => $v !== ''));
 
 if (isset($_GET['reset']) && $_GET['reset'] === '1') {
     header("Location: comparative_report_original_raw.php");
@@ -107,20 +112,82 @@ $distinct_mz = [];
 $distinct_zn = [];
 $distinct_reg = [];
 $distinct_area = [];
+$distinct_branches = [];
 $distinct_years = [];
 $month_options = [];
 
 $mz_to_zn = [];
-$mz_to_reg = []; // Add mainzone to region mapping
+$mz_to_reg = [];
 $zn_to_reg = [];
 $reg_to_area = [];
+$area_to_branch = [];
+$branch_info = []; // NEW: Store branch info for display
 
-// Updated query to use fs_raw_data_summary
+// Updated query to get distinct branches
+$branch_query = "
+    SELECT DISTINCT branch_id, branch_name, area as area, region
+    FROM fs_reports.fs_raw_data_summary
+    WHERE branch_id IS NOT NULL AND branch_id != ''
+    AND branch_name IS NOT NULL AND branch_name != ''
+    ORDER BY branch_name
+";
+$branch_res = mysqli_query($conn, $branch_query);
+if ($branch_res) {
+    while ($b = mysqli_fetch_assoc($branch_res)) {
+        $branch_id = trim((string)($b['branch_id'] ?? ''));
+        $branch_name = trim((string)($b['branch_name'] ?? ''));
+        $area = trim((string)($b['area'] ?? ''));
+        $region = trim((string)($b['region'] ?? ''));
+        
+        if ($branch_id !== '' && $branch_name !== '') {
+            $branch_key = $branch_id . '|' . $branch_name;
+            if (!in_array($branch_key, $distinct_branches, true)) {
+                $distinct_branches[] = $branch_key;
+            }
+            
+            // Store branch info
+            $branch_info[$branch_key] = [
+                'id' => $branch_id,
+                'name' => $branch_name,
+                'area' => $area,
+                'region' => $region
+            ];
+            
+            // Map area to branches
+            if ($area !== '') {
+                $area_to_branch[$area] = $area_to_branch[$area] ?? [];
+                if (!in_array($branch_key, $area_to_branch[$area], true)) {
+                    $area_to_branch[$area][] = $branch_key;
+                }
+            }
+        }
+    }
+}
+
+// Sort branches numerically by branch_id for distinct_branches
+usort($distinct_branches, function($a, $b) {
+    $a_id = explode('|', $a)[0];
+    $b_id = explode('|', $b)[0];
+    return intval($a_id) - intval($b_id);
+});
+
+// Sort each area's branches numerically by branch_id
+foreach ($area_to_branch as $area => $branches) {
+    usort($area_to_branch[$area], function($a, $b) {
+        $a_parts = explode('|', $a);
+        $b_parts = explode('|', $b);
+        $a_id = isset($a_parts[0]) ? $a_parts[0] : '0';
+        $b_id = isset($b_parts[0]) ? $b_parts[0] : '0';
+        return intval($a_id) - intval($b_id);
+    });
+}
+
+// Updated hierarchy query to include branch_id and branch_name
 $hierarchy_query = "
-    SELECT DISTINCT mainzone, mlmatic_zone as zone, region, mlmatic_area as area
+    SELECT DISTINCT mainzone, mlmatic_zone as zone, region, area as area
     FROM fs_reports.fs_raw_data_summary
     WHERE mainzone IS NOT NULL AND mainzone != ''
-    ORDER BY mainzone, mlmatic_zone, region, mlmatic_area
+    ORDER BY mainzone, mlmatic_zone, region, area
 ";
 $hierarchy_res = mysqli_query($conn, $hierarchy_query);
 if ($hierarchy_res) {
@@ -140,7 +207,6 @@ if ($hierarchy_res) {
             if (!in_array($zn, $mz_to_zn[$mz], true)) $mz_to_zn[$mz][] = $zn;
         }
         
-        // Add mainzone to region mapping
         if ($mz !== '' && $rg !== '') {
             $mz_to_reg[$mz] = $mz_to_reg[$mz] ?? [];
             if (!in_array($rg, $mz_to_reg[$mz], true)) $mz_to_reg[$mz][] = $rg;
@@ -179,22 +245,20 @@ if ($years_res) {
 // ============================================================
 // GET GL MAPPING based on GL Code Mode
 // ============================================================
-$gl_mapping = []; // sort_order|sub_order -> ['old' => [gl_codes], 'new' => [gl_codes]]
-$gl_descriptions = []; // sort_order|sub_order -> gl_description_comparative
-$sort_order_descriptions = []; // sort_order -> description
-$special_keys = []; // To track keys that have gl_id = 'INJ-2'
+$gl_mapping = [];
+$gl_descriptions = [];
+$sort_order_descriptions = [];
+$special_keys = [];
 
 // Build lookup maps if mixed mode is active
 $old_gl_id_to_codes = [];
 $mixed_id_map = [];
 if ($gl_code_mode === 'mixed') {
-    // Load all old codes for lookup by gl_id
     $res = mysqli_query($conn, "SELECT gl_id, gl_code FROM fs_reports.gl_codes WHERE gl_code IS NOT NULL AND gl_code != ''");
     while ($row = mysqli_fetch_assoc($res)) {
         $old_gl_id_to_codes[$row['gl_id']][] = trim($row['gl_code']);
     }
 
-    // Define mappings for mixed mode: new_gl_id => [old_gl_ids]
     $mixed_id_map = [
         'INS-1' => ['INS-28', 'INS-29', 'INS-30', 'INS-31', 'INS-34', 'INS-39'],
         'INS-2' => ['INS-25', 'INS-26', 'INS-44', 'INS-47'],
@@ -209,7 +273,6 @@ if ($gl_code_mode === 'mixed') {
     ];
 }
 
-// Determine which table to use for report structure
 $table_name = ($gl_code_mode === 'old') ? 'fs_reports.gl_codes' : 'fs_reports.new_gl_codes';
 
 $gl_structure_query = "
@@ -225,12 +288,10 @@ if ($gl_structure_result) {
         $key = $row['sort_order'] . '|' . $row['sub_order'];
         $gl_id = $row['gl_id'] ?? '';
 
-        // Check for INJ-2 in gl_id
         if ($gl_id === 'INJ-2') {
             $special_keys[] = $key;
         }
 
-        // Store gl_codes for this combination
         if (!isset($gl_mapping[$key])) {
             $gl_mapping[$key] = ['old' => [], 'new' => []];
             $gl_descriptions[$key] = $row['gl_description_comparative'] ?? '';
@@ -239,12 +300,10 @@ if ($gl_structure_result) {
         $code = trim((string)($row['gl_code'] ?? ''));
 
         if ($gl_code_mode === 'mixed') {
-            // Mixed mode: new codes come from current row (new_gl_codes table)
             if ($code !== '' && !in_array($code, $gl_mapping[$key]['new'], true)) {
                 $gl_mapping[$key]['new'][] = $code;
             }
             
-            // Old codes come from ID mapping and lookup in old table
             $target_old_ids = $mixed_id_map[$gl_id] ?? [$gl_id];
             foreach ($target_old_ids as $oid) {
                 if (isset($old_gl_id_to_codes[$oid])) {
@@ -256,7 +315,6 @@ if ($gl_structure_result) {
                 }
             }
         } else {
-            // Old or New mode: 1:1 behavior (codes populate both buckets)
             if ($code !== '') {
                 if (!in_array($code, $gl_mapping[$key]['old'], true)) {
                     $gl_mapping[$key]['old'][] = $code;
@@ -267,17 +325,13 @@ if ($gl_structure_result) {
             }
         }
         
-        // Store sort_order description (for summary rows)
         if (!isset($sort_order_descriptions[$row['sort_order']]) && !empty($row['description'])) {
             $sort_order_descriptions[$row['sort_order']] = $row['description'];
         }
     }
 }
 
-function compute_table_rows_for_region_area(mysqli $conn, string $mainzone, string $zone, string $transaction_year, string $primary_period, string $previous_period, string $gl_code_mode, array $gl_mapping, array $gl_descriptions, array $special_keys, array $sort_order_descriptions, string $region, string $area, bool $use_real_data = true): array {
-// ============================================================
-// BUILD WHERE CLAUSE FOR FILTERS
-// ============================================================
+function compute_table_rows_for_region_area(mysqli $conn, string $mainzone, string $zone, string $transaction_year, string $primary_period, string $previous_period, string $gl_code_mode, array $gl_mapping, array $gl_descriptions, array $special_keys, array $sort_order_descriptions, string $region, string $area, array $selected_branches = [], bool $use_real_data = true): array {
 $where_conditions = [];
 $params = [];
 $types = "";
@@ -298,9 +352,26 @@ if (!empty($region)) {
     $types .= "s";
 }
 if (!empty($area)) {
-    $where_conditions[] = "mlmatic_area = ?";
+    $where_conditions[] = "area = ?";
     $params[] = $area;
     $types .= "s";
+}
+if (!empty($selected_branches)) {
+    $branch_conditions = [];
+    foreach ($selected_branches as $branch) {
+        $branch_parts = explode('|', $branch);
+        if (count($branch_parts) == 2) {
+            $branch_id = trim($branch_parts[0]);
+            $branch_name = trim($branch_parts[1]);
+            $branch_conditions[] = "(branch_id = ? AND branch_name = ?)";
+            $params[] = $branch_id;
+            $params[] = $branch_name;
+            $types .= "ss";
+        }
+    }
+    if (!empty($branch_conditions)) {
+        $where_conditions[] = "(" . implode(" OR ", $branch_conditions) . ")";
+    }
 }
 if (!empty($transaction_year)) {
     $where_conditions[] = "transaction_year = ?";
@@ -308,17 +379,13 @@ if (!empty($transaction_year)) {
     $types .= "s";
 }
 
-// Base filters for common conditions (Region, Area, etc.)
 $base_where = !empty($where_conditions) ? "WHERE " . implode(" AND ", $where_conditions) : "WHERE 1=1";
 
-// ============================================================
-// FETCH PRIMARY PERIOD DATA
-// ============================================================
-$primary_data = []; // gl_code -> [branch_amount, showroom_amount, total]
+$primary_data = [];
 if ($use_real_data && !empty($primary_period)) {
     $p_parts = explode('-', $primary_period);
     $p_year = $p_parts[0];
-    $p_month_val = $primary_period . '-01'; // Match DATE format YYYY-MM-01 in DB
+    $p_month_val = $primary_period . '-01';
     
     $primary_sql = "
         SELECT 
@@ -352,10 +419,7 @@ if ($use_real_data && !empty($primary_period)) {
     }
 }
 
-// ============================================================
-// FETCH PREVIOUS PERIOD DATA
-// ============================================================
-$previous_data = []; // gl_code -> [branch_amount, showroom_amount, total]
+$previous_data = [];
 if ($use_real_data && !empty($previous_period)) {
     $prev_parts = explode('-', $previous_period);
     $prev_year_val = $prev_parts[0];
@@ -393,9 +457,6 @@ if ($use_real_data && !empty($previous_period)) {
     }
 }
 
-// ============================================================
-// BUILD TABLE ROWS BASED ON GL MAPPING
-// ============================================================
 $table_rows = [];
 
 foreach ($gl_mapping as $key => $codes_detailed) {
@@ -403,32 +464,27 @@ foreach ($gl_mapping as $key => $codes_detailed) {
     $gl_description = $gl_descriptions[$key] ?? '';
     $is_inj2 = in_array($key, $special_keys);
     
-    // Determine which codes to use based on mode
     $p_codes = [];
     $prev_codes = [];
     
     if ($gl_code_mode === 'old') {
-        // Use old codes for both periods
         $p_codes = $codes_detailed['old'];
         $prev_codes = $codes_detailed['old'];
     } elseif ($gl_code_mode === 'new') {
-        // Use new codes for both periods
         $p_codes = $codes_detailed['new'];
         $prev_codes = $codes_detailed['new'];
-    } else { // mixed
+    } else {
         $p_mode = isApril2026OrLater($primary_period) ? 'new' : 'old';
         $prev_mode = isApril2026OrLater($previous_period) ? 'new' : 'old';
         $p_codes = $codes_detailed[$p_mode];
         $prev_codes = $codes_detailed[$prev_mode];
     }
 
-    // Initialize totals for this GL combination
     $primary_mlfsi = 0;
     $primary_jewelers = 0;
     $previous_mlfsi = 0;
     $previous_jewelers = 0;
     
-    // Sum up amounts for all gl_codes in this combination
     foreach ($p_codes as $gl_code) {
         if (isset($primary_data[$gl_code])) {
             $primary_mlfsi += $primary_data[$gl_code]['mlfsi'];
@@ -444,7 +500,6 @@ foreach ($gl_mapping as $key => $codes_detailed) {
     $primary_total = $primary_mlfsi + $primary_jewelers;
     $previous_total = $previous_mlfsi + $previous_jewelers;
     
-    // Add the detail row for this GL combination
     $table_rows[] = [
         'sort_order' => $sort_order,
         'sub_order' => $sub_order,
@@ -461,9 +516,6 @@ foreach ($gl_mapping as $key => $codes_detailed) {
     ];
 }
 
-// ============================================================
-// GROUP BY SORT_ORDER AND ADD SUMMARY ROWS
-// ============================================================
 $grouped_rows = [];
 foreach ($table_rows as $row) {
     $sort_order = $row['sort_order'];
@@ -474,7 +526,6 @@ foreach ($table_rows as $row) {
 }
 
 $final_table_rows = [];
-// Initialize cumulative revenue counters
 $rev_mlfsi_p = 0; $rev_jew_p = 0; $rev_tot_p = 0;
 $rev_mlfsi_prev = 0; $rev_jew_prev = 0; $rev_tot_prev = 0;
 $sa_mlfsi_p = 0; $sa_jew_p = 0; $sa_tot_p = 0;
@@ -491,15 +542,12 @@ $net_mlfsi_p = 0; $net_jew_p = 0; $net_tot_p = 0;
 $net_mlfsi_prev = 0; $net_jew_prev = 0; $net_tot_prev = 0;
 
 foreach ($grouped_rows as $sort_order => $rows) {
-    // Add all detail rows for this sort_order
-    // Skip details for sort orders 6, 8, and 11 to show only the summary row
     if (!in_array((int)$sort_order, [6, 8, 11])) {
         foreach ($rows as $row) {
             $final_table_rows[] = $row;
         }
     }
     
-    // Calculate totals for summary row
     $total_primary_mlfsi = array_sum(array_column($rows, 'primary_mlfsi'));
     $total_primary_jewelers = array_sum(array_column($rows, 'primary_jewelers'));
     $total_primary_total = array_sum(array_column($rows, 'primary_total'));
@@ -507,7 +555,6 @@ foreach ($grouped_rows as $sort_order => $rows) {
     $total_previous_jewelers = array_sum(array_column($rows, 'previous_jewelers'));
     $total_previous_total = array_sum(array_column($rows, 'previous_total'));
 
-    // Accumulate for Total Revenues if sort_order is within the revenue range (1-20)
     if ((int)$sort_order >= 1 && (int)$sort_order <= 20) {
         $rev_mlfsi_p += $total_primary_mlfsi;
         $rev_jew_p += $total_primary_jewelers;
@@ -517,7 +564,6 @@ foreach ($grouped_rows as $sort_order => $rows) {
         $rev_tot_prev += $total_previous_total;
     }
     
-    // Accumulate for Total Selling and Admin Expenses if sort_order is 22 or 23
     if ((int)$sort_order == 22 || (int)$sort_order == 23) {
         $sa_mlfsi_p += $total_primary_mlfsi;
         $sa_jew_p += $total_primary_jewelers;
@@ -539,8 +585,6 @@ foreach ($grouped_rows as $sort_order => $rows) {
         ? $sort_order_descriptions[$sort_order] 
         : "Total for Sort Order " . $sort_order;
     
-    // Add summary row
-    // Hide summary row for sort orders 24, 25, and 26, but keep calculations for subsequent computed rows
     if (!in_array((int)$sort_order, [24, 25, 26])) {
         $final_table_rows[] = [
             'sort_order' => $sort_order,
@@ -559,7 +603,6 @@ foreach ($grouped_rows as $sort_order => $rows) {
         ];
     }
 
-    // Insert TOTAL REVENUES summary row after the sort_order 20 block
     if ((int)$sort_order == 20) {
         $inc_dec_rev = $rev_tot_p - $rev_tot_prev;
         $pct_rev = ($rev_tot_prev != 0) ? ($inc_dec_rev / abs($rev_tot_prev)) * 100 : ($rev_tot_p != 0 ? 100 : 0);
@@ -580,7 +623,6 @@ foreach ($grouped_rows as $sort_order => $rows) {
             'percentage' => $pct_rev
         ];
 
-        // Insert Cost of Sales/Service header row
         $final_table_rows[] = [
             'sort_order' => '',
             'sub_order' => 'Cost of Sales/Service',
@@ -598,7 +640,6 @@ foreach ($grouped_rows as $sort_order => $rows) {
         ];
     }
 
-    // Insert GROSS PROFIT summary row after sort_order 21 (Cost of Sales)
     if ((int)$sort_order == 21) {
         $gp_mlfsi_p = $rev_mlfsi_p - $total_primary_mlfsi;
         $gp_jew_p = $rev_jew_p - $total_primary_jewelers;
@@ -626,7 +667,6 @@ foreach ($grouped_rows as $sort_order => $rows) {
             'percentage' => $pct_gp
         ];
 
-        // Add SELLING & ADMIN EXPENSE header row
         $final_table_rows[] = [
             'sort_order' => 'SELLING & ADMIN EXPENSE',
             'sub_order' => '',
@@ -644,7 +684,6 @@ foreach ($grouped_rows as $sort_order => $rows) {
         ];
     }
 
-    // Insert TOTAL SELLING AND ADMIN EXPENSES summary row after sort_order 23
     if ((int)$sort_order == 23) {
         $inc_dec_sa = $sa_tot_p - $sa_tot_prev;
         $pct_sa = ($sa_tot_prev != 0) ? ($inc_dec_sa / abs($sa_tot_prev)) * 100 : ($sa_tot_p != 0 ? 100 : 0);
@@ -665,7 +704,6 @@ foreach ($grouped_rows as $sort_order => $rows) {
             'percentage' => $pct_sa
         ];
 
-        // Calculate EBITDA: Gross Profit - Total Selling and Admin Expenses
         $ebitda_mlfsi_p = $gp_mlfsi_p - $sa_mlfsi_p;
         $ebitda_jew_p = $gp_jew_p - $sa_jew_p;
         $ebitda_tot_p = $gp_tot_p - $sa_tot_p;
@@ -694,7 +732,6 @@ foreach ($grouped_rows as $sort_order => $rows) {
         ];
     }
 
-    // Insert EARNINGS BEFORE INTEREST & TAXES summary row after sort_order 24
     if ((int)$sort_order == 24) {
         $ebit_mlfsi_p = $ebitda_mlfsi_p - $total_primary_mlfsi;
         $ebit_jew_p = $ebitda_jew_p - $total_primary_jewelers;
@@ -726,7 +763,6 @@ foreach ($grouped_rows as $sort_order => $rows) {
         ];
     }
 
-    // Insert EARNINGS BEFORE TAXES summary row after sort_order 25
     if ((int)$sort_order == 25) {
         $ebt_mlfsi_p = $ebit_mlfsi_p - $total_primary_mlfsi;
         $ebt_jew_p = $ebit_jew_p - $total_primary_jewelers;
@@ -758,7 +794,6 @@ foreach ($grouped_rows as $sort_order => $rows) {
         ];
     }
 
-    // Insert TOTAL NET INCOME/LOSS summary row after sort_order 26
     if ((int)$sort_order == 26) {
         $net_mlfsi_p = $ebt_mlfsi_p - $total_primary_mlfsi;
         $net_jew_p = $ebt_jew_p - $total_primary_jewelers;
@@ -795,32 +830,33 @@ return $final_table_rows;
 }
 
 // ============================================================
-// BUILD TABLE(S) FOR SELECTED REGION/AREA COMBINATIONS
+// BUILD TABLE(S) FOR SELECTED REGION/AREA COMBINATIONS OR BRANCHES
 // ============================================================
 $tables_by_region = [];
 
-// Always build the table structure, even with empty/zero data
-if (!empty($selected_regions)) {
-    foreach ($selected_regions as $rg) {
-        $allowed_areas = $reg_to_area[$rg] ?? [];
-        $areas_for_region = [];
-
-        if (!empty($selected_areas)) {
-            foreach ($selected_areas as $ar) {
-                if (in_array($ar, $allowed_areas, true)) {
-                    $areas_for_region[] = $ar;
-                }
+// FIXED: If branches are selected, create a separate table for EACH branch
+if (!empty($selected_branches)) {
+    // Create a separate table for each selected branch
+    foreach ($selected_branches as $branch_key) {
+        if (isset($branch_info[$branch_key])) {
+            $info = $branch_info[$branch_key];
+            $region = $info['region'] ?: 'Unknown Region';
+            $area = $info['area'] ?: 'Unknown Area';
+            $branch_name = $info['name'];
+            $branch_id = $info['id'];
+            
+            // Initialize region array if not exists
+            if (!isset($tables_by_region[$region])) {
+                $tables_by_region[$region] = [];
             }
-        }
-
-        if (empty($areas_for_region)) {
-            $areas_for_region = ['']; // All Areas for this region
-        }
-
-        foreach ($areas_for_region as $ar) {
-            $tables_by_region[$rg] = $tables_by_region[$rg] ?? [];
-            $tables_by_region[$rg][] = [
-                'area' => $ar,
+            
+            // Add a separate table entry for this branch
+            $tables_by_region[$region][] = [
+                'area' => $area,
+                'branches' => [$branch_key], // Single branch only
+                'branch_names' => [$branch_name],
+                'branch_id' => $branch_id,
+                'is_individual_branch' => true, // Flag to indicate individual branch table
                 'rows' => compute_table_rows_for_region_area(
                     $conn,
                     $mainzone,
@@ -833,38 +869,88 @@ if (!empty($selected_regions)) {
                     $gl_descriptions,
                     $special_keys,
                     $sort_order_descriptions,
-                    $rg,
-                    $ar,
-                    $valid_filters // Use real data only if filters are valid
+                    $region,
+                    $area,
+                    [$branch_key], // Pass single branch
+                    $valid_filters
                 ),
             ];
         }
     }
 } else {
-    // No region selected: render a single "All Regions/All Areas" table.
-    $tables_by_region[''] = [[
-        'area' => '',
-        'rows' => compute_table_rows_for_region_area(
-            $conn,
-            $mainzone,
-            $zone,
-            $transaction_year,
-            $primary_period,
-            $previous_period,
-            $gl_code_mode,
-            $gl_mapping,
-            $gl_descriptions,
-            $special_keys,
-            $sort_order_descriptions,
-            '',
-            '',
-            $valid_filters // Use real data only if filters are valid
-        ),
-    ]];
+    // Original logic when no branches are selected
+    if (!empty($selected_regions)) {
+        foreach ($selected_regions as $rg) {
+            $allowed_areas = $reg_to_area[$rg] ?? [];
+            $areas_for_region = [];
+
+            if (!empty($selected_areas)) {
+                foreach ($selected_areas as $ar) {
+                    if (in_array($ar, $allowed_areas, true)) {
+                        $areas_for_region[] = $ar;
+                    }
+                }
+            }
+
+            if (empty($areas_for_region)) {
+                $areas_for_region = [''];
+            }
+
+            foreach ($areas_for_region as $ar) {
+                $tables_by_region[$rg] = $tables_by_region[$rg] ?? [];
+                $tables_by_region[$rg][] = [
+                    'area' => $ar,
+                    'branches' => [],
+                    'branch_names' => [],
+                    'is_individual_branch' => false,
+                    'rows' => compute_table_rows_for_region_area(
+                        $conn,
+                        $mainzone,
+                        $zone,
+                        $transaction_year,
+                        $primary_period,
+                        $previous_period,
+                        $gl_code_mode,
+                        $gl_mapping,
+                        $gl_descriptions,
+                        $special_keys,
+                        $sort_order_descriptions,
+                        $rg,
+                        $ar,
+                        [],
+                        $valid_filters
+                    ),
+                ];
+            }
+        }
+    } else {
+        $tables_by_region[''] = [[
+            'area' => '',
+            'branches' => [],
+            'branch_names' => [],
+            'is_individual_branch' => false,
+            'rows' => compute_table_rows_for_region_area(
+                $conn,
+                $mainzone,
+                $zone,
+                $transaction_year,
+                $primary_period,
+                $previous_period,
+                $gl_code_mode,
+                $gl_mapping,
+                $gl_descriptions,
+                $special_keys,
+                $sort_order_descriptions,
+                '',
+                '',
+                [],
+                $valid_filters
+            ),
+        ]];
+    }
 }
 
 ?>
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -879,7 +965,7 @@ if (!empty($selected_regions)) {
 <body>
     <main class="main-content">
         <header class="top-bar">
-            <h2><a href="settings.php" style="font-size: 16px; text-decoration: none;">⬅ Back</a></h2>
+            <h2><a href="comparative_report_raw_data.php" style="font-size: 16px; text-decoration: none;">⬅ Back</a></h2>
             <div class="user-badge">
                 <span><?php echo htmlspecialchars($username); ?> (<?php echo htmlspecialchars($user_type); ?>)</span>
                 <div class="avatar"><?php echo strtoupper(substr($full_name, 0, 1)); ?></div>
@@ -889,7 +975,6 @@ if (!empty($selected_regions)) {
         <div class="content-wrapper">
             <div class="page-title">Comparative Report (No Manual Adjustment) - Raw Data</div>
 
-            <!-- Error Banner for validation issues -->
             <?php if ($show_error && !empty($error_message)): ?>
                 <div class="error-banner">
                     <i class="fa-solid fa-circle-exclamation"></i>
@@ -897,7 +982,6 @@ if (!empty($selected_regions)) {
                 </div>
             <?php endif; ?>
 
-            <!-- Filter Form -->
             <form method="GET" class="filter-form" id="filterForm" onsubmit="return validateForm()">
                 <div class="filter-group">
                     <label>Main Zone</label>
@@ -939,6 +1023,14 @@ if (!empty($selected_regions)) {
                     </div>
                 </div>
 
+                <div class="filter-group">
+                    <label>Branch</label>
+                    <div class="multi-select" id="branchMulti">
+                        <button type="button" class="multi-select__button" id="branchMultiBtn" aria-expanded="false">Branches</button>
+                        <div class="multi-select__panel" id="branchPanel"></div>
+                    </div>
+                </div>
+
                 <div class="filter-group filter-group--gl-mode">
                     <label>GL Code</label>
                     <div class="radio-group" role="radiogroup" aria-label="GL Code Mode">
@@ -977,24 +1069,42 @@ if (!empty($selected_regions)) {
                 </div>
             </form>
 
-            <!-- Always display tables, even with zero data -->
             <?php foreach ($tables_by_region as $region_name => $tables): ?>
                 <div class="region-block">
                     <div class="tables-scroll">
                         <div class="tables-grid">
-                            <?php foreach ($tables as $t): ?>
+                            <?php foreach ($tables as $index => $t): ?>
                                 <?php
                                     $table_rows = $t['rows'];
                                     $display_region = $region_name;
                                     $display_area = $t['area'];
+                                    $branch_names = $t['branch_names'] ?? [];
+                                    $is_individual_branch = $t['is_individual_branch'] ?? false;
+                                    
+                                    // Build display text
+                                    if ($is_individual_branch && !empty($branch_names)) {
+                                        $branch_display = ' - Branch: ' . htmlspecialchars($branch_names[0]);
+                                    } else {
+                                        $branch_display = !empty($branch_names) ? ' (Branches: ' . implode(', ', array_map('htmlspecialchars', $branch_names)) . ')' : '';
+                                    }
                                 ?>
                                 <div class="table-container">
                                     <table class="data-table">
                                         <thead>
                                             <tr>
-                                                <th colspan="4">Region: <?php echo !empty($display_region) ? htmlspecialchars($display_region) : 'All Regions'; ?></th>
+                                                <th colspan="4">Region: <?php echo !empty($display_region) ? htmlspecialchars($display_region) : 'All Regions'; ?><?= $branch_display ?></th>
                                                 <th colspan="11">Area: <?php echo !empty($display_area) ? htmlspecialchars($display_area) : 'All Areas'; ?></th>
                                             </tr>
+                                            <?php if ($is_individual_branch && !empty($branch_names)): ?>
+                                            <tr>
+                                                <!-- <th colspan="15" style="background-color: #f0f7ff; color: #1a56db; font-weight: bold; text-align: center;">
+                                                    Branch: <?php echo htmlspecialchars($branch_names[0]); ?>
+                                                    <?php if (isset($t['branch_id'])): ?>
+                                                        (ID: <?php echo htmlspecialchars($t['branch_id']); ?>)
+                                                    <?php endif; ?>
+                                                </th> -->
+                                            </tr>
+                                            <?php endif; ?>
                                             <tr>
                                                 <th colspan="4"></th>
                                                 <th colspan="3"><?php echo !empty($primary_period) ? strtoupper(date('F Y', strtotime($primary_period . '-01'))) : '(Primary Period)'; ?></th>
@@ -1122,7 +1232,6 @@ if (!empty($selected_regions)) {
                                                         <td class="<?= $is_summary_row ? 'summary-cell' : '' ?>"></td>
                                                     </tr>
                                                     <?php 
-                                                    // Spacer row after summary rows, EXCEPT after EBITDA, EBIT, EBT, and NET rows
                                                     if ($is_summary_row && !$is_header && empty($row['skip_spacer'])): 
                                                     ?>
                                                         <tr class="spacer-row" data-spacer-for="<?= htmlspecialchars($row['sort_order'] ?? '') ?>" style="height: 20px;"><td colspan="15"></td></tr>
@@ -1139,13 +1248,11 @@ if (!empty($selected_regions)) {
             <?php endforeach; ?>
 
             <script>
-                // Helper function to compare months (format: YYYY-MM)
                 function compareMonths(month1, month2) {
                     if (!month1 || !month2) return 0;
                     return new Date(month1 + '-01') - new Date(month2 + '-01');
                 }
 
-                // Helper to check if month is March 2026 or earlier
                 function isMarch2026OrEarlier(month) {
                     if (!month) return true;
                     const cutoff = new Date('2026-03-01');
@@ -1153,7 +1260,6 @@ if (!empty($selected_regions)) {
                     return monthDate <= cutoff;
                 }
 
-                // Helper to check if month is April 2026 or later
                 function isApril2026OrLater(month) {
                     if (!month) return true;
                     const cutoff = new Date('2026-04-01');
@@ -1164,7 +1270,6 @@ if (!empty($selected_regions)) {
                 let activeModal = null;
 
                 function showModal(message) {
-                    // Remove any existing modal
                     if (activeModal) {
                         activeModal.remove();
                     }
@@ -1209,19 +1314,15 @@ if (!empty($selected_regions)) {
                     const glMixedRadio = document.getElementById('glMixedRadio');
                     const glCodeMode = glOldRadio.checked ? 'old' : (glNewRadio.checked ? 'new' : (glMixedRadio.checked ? 'mixed' : 'old'));
 
-                    // Only validate if both periods have values
                     if (!primaryPeriod || !previousPeriod) {
-                        // Allow form submission with empty periods - will show zero data
                         return true;
                     }
 
-                    // Validation 1: Primary period must be greater than previous period
                     if (compareMonths(primaryPeriod, previousPeriod) <= 0) {
                         showModal('Primary period must be later than the Previous period.');
                         return false;
                     }
 
-                    // Validation 2: GL code mode restrictions
                     if (glCodeMode === 'old') {
                         if (!isMarch2026OrEarlier(primaryPeriod) || !isMarch2026OrEarlier(previousPeriod)) {
                             showModal('Old GL Code is only available for March 2026 and earlier. Both selected periods must be March 2026 or earlier.');
@@ -1256,12 +1357,10 @@ if (!empty($selected_regions)) {
                                     const sortNum = parseInt(sortOrder);
                                     const is1To20 = !isNaN(sortNum) && sortNum >= 1 && sortNum <= 20;
                                     
-                                    // 1. Hide detail rows for sort 1-20
                                     if (is1To20 && isDetail) {
                                         row.style.display = isCollapsed ? 'none' : '';
                                     }
                                     
-                                    // 2. Hide spacer rows for sort 1-20
                                     if (spacerFor) {
                                         const spacerNum = parseInt(spacerFor);
                                         if (!isNaN(spacerNum) && spacerNum >= 1 && spacerNum <= 20) {
@@ -1269,12 +1368,10 @@ if (!empty($selected_regions)) {
                                         }
                                     }
 
-                                    // 3. Hide REVENUES header row
                                     if (row.classList.contains('revenues-header-row')) {
                                         row.style.display = isCollapsed ? 'none' : '';
                                     }
 
-                                    // 4. Hide initial spacer row
                                     if (row.classList.contains('initial-spacer')) {
                                         row.style.display = isCollapsed ? 'none' : '';
                                     }
@@ -1285,7 +1382,6 @@ if (!empty($selected_regions)) {
                                 ? '<i class="fa-solid fa-expand"></i> Uncollapse' 
                                 : '<i class="fa-solid fa-compress"></i> Collapse';
                             
-                            // Visual feedback for active state
                             collapseBtn.style.backgroundColor = isCollapsed ? '#1f2937' : '#4b5563';
                         });
                     }
@@ -1296,10 +1392,13 @@ if (!empty($selected_regions)) {
                     const mzToReg = <?= json_encode($mz_to_reg) ?>;
                     const znToReg = <?= json_encode($zn_to_reg) ?>;
                     const regToArea = <?= json_encode($reg_to_area) ?>;
+                    const areaToBranch = <?= json_encode($area_to_branch) ?>;
                     const allRegions = <?= json_encode(array_values($distinct_reg)) ?>;
                     const allAreas = <?= json_encode(array_values($distinct_area)) ?>;
+                    const allBranches = <?= json_encode(array_values($distinct_branches)) ?>;
                     const selectedRegions = <?= json_encode(array_values($selected_regions)) ?>;
                     const selectedAreas = <?= json_encode(array_values($selected_areas)) ?>;
+                    const selectedBranches = <?= json_encode(array_values($selected_branches)) ?>;
 
                     const mainzoneSelect = document.getElementById('mainzoneSelect');
                     const zoneSelect = document.getElementById('zoneSelect');
@@ -1307,6 +1406,8 @@ if (!empty($selected_regions)) {
                     const regionPanel = document.getElementById('regionPanel');
                     const areaBtn = document.getElementById('areaMultiBtn');
                     const areaPanel = document.getElementById('areaPanel');
+                    const branchBtn = document.getElementById('branchMultiBtn');
+                    const branchPanel = document.getElementById('branchPanel');
 
                     const allZones = Array.from(zoneSelect.options).map(o => ({ value: o.value, label: o.text }));
 
@@ -1346,8 +1447,8 @@ if (!empty($selected_regions)) {
                     }
 
                     function closePanels() {
-                        [regionPanel, areaPanel].forEach(p => p.classList.remove('is-open'));
-                        [regionBtn, areaBtn].forEach(b => b.setAttribute('aria-expanded', 'false'));
+                        [regionPanel, areaPanel, branchPanel].forEach(p => p.classList.remove('is-open'));
+                        [regionBtn, areaBtn, branchBtn].forEach(b => b.setAttribute('aria-expanded', 'false'));
                     }
 
                     function setButtonLabel(btn, checkedValues, allLabel, singularLabel) {
@@ -1379,12 +1480,144 @@ if (!empty($selected_regions)) {
                             input.checked = checkedSet.has(v);
 
                             const span = document.createElement('span');
-                            span.textContent = v;
+                            span.textContent = v.includes('|') ? v.replace('|', ' - ') : v;
 
                             label.appendChild(input);
                             label.appendChild(span);
                             panelEl.appendChild(label);
                         });
+                    }
+
+                    function rebuildBranchCheckboxes() {
+                        const selectedRegionsList = getCheckedValues(regionPanel);
+                        const selectedAreasList = getCheckedValues(areaPanel);
+                        const mz = mainzoneSelect.value;
+                        const zn = zoneSelect.value;
+                        
+                        let branches = [];
+                        
+                        // Step 1: Filter by areas if selected
+                        if (selectedAreasList.length > 0) {
+                            selectedAreasList.forEach(area => {
+                                if (areaToBranch[area]) {
+                                    branches = branches.concat(areaToBranch[area]);
+                                }
+                            });
+                            branches = [...new Set(branches)];
+                        } 
+                        // Step 2: Filter by regions if no areas selected but regions are selected
+                        else if (selectedRegionsList.length > 0) {
+                            selectedRegionsList.forEach(region => {
+                                const areasInRegion = regToArea[region] || [];
+                                areasInRegion.forEach(area => {
+                                    if (areaToBranch[area]) {
+                                        branches = branches.concat(areaToBranch[area]);
+                                    }
+                                });
+                            });
+                            branches = [...new Set(branches)];
+                        } 
+                        // Step 3: Filter by zone if no region/area selected but zone is selected
+                        else if (zn) {
+                            const regionsInZone = znToReg[zn] || [];
+                            regionsInZone.forEach(region => {
+                                const areasInRegion = regToArea[region] || [];
+                                areasInRegion.forEach(area => {
+                                    if (areaToBranch[area]) {
+                                        branches = branches.concat(areaToBranch[area]);
+                                    }
+                                });
+                            });
+                            branches = [...new Set(branches)];
+                        } 
+                        // Step 4: Filter by mainzone if no other filters selected
+                        else if (mz) {
+                            const regionsInMz = mzToReg[mz] || [];
+                            regionsInMz.forEach(region => {
+                                const areasInRegion = regToArea[region] || [];
+                                areasInRegion.forEach(area => {
+                                    if (areaToBranch[area]) {
+                                        branches = branches.concat(areaToBranch[area]);
+                                    }
+                                });
+                            });
+                            branches = [...new Set(branches)];
+                        } 
+                        // Step 5: No filters - show all branches
+                        else {
+                            branches = allBranches;
+                        }
+                        
+                        // Additional filtering: If regions are selected but no areas, ensure branches match those regions
+                        if (selectedRegionsList.length > 0 && selectedAreasList.length === 0) {
+                            const validBranches = [];
+                            const branchInfo = <?= json_encode($branch_info) ?>;
+                            branches.forEach(branchKey => {
+                                if (branchInfo[branchKey]) {
+                                    const branchRegion = branchInfo[branchKey].region;
+                                    if (selectedRegionsList.includes(branchRegion)) {
+                                        validBranches.push(branchKey);
+                                    }
+                                }
+                            });
+                            branches = validBranches;
+                        }
+                        
+                        // Sort branches by ID
+                        branches.sort((a, b) => {
+                            const aId = parseInt(a.split('|')[0]) || 0;
+                            const bId = parseInt(b.split('|')[0]) || 0;
+                            return aId - bId;
+                        });
+
+                        // Get current checked values
+                        const currentChecked = branchPanel.querySelectorAll('input[type="checkbox"]').length
+                            ? getCheckedValues(branchPanel)
+                            : selectedBranches;
+                        const checked = new Set(currentChecked);
+                        // Remove any branches that are no longer available
+                        Array.from(checked).forEach(v => { 
+                            if (!branches.includes(v)) checked.delete(v); 
+                        });
+
+                        buildCheckboxList(branchPanel, 'branch[]', branches, checked);
+
+                        // Add "All Branches" option
+                        if (branches.length > 0) {
+                            const allOption = document.createElement('label');
+                            allOption.className = 'multi-select__option';
+                            allOption.style.fontWeight = 'bold';
+                            allOption.style.borderBottom = '1px solid #edf2f7';
+                            allOption.style.marginBottom = '4px';
+                            allOption.style.paddingBottom = '4px';
+                            allOption.style.position = 'sticky';
+                            allOption.style.top = '0';
+                            allOption.style.backgroundColor = '#fff';
+                            allOption.style.zIndex = '2';
+
+                            const allInput = document.createElement('input');
+                            allInput.type = 'checkbox';
+                            allInput.className = 'select-all-checkbox';
+                            allInput.checked = branches.length > 0 && branches.every(b => checked.has(b));
+
+                            const allSpan = document.createElement('span');
+                            allSpan.textContent = 'All Branches';
+
+                            allOption.appendChild(allInput);
+                            allOption.appendChild(allSpan);
+                            branchPanel.insertBefore(allOption, branchPanel.firstChild);
+
+                            allInput.addEventListener('change', function() {
+                                const isChecked = this.checked;
+                                branchPanel.querySelectorAll('input[type="checkbox"]:not(.select-all-checkbox)').forEach(cb => {
+                                    cb.checked = isChecked;
+                                });
+                                const checkedBranches = getCheckedValues(branchPanel);
+                                setButtonLabel(branchBtn, checkedBranches, 'All Branches', 'Branch');
+                            });
+                        }
+
+                        setButtonLabel(branchBtn, Array.from(checked), 'Branches', 'Branch');
                     }
 
                     function rebuildRegionCheckboxes() {
@@ -1393,20 +1626,16 @@ if (!empty($selected_regions)) {
                         
                         let regions = [];
                         
-                        // Priority: If mainzone is selected, filter regions by mainzone
                         if (mz && mzToReg[mz]) {
                             regions = mzToReg[mz];
                         } 
-                        // If zone is selected (and no mainzone or mainzone doesn't filter further), filter by zone
                         else if (zn && znToReg[zn]) {
                             regions = znToReg[zn];
                         } 
-                        // Otherwise show all regions
                         else {
                             regions = allRegions;
                         }
                         
-                        // Further filter regions if both mainzone and zone are selected
                         if (mz && zn && mzToReg[mz] && znToReg[zn]) {
                             const mzRegions = new Set(mzToReg[mz]);
                             const znRegions = new Set(znToReg[zn]);
@@ -1510,33 +1739,46 @@ if (!empty($selected_regions)) {
                                 });
                                 const checkedAreas = getCheckedValues(areaPanel);
                                 setButtonLabel(areaBtn, checkedAreas, 'All Areas', 'Area');
+                                rebuildBranchCheckboxes();
                             });
                         }
 
                         setButtonLabel(areaBtn, Array.from(checked), 'Areas', 'Area');
+                        rebuildBranchCheckboxes();
                     }
 
                     mainzoneSelect.addEventListener('change', () => {
                         updateZones();
                         rebuildRegionCheckboxes();
                         rebuildAreaCheckboxes();
+                        rebuildBranchCheckboxes();
                     });
 
                     zoneSelect.addEventListener('change', () => {
                         rebuildRegionCheckboxes();
                         rebuildAreaCheckboxes();
+                        rebuildBranchCheckboxes();
                     });
 
                     regionBtn.addEventListener('click', (e) => {
                         e.preventDefault();
                         togglePanel(regionBtn, regionPanel);
                         areaPanel.classList.remove('is-open');
+                        branchPanel.classList.remove('is-open');
                     });
 
                     areaBtn.addEventListener('click', (e) => {
                         e.preventDefault();
                         togglePanel(areaBtn, areaPanel);
                         regionPanel.classList.remove('is-open');
+                        branchPanel.classList.remove('is-open');
+                    });
+
+                    branchBtn.addEventListener('click', (e) => {
+                        e.preventDefault();
+                        togglePanel(branchBtn, branchPanel);
+                        regionPanel.classList.remove('is-open');
+                        areaPanel.classList.remove('is-open');
                     });
 
                     regionPanel.addEventListener('change', (e) => {
@@ -1550,6 +1792,7 @@ if (!empty($selected_regions)) {
                             const regs = getCheckedValues(regionPanel);
                             setButtonLabel(regionBtn, regs, 'All Regions', 'Region');
                             rebuildAreaCheckboxes();
+                            rebuildBranchCheckboxes();
                         }
                     });
 
@@ -1563,21 +1806,37 @@ if (!empty($selected_regions)) {
 
                             const areas = getCheckedValues(areaPanel);
                             setButtonLabel(areaBtn, areas, 'All Areas', 'Area');
+                            rebuildBranchCheckboxes();
+                        }
+                    });
+
+                    branchPanel.addEventListener('change', (e) => {
+                        if (e.target && e.target.matches('input[type="checkbox"]') && !e.target.classList.contains('select-all-checkbox')) {
+                            const allCb = branchPanel.querySelector('.select-all-checkbox');
+                            if (allCb) {
+                                const others = Array.from(branchPanel.querySelectorAll('input[type="checkbox"]:not(.select-all-checkbox)'));
+                                allCb.checked = others.length > 0 && others.every(cb => cb.checked);
+                            }
+
+                            const branches = getCheckedValues(branchPanel);
+                            setButtonLabel(branchBtn, branches, 'All Branches', 'Branch');
                         }
                     });
 
                     document.addEventListener('click', (e) => {
                         const regionWrap = document.getElementById('regionMulti');
                         const areaWrap = document.getElementById('areaMulti');
+                        const branchWrap = document.getElementById('branchMulti');
                         if (regionWrap && regionWrap.contains(e.target)) return;
                         if (areaWrap && areaWrap.contains(e.target)) return;
+                        if (branchWrap && branchWrap.contains(e.target)) return;
                         closePanels();
                     });
 
-                    // initialize dependent selects + checkbox panels on load
                     updateZones();
                     rebuildRegionCheckboxes();
                     rebuildAreaCheckboxes();
+                    rebuildBranchCheckboxes();
                 })();
             </script>
 

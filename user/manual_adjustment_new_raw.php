@@ -1,4 +1,3 @@
-
 <?php
 session_start();
 require_once __DIR__ . '/../config/config.php';
@@ -72,7 +71,7 @@ if (!is_array($selected_regions)) {
 $selected_regions = array_values(array_filter(array_map('trim', $selected_regions), fn($v) => $v !== ''));
 
 if (isset($_GET['reset']) && $_GET['reset'] === '1') {
-    header("Location: manual_adjustment_new.php");
+    header("Location: manual_adjustment_new_raw.php");
     exit;
 }
 
@@ -83,7 +82,7 @@ $distinct_years = [];
 
 $hierarchy_query = "
     SELECT DISTINCT region, area
-    FROM fs_reports.comparative_report
+    FROM fs_reports.fs_raw_data_summary
     WHERE region IS NOT NULL AND region != ''
     ORDER BY region, area
 ";
@@ -190,7 +189,7 @@ function compute_table_rows_for_region(
                 gl_code,
                 SUM(CASE WHEN transaction_type = 'Branch'   THEN amount ELSE 0 END) AS branch_amount,
                 SUM(CASE WHEN transaction_type = 'Showroom' THEN amount ELSE 0 END) AS showroom_amount
-            FROM fs_reports.comparative_report
+            FROM fs_reports.fs_raw_data_summary
             $base_where
             AND transaction_year = ? AND transaction_month = ?
             AND gl_code IS NOT NULL AND gl_code != ''
@@ -267,7 +266,7 @@ function compute_table_rows_for_region(
     $ebt_mlfsi    = 0; $ebt_jew    = 0; $ebt_tot    = 0;
 
     foreach ($grouped_rows as $sort_order => $rows) {
-        // Skip detail rows for 6, 8, 11 (hide them)
+        // CHANGED: Skip detail rows for 6, 8, 11 (hide them)
         if (!in_array((int)$sort_order, [6, 8, 11])) {
             foreach ($rows as $row) {
                 $final_rows[] = $row;
@@ -294,7 +293,7 @@ function compute_table_rows_for_region(
 
         $description = $sort_order_descriptions[$sort_order] ?? "Total for Sort Order $sort_order";
 
-        // Emit summary row for all sort orders except 24, 25, 26
+        // CHANGED: Emit summary row for all sort orders except 24, 25, 26
         // Keep summary rows for 6, 8, 11 (these are the total rows)
         if (!in_array((int)$sort_order, [24, 25, 26])) {
             $final_rows[] = [
@@ -498,7 +497,7 @@ if (!empty($selected_regions)) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Manual Adjustment</title>
+    <title>Manual Adjustment (Raw Data)</title>
     <link rel="icon" href="../images/MLW%20Logo.png" type="image/png"/>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="css/comparative_original.css?v=<?= time(); ?>">
@@ -562,7 +561,7 @@ if (!empty($selected_regions)) {
 <body>
     <main class="main-content">
         <header class="top-bar">
-            <h2><a href="settings.php" style="font-size: 16px; text-decoration: none;">⬅ Back</a></h2>
+            <h2><a href="comparative_report_raw_data.php" style="font-size: 16px; text-decoration: none;">⬅ Back</a></h2>
             <div class="user-badge">
                 <span><?php echo htmlspecialchars($username); ?> (<?php echo htmlspecialchars($user_type); ?>)</span>
                 <div class="avatar"><?php echo strtoupper(substr($full_name, 0, 1)); ?></div>
@@ -570,7 +569,7 @@ if (!empty($selected_regions)) {
         </header>
 
         <div class="content-wrapper">
-            <div class="page-title">Manual Adjustment</div>
+            <div class="page-title">Manual Adjustment (Raw Data)</div>
 
             <!-- Error Banner -->
             <?php if ($show_error && !empty($error_message)): ?>
@@ -685,7 +684,7 @@ if (!empty($selected_regions)) {
                                                     $jewelers = $row['jewelers'] ?? 0;
                                                     $total    = $row['total']    ?? 0;
 
-                                                    // Negate INJ-2 detail rows for display
+                                                    // Negate INJ-2 detail rows
                                                     if (!$is_summary_row && !empty($row['is_inj2'])) {
                                                         $mlfsi    = -$mlfsi;
                                                         $jewelers = -$jewelers;

@@ -25,10 +25,11 @@ $mainzone = $_GET['mainzone'] ?? '';
 $zone = $_GET['zone'] ?? '';
 $selected_regions = $_GET['region'] ?? [];
 $selected_areas = $_GET['area'] ?? [];
+$selected_branches = $_GET['branch'] ?? [];
 $transaction_year = $_GET['transaction_year'] ?? '';
 $primary_period = $_GET['primary_period'] ?? '';
 $previous_period = $_GET['previous_period'] ?? '';
-$gl_code_mode = $_GET['gl_code_mode'] ?? 'old'; // old|new|mixed
+$gl_code_mode = $_GET['gl_code_mode'] ?? 'old';
 $gl_code_mode = in_array($gl_code_mode, ['old', 'new', 'mixed'], true) ? $gl_code_mode : 'old';
 
 if (!is_array($selected_regions)) {
@@ -37,8 +38,12 @@ if (!is_array($selected_regions)) {
 if (!is_array($selected_areas)) {
     $selected_areas = $selected_areas !== '' ? [$selected_areas] : [];
 }
+if (!is_array($selected_branches)) {
+    $selected_branches = $selected_branches !== '' ? [$selected_branches] : [];
+}
 $selected_regions = array_values(array_filter(array_map('trim', $selected_regions), fn($v) => $v !== ''));
 $selected_areas = array_values(array_filter(array_map('trim', $selected_areas), fn($v) => $v !== ''));
+$selected_branches = array_values(array_filter(array_map('trim', $selected_branches), fn($v) => $v !== ''));
 
 // Helper functions
 function compareMonths(string $month1, string $month2): int {
@@ -89,18 +94,20 @@ if (!empty($primary_period) && !empty($previous_period)) {
     }
 }
 
-// Get hierarchy data - Updated to use fs_raw_data_summary
+// Get hierarchy data
 $distinct_reg = [];
 $distinct_area = [];
 $mz_to_zn = [];
 $zn_to_reg = [];
 $reg_to_area = [];
+$area_to_branch = [];
+$branch_info = [];
 
 $hierarchy_query = "
-    SELECT DISTINCT mainzone, mlmatic_zone as zone, region, mlmatic_area as area
+    SELECT DISTINCT mainzone, mlmatic_zone as zone, region, area as area
     FROM fs_reports.fs_raw_data_summary
     WHERE mainzone IS NOT NULL AND mainzone != ''
-    ORDER BY mainzone, mlmatic_zone, region, mlmatic_area
+    ORDER BY mainzone, mlmatic_zone, region, area
 ";
 $hierarchy_res = mysqli_query($conn, $hierarchy_query);
 if ($hierarchy_res) {
@@ -130,23 +137,56 @@ if ($hierarchy_res) {
 sort($distinct_reg);
 sort($distinct_area);
 
+// Get distinct branches
+$branch_query = "
+    SELECT DISTINCT branch_id, branch_name, area as area, region
+    FROM fs_reports.fs_raw_data_summary
+    WHERE branch_id IS NOT NULL AND branch_id != ''
+    AND branch_name IS NOT NULL AND branch_name != ''
+    ORDER BY branch_name
+";
+$branch_res = mysqli_query($conn, $branch_query);
+if ($branch_res) {
+    while ($b = mysqli_fetch_assoc($branch_res)) {
+        $branch_id = trim((string)($b['branch_id'] ?? ''));
+        $branch_name = trim((string)($b['branch_name'] ?? ''));
+        $area = trim((string)($b['area'] ?? ''));
+        $region = trim((string)($b['region'] ?? ''));
+        
+        if ($branch_id !== '' && $branch_name !== '') {
+            $branch_key = $branch_id . '|' . $branch_name;
+            
+            $branch_info[$branch_key] = [
+                'id' => $branch_id,
+                'name' => $branch_name,
+                'area' => $area,
+                'region' => $region
+            ];
+            
+            if ($area !== '') {
+                $area_to_branch[$area] = $area_to_branch[$area] ?? [];
+                if (!in_array($branch_key, $area_to_branch[$area], true)) {
+                    $area_to_branch[$area][] = $branch_key;
+                }
+            }
+        }
+    }
+}
+
 // Get GL mapping
-$gl_mapping = []; // sort_order|sub_order -> ['old' => [], 'new' => []]
+$gl_mapping = [];
 $gl_descriptions = [];
 $sort_order_descriptions = [];
 $special_keys = [];
 
-// Build lookup maps if mixed mode is active
 $old_gl_id_to_codes = [];
 $mixed_id_map = [];
 if ($gl_code_mode === 'mixed') {
-    // Load all old codes for lookup by gl_id
     $res = mysqli_query($conn, "SELECT gl_id, gl_code FROM fs_reports.gl_codes WHERE gl_code IS NOT NULL AND gl_code != ''");
     while ($row = mysqli_fetch_assoc($res)) {
         $old_gl_id_to_codes[$row['gl_id']][] = trim($row['gl_code']);
     }
 
-    // Define mappings for mixed mode: new_gl_id => [old_gl_ids]
     $mixed_id_map = [
         'INS-1' => ['INS-28', 'INS-29', 'INS-30', 'INS-31', 'INS-34', 'INS-39'],
         'INS-2' => ['INS-25', 'INS-26', 'INS-44', 'INS-47'],
@@ -161,7 +201,6 @@ if ($gl_code_mode === 'mixed') {
     ];
 }
 
-// Determine which table to use for report structure
 $table_name = ($gl_code_mode === 'old') ? 'fs_reports.gl_codes' : 'fs_reports.new_gl_codes';
 
 $gl_structure_query = "
@@ -189,12 +228,10 @@ if ($gl_structure_result) {
         $code = trim((string)($row['gl_code'] ?? ''));
 
         if ($gl_code_mode === 'mixed') {
-            // Mixed mode: new codes come from current row (new_gl_codes table)
             if ($code !== '' && !in_array($code, $gl_mapping[$key]['new'], true)) {
                 $gl_mapping[$key]['new'][] = $code;
             }
             
-            // Old codes come from ID mapping and lookup in old table
             $target_old_ids = $mixed_id_map[$gl_id] ?? [$gl_id];
             foreach ($target_old_ids as $oid) {
                 if (isset($old_gl_id_to_codes[$oid])) {
@@ -206,7 +243,6 @@ if ($gl_structure_result) {
                 }
             }
         } else {
-            // Old or New mode: 1:1 behavior (codes populate both buckets)
             if ($code !== '') {
                 if (!in_array($code, $gl_mapping[$key]['old'], true)) {
                     $gl_mapping[$key]['old'][] = $code;
@@ -222,7 +258,7 @@ if ($gl_structure_result) {
     }
 }
 
-// Function to compute table rows - Updated to use fs_raw_data_summary
+// Function to compute table rows - MATCHING the main page logic
 function compute_table_rows_for_export(
     mysqli $conn,
     string $mainzone,
@@ -237,6 +273,7 @@ function compute_table_rows_for_export(
     array $sort_order_descriptions,
     string $region,
     string $area,
+    array $selected_branches = [],
     bool $valid_filters
 ): array {
     $where_conditions = [];
@@ -259,9 +296,26 @@ function compute_table_rows_for_export(
         $types .= "s";
     }
     if (!empty($area)) {
-        $where_conditions[] = "mlmatic_area = ?";
+        $where_conditions[] = "area = ?";
         $params[] = $area;
         $types .= "s";
+    }
+    if (!empty($selected_branches)) {
+        $branch_conditions = [];
+        foreach ($selected_branches as $branch) {
+            $branch_parts = explode('|', $branch);
+            if (count($branch_parts) == 2) {
+                $branch_id = trim($branch_parts[0]);
+                $branch_name = trim($branch_parts[1]);
+                $branch_conditions[] = "(branch_id = ? AND branch_name = ?)";
+                $params[] = $branch_id;
+                $params[] = $branch_name;
+                $types .= "ss";
+            }
+        }
+        if (!empty($branch_conditions)) {
+            $where_conditions[] = "(" . implode(" OR ", $branch_conditions) . ")";
+        }
     }
     if (!empty($transaction_year)) {
         $where_conditions[] = "transaction_year = ?";
@@ -271,7 +325,7 @@ function compute_table_rows_for_export(
 
     $base_where = !empty($where_conditions) ? "WHERE " . implode(" AND ", $where_conditions) : "WHERE 1=1";
 
-    // Primary period data - Updated to use fs_raw_data_summary
+    // Primary period data
     $primary_data = [];
     if ($valid_filters && !empty($primary_period)) {
         $p_parts = explode('-', $primary_period);
@@ -310,7 +364,7 @@ function compute_table_rows_for_export(
         }
     }
 
-    // Previous period data - Updated to use fs_raw_data_summary
+    // Previous period data
     $previous_data = [];
     if ($valid_filters && !empty($previous_period)) {
         $prev_parts = explode('-', $previous_period);
@@ -349,14 +403,13 @@ function compute_table_rows_for_export(
         }
     }
 
-    // Build table rows
+    // Build table rows - MATCHING main page logic
     $table_rows = [];
     foreach ($gl_mapping as $key => $codes_detailed) {
         [$sort_order, $sub_order] = explode('|', $key);
-        $gl_description = $gl_descriptions[$key];
+        $gl_description = $gl_descriptions[$key] ?? '';
         $is_inj2 = in_array($key, $special_keys);
         
-        // Determine mode per period
         $p_mode = $gl_code_mode;
         $prev_mode = $gl_code_mode;
         if ($gl_code_mode === 'mixed') {
@@ -402,7 +455,7 @@ function compute_table_rows_for_export(
         ];
     }
 
-    // Group by sort_order and add summary rows
+    // Group by sort_order and add summary rows - MATCHING main page
     $grouped_rows = [];
     foreach ($table_rows as $row) {
         $grouped_rows[$row['sort_order']][] = $row;
@@ -413,8 +466,6 @@ function compute_table_rows_for_export(
     $rev_mlfsi_prev = 0; $rev_jew_prev = 0; $rev_tot_prev = 0;
     $sa_mlfsi_p = 0; $sa_jew_p = 0; $sa_tot_p = 0;
     $sa_mlfsi_prev = 0; $sa_jew_prev = 0; $sa_tot_prev = 0;
-    
-    $revenues_header_added = false;
     $gp_mlfsi_p = 0; $gp_jew_p = 0; $gp_tot_p = 0;
     $gp_mlfsi_prev = 0; $gp_jew_prev = 0; $gp_tot_prev = 0;
     $ebitda_mlfsi_p = 0; $ebitda_jew_p = 0; $ebitda_tot_p = 0;
@@ -427,7 +478,8 @@ function compute_table_rows_for_export(
     $net_mlfsi_prev = 0; $net_jew_prev = 0; $net_tot_prev = 0;
 
     foreach ($grouped_rows as $sort_order => $rows) {
-        if (!$revenues_header_added && (int)$sort_order >= 1) {
+        // Add REVENUES header before sort_order 1
+        if (!isset($revenues_header_added) && (int)$sort_order >= 1) {
             $final_table_rows[] = [
                 'is_section_header' => true,
                 'section_name' => 'REVENUES',
@@ -436,9 +488,11 @@ function compute_table_rows_for_export(
             $revenues_header_added = true;
         }
         
+        // Skip sort orders 6, 8, 11 for detail rows (matching main page)
         if (!in_array((int)$sort_order, [6, 8, 11])) {
             foreach ($rows as $row) {
                 $display_row = $row;
+                // Apply INJ-2 negation (matching main page)
                 if ($row['is_inj2']) {
                     $display_row['primary_mlfsi'] = -$row['primary_mlfsi'];
                     $display_row['primary_jewelers'] = -$row['primary_jewelers'];
@@ -458,6 +512,7 @@ function compute_table_rows_for_export(
         $total_previous_jewelers = array_sum(array_column($rows, 'previous_jewelers'));
         $total_previous_total = array_sum(array_column($rows, 'previous_total'));
 
+        // Accumulate revenues (sort orders 1-20)
         if ((int)$sort_order >= 1 && (int)$sort_order <= 20) {
             $rev_mlfsi_p += $total_primary_mlfsi;
             $rev_jew_p += $total_primary_jewelers;
@@ -467,6 +522,7 @@ function compute_table_rows_for_export(
             $rev_tot_prev += $total_previous_total;
         }
         
+        // Accumulate selling & admin (sort orders 22-23)
         if ((int)$sort_order == 22 || (int)$sort_order == 23) {
             $sa_mlfsi_p += $total_primary_mlfsi;
             $sa_jew_p += $total_primary_jewelers;
@@ -486,6 +542,7 @@ function compute_table_rows_for_export(
         
         $description = $sort_order_descriptions[$sort_order] ?? "Total for Sort Order " . $sort_order;
         
+        // Add summary row for sort orders except 24, 25, 26 (matching main page)
         if (!in_array((int)$sort_order, [24, 25, 26])) {
             $final_table_rows[] = [
                 'sort_order' => $sort_order,
@@ -502,6 +559,7 @@ function compute_table_rows_for_export(
             ];
         }
 
+        // TOTAL REVENUES (after sort order 20)
         if ((int)$sort_order == 20) {
             $inc_dec_rev = $rev_tot_p - $rev_tot_prev;
             $pct_rev = ($rev_tot_prev != 0) ? ($inc_dec_rev / abs($rev_tot_prev)) * 100 : ($rev_tot_p != 0 ? 100 : 0);
@@ -527,6 +585,7 @@ function compute_table_rows_for_export(
             ];
         }
 
+        // GROSS PROFIT (after sort order 21)
         if ((int)$sort_order == 21) {
             $gp_mlfsi_p = $rev_mlfsi_p - $total_primary_mlfsi;
             $gp_jew_p = $rev_jew_p - $total_primary_jewelers;
@@ -559,6 +618,7 @@ function compute_table_rows_for_export(
             ];
         }
 
+        // TOTAL SELLING AND ADMIN EXPENSES & EBITDA (after sort order 23)
         if ((int)$sort_order == 23) {
             $inc_dec_sa = $sa_tot_p - $sa_tot_prev;
             $pct_sa = ($sa_tot_prev != 0) ? ($inc_dec_sa / abs($sa_tot_prev)) * 100 : ($sa_tot_p != 0 ? 100 : 0);
@@ -602,7 +662,7 @@ function compute_table_rows_for_export(
             ];
         }
 
-        // Add EARNINGS BEFORE INTEREST & TAXES (sort_order 24)
+        // EARNINGS BEFORE INTEREST & TAXES (after sort order 24)
         if ((int)$sort_order == 24) {
             $ebit_mlfsi_p = $ebitda_mlfsi_p - $total_primary_mlfsi;
             $ebit_jew_p = $ebitda_jew_p - $total_primary_jewelers;
@@ -629,7 +689,7 @@ function compute_table_rows_for_export(
             ];
         }
 
-        // Add EARNINGS BEFORE TAXES (sort_order 25)
+        // EARNINGS BEFORE TAXES (after sort order 25)
         if ((int)$sort_order == 25) {
             $ebt_mlfsi_p = $ebit_mlfsi_p - $total_primary_mlfsi;
             $ebt_jew_p = $ebit_jew_p - $total_primary_jewelers;
@@ -656,7 +716,7 @@ function compute_table_rows_for_export(
             ];
         }
 
-        // Add TOTAL NET INCOME/LOSS (sort_order 26)
+        // TOTAL NET INCOME/LOSS (after sort order 26)
         if ((int)$sort_order == 26) {
             $net_mlfsi_p = $ebt_mlfsi_p - $total_primary_mlfsi;
             $net_jew_p = $ebt_jew_p - $total_primary_jewelers;
@@ -689,7 +749,6 @@ function compute_table_rows_for_export(
 
 // Function to set manual column widths
 function setManualColumnWidths(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet, int $startColumnIndex = 1): void {
-    // 15-column block, same layout as A through O
     $columnWidthsByOffset = [
         0 => 2,   // A
         1 => 2,   // B
@@ -715,12 +774,9 @@ function setManualColumnWidths(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sh
 
 // Function to apply border styles to specific rows
 function applyBorderStyles(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet, int $row, string $label, int $startColumnIndex = 1): void {
-    // E..N (include spacers H and L)
     $columnOffsets = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
     
-    // For sort_order = 21 (Cost of Sales/Service total)
     if ($label == '21') {
-        // Apply bottom border single
         foreach ($columnOffsets as $offset) {
             $sheet->getStyle(cellAddr($startColumnIndex, $offset, $row))->getBorders()->getBottom()
                 ->setBorderStyle(Border::BORDER_THIN);
@@ -730,13 +786,11 @@ function applyBorderStyles(\PhpOffice\PhpSpreadsheet\Worksheet\Worksheet $sheet,
         'EARNINGS BEFORE INTEREST & TAXES',
         'EARNINGS BEFORE TAXES'
     ])) {
-        // Apply top border single
         foreach ($columnOffsets as $offset) {
             $sheet->getStyle(cellAddr($startColumnIndex, $offset, $row))->getBorders()->getTop()
                 ->setBorderStyle(Border::BORDER_THIN);
         }
     } elseif ($label == 'TOTAL NET INCOME/LOSS') {
-        // Apply top border single and double bottom border
         foreach ($columnOffsets as $offset) {
             $sheet->getStyle(cellAddr($startColumnIndex, $offset, $row))->getBorders()->getTop()
                 ->setBorderStyle(Border::BORDER_THIN);
@@ -755,47 +809,85 @@ $spreadsheet->getProperties()
     ->setSubject('Comparative Report')
     ->setDescription('Comparative Profit & Loss Statement Export');
 
-// Build export data for each combination
-$export_combinations = [];
-if (!empty($selected_regions)) {
-    foreach ($selected_regions as $rg) {
-        $allowed_areas = $reg_to_area[$rg] ?? [];
-        $areas_for_region = [];
-        if (!empty($selected_areas)) {
-            foreach ($selected_areas as $ar) {
-                if (in_array($ar, $allowed_areas, true)) {
-                    $areas_for_region[] = $ar;
-                }
+// Build export data - ONE SHEET PER REGION with all areas side by side
+$region_groups = [];
+
+if (!empty($selected_branches)) {
+    // If branches are selected, group by region
+    foreach ($selected_branches as $branch_key) {
+        if (isset($branch_info[$branch_key])) {
+            $info = $branch_info[$branch_key];
+            $region = $info['region'] ?: 'Unknown Region';
+            $area = $info['area'] ?: 'Unknown Area';
+            $branch_name = $info['name'];
+            $branch_id = $info['id'];
+            
+            if (!isset($region_groups[$region])) {
+                $region_groups[$region] = [];
             }
+            $region_groups[$region][] = [
+                'area' => $area,
+                'branches' => [$branch_key],
+                'branch_name' => $branch_name,
+                'branch_id' => $branch_id,
+                'is_individual_branch' => true
+            ];
         }
-        if (empty($areas_for_region)) {
-            $areas_for_region = [''];
-        }
-        $export_combinations[] = ['region' => $rg, 'areas' => $areas_for_region];
     }
 } else {
-    $export_combinations[] = ['region' => '', 'areas' => ['']];
+    // No branches selected - group by region with areas
+    if (!empty($selected_regions)) {
+        foreach ($selected_regions as $rg) {
+            $allowed_areas = $reg_to_area[$rg] ?? [];
+            $areas_for_region = [];
+
+            if (!empty($selected_areas)) {
+                foreach ($selected_areas as $ar) {
+                    if (in_array($ar, $allowed_areas, true)) {
+                        $areas_for_region[] = $ar;
+                    }
+                }
+            }
+
+            if (empty($areas_for_region)) {
+                $areas_for_region = [''];
+            }
+
+            $region_groups[$rg] = [];
+            foreach ($areas_for_region as $ar) {
+                $region_groups[$rg][] = [
+                    'area' => $ar,
+                    'branches' => [],
+                    'branch_name' => '',
+                    'branch_id' => '',
+                    'is_individual_branch' => false
+                ];
+            }
+        }
+    } else {
+        // No region selected - nationwide
+        $region_groups['NATIONWIDE'] = [[
+            'area' => '',
+            'branches' => [],
+            'branch_name' => '',
+            'branch_id' => '',
+            'is_individual_branch' => false
+        ]];
+    }
 }
 
-$current_row = 1;
 $sheet_index = 0;
 
-foreach ($export_combinations as $index => $combo) {
-    $region_name = $combo['region'];
-    $areas_for_region = $combo['areas'] ?? [''];
-    
-    // Create new sheet for each region (first one uses existing sheet)
+foreach ($region_groups as $region_name => $area_combos) {
+    // Create one sheet per region
     if ($sheet_index > 0) {
         $spreadsheet->createSheet();
     }
     $sheet = $spreadsheet->getSheet($sheet_index);
     $sheet->setShowSummaryBelow(true);
     
-    // Freeze rows 1-9
-    $sheet->freezePane('A10');
-    
     // Set sheet title
-    $sheet_title = !empty($region_name) ? substr($region_name, 0, 31) : 'NATIONWIDE';
+    $sheet_title = !empty($region_name) ? substr(strtoupper($region_name), 0, 31) : 'NATIONWIDE';
     $sheet->setTitle($sheet_title);
 
     // Format period names
@@ -803,15 +895,23 @@ foreach ($export_combinations as $index => $combo) {
     $previous_month_display = !empty($previous_period) ? date('F Y', strtotime($previous_period . '-01')) : '(Previous Period)';
     $primary_month_only = !empty($primary_period) ? date('F', strtotime($primary_period . '-01')) : '(Primary)';
     $previous_month_only = !empty($previous_period) ? date('F', strtotime($previous_period . '-01')) : '(Previous)';
+    
     $region_display = !empty($region_name) ? strtoupper($region_name) : 'NATIONWIDE';
-
-    foreach (array_values($areas_for_region) as $area_index => $area_name) {
+    
+    // Get logo path
+    $logo_path = __DIR__ . '/../images/weblogo.png';
+    $logo_exists = file_exists($logo_path);
+    
+    // For each area in this region, place it side by side using 15 columns each
+    foreach ($area_combos as $area_index => $area_combo) {
         $startColumnIndex = 1 + ($area_index * 15);
-        $current_row = 1;
-
+        $area_name = $area_combo['area'];
+        $branches = $area_combo['branches'] ?? [];
+        $branch_name = $area_combo['branch_name'] ?? '';
+        $branch_id = $area_combo['branch_id'] ?? '';
+        $is_individual_branch = $area_combo['is_individual_branch'] ?? false;
+        
         setManualColumnWidths($sheet, $startColumnIndex);
-
-        $area_display = !empty($area_name) ? 'AREA ' . $area_name : '';
 
         $rows = compute_table_rows_for_export(
             $conn,
@@ -827,12 +927,15 @@ foreach ($export_combinations as $index => $combo) {
             $sort_order_descriptions,
             $region_name,
             $area_name,
+            $branches,
             $valid_filters
         );
 
-        // Load and insert logo with proper row height adjustment
-        $logo_path = __DIR__ . '/../images/weblogo.png';
-        if (file_exists($logo_path)) {
+        // Each area block starts at row 1
+        $current_row = 1;
+
+        // Row 1: Logo (EVERY area has this)
+        if ($logo_exists) {
             $sheet->getRowDimension($current_row)->setRowHeight(50);
 
             $drawing = new \PhpOffice\PhpSpreadsheet\Worksheet\Drawing();
@@ -841,26 +944,26 @@ foreach ($export_combinations as $index => $combo) {
             $drawing->setPath($logo_path);
             $drawing->setHeight(60);
             $drawing->setCoordinates(cellAddr($startColumnIndex, 5, $current_row));
-            $drawing->setOffsetX(20);
+            $drawing->setOffsetX(70);
             $drawing->setWorksheet($sheet);
         }
         $current_row++;
 
-        // Row 2: Region COMPARATIVE PROFIT & LOSS STATEMENT
+        // Row 2: Region COMPARATIVE PROFIT & LOSS STATEMENT (EACH area has this)
         $sheet->setCellValue(cellAddr($startColumnIndex, 0, $current_row), $region_display . ' COMPARATIVE PROFIT & LOSS STATEMENT');
         $sheet->mergeCells(rangeAddr($startColumnIndex, 0, 14, $current_row));
         $sheet->getStyle(cellAddr($startColumnIndex, 0, $current_row))->getFont()->setBold(true)->setSize(16);
         $sheet->getStyle(cellAddr($startColumnIndex, 0, $current_row))->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
         $current_row++;
 
-        // Row 3: MLFSI & JEWELERS
+        // Row 3: MLFSI & JEWELERS (EACH area has this)
         $sheet->setCellValue(cellAddr($startColumnIndex, 0, $current_row), 'MLFSI & JEWELERS');
         $sheet->mergeCells(rangeAddr($startColumnIndex, 0, 14, $current_row));
         $sheet->getStyle(cellAddr($startColumnIndex, 0, $current_row))->getFont()->setBold(true)->setSize(16);
         $sheet->getStyle(cellAddr($startColumnIndex, 0, $current_row))->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
         $current_row++;
 
-        // Row 4: PRIMARY PERIOD VS PREVIOUS PERIOD
+        // Row 4: PRIMARY PERIOD VS PREVIOUS PERIOD (EACH area has this)
         $sheet->setCellValue(
             cellAddr($startColumnIndex, 0, $current_row),
             strtoupper($primary_month_display . ' VS ' . $previous_month_display)
@@ -870,17 +973,24 @@ foreach ($export_combinations as $index => $combo) {
         $sheet->getStyle(cellAddr($startColumnIndex, 0, $current_row))->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
         $current_row++;
 
-        // Row 5: AREA
+        // Row 5: AREA / BRANCH name with Area and Branch ID (EACH area has its own)
+        // For individual branch, show both area and branch ID
+        if ($is_individual_branch && !empty($branch_name)) {
+            $area_display = 'BRANCH NAME: ' . $branch_name . ' (BRANCH ID: ' . $branch_id . ') | AREA ' . $area_name;
+        } else {
+            $area_display = !empty($area_name) ? 'AREA ' . $area_name : '';
+        }
+
         $sheet->setCellValue(cellAddr($startColumnIndex, 0, $current_row), $area_display);
         $sheet->mergeCells(rangeAddr($startColumnIndex, 0, 14, $current_row));
         $sheet->getStyle(cellAddr($startColumnIndex, 0, $current_row))->getFont()->setBold(true)->setSize(16);
         $sheet->getStyle(cellAddr($startColumnIndex, 0, $current_row))->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
         $current_row++;
 
-        // Row 6: Empty
+        // Row 6: Empty spacer
         $current_row++;
 
-        // Row 7: Period headers with merged cells
+        // Row 7: Period headers
         $sheet->setCellValue(cellAddr($startColumnIndex, 4, $current_row), strtoupper($primary_month_only));
         $sheet->mergeCells(rangeAddr($startColumnIndex, 4, 6, $current_row));
 
@@ -939,7 +1049,7 @@ foreach ($export_combinations as $index => $combo) {
             ->getStartColor()->setARGB('FFFFA46E');
         $current_row++;
 
-        // Row 9: Empty
+        // Row 9: Empty spacer
         $sheet->getStyle(cellAddr($startColumnIndex, 14, $current_row))->getFill()
             ->setFillType(Fill::FILL_SOLID)
             ->getStartColor()->setARGB('FF000000');
@@ -1011,16 +1121,13 @@ foreach ($export_combinations as $index => $combo) {
                         ->setFillType(Fill::FILL_SOLID)
                         ->getStartColor()->setARGB('FFFFA973');
                 } elseif (is_numeric($label) && (int)$label >= 1 && (int)$label <= 20) {
-                    // Alternate fill for sort_order 1-20: even numbers get fill, odd numbers no fill
                     $sortOrderNum = (int)$label;
                     if ($sortOrderNum % 2 == 0) {
                         $sheet->getStyle(rangeAddr($startColumnIndex, 0, 13, $current_row))->getFill()
                             ->setFillType(Fill::FILL_SOLID)
                             ->getStartColor()->setARGB('FFFDE9D9');
                     }
-                    // Odd numbers get no fill (do nothing)
                 } elseif (is_numeric($label) && (int)$label >= 21 && (int)$label <= 23) {
-                    // For sort_order 21-23, keep the original behavior
                     $sheet->getStyle(rangeAddr($startColumnIndex, 0, 13, $current_row))->getFill()
                         ->setFillType(Fill::FILL_SOLID)
                         ->getStartColor()->setARGB('FFFDE9D9');
@@ -1056,17 +1163,35 @@ foreach ($export_combinations as $index => $combo) {
 
                 $current_row++;
             } else {
+                // Detail row - apply INJ-2 negation
+                $primary_mlfsi = $row['primary_mlfsi'];
+                $primary_jewelers = $row['primary_jewelers'];
+                $primary_total = $row['primary_total'];
+                $previous_mlfsi = $row['previous_mlfsi'];
+                $previous_jewelers = $row['previous_jewelers'];
+                $previous_total = $row['previous_total'];
+                
+                // Apply INJ-2 negation for detail rows too
+                if ($row['is_inj2']) {
+                    $primary_mlfsi = -$primary_mlfsi;
+                    $primary_jewelers = -$primary_jewelers;
+                    $primary_total = -$primary_total;
+                    $previous_mlfsi = -$previous_mlfsi;
+                    $previous_jewelers = -$previous_jewelers;
+                    $previous_total = -$previous_total;
+                }
+                
                 $sheet->setCellValue(cellAddr($startColumnIndex, 0, $current_row), '');
                 $sheet->setCellValue(cellAddr($startColumnIndex, 2, $current_row), $row['gl_description']);
-                $sheet->setCellValue(cellAddr($startColumnIndex, 4, $current_row), $row['primary_mlfsi']);
-                $sheet->setCellValue(cellAddr($startColumnIndex, 5, $current_row), $row['primary_jewelers']);
-                $sheet->setCellValue(cellAddr($startColumnIndex, 6, $current_row), $row['primary_total']);
-                $sheet->setCellValue(cellAddr($startColumnIndex, 8, $current_row), $row['previous_mlfsi']);
-                $sheet->setCellValue(cellAddr($startColumnIndex, 9, $current_row), $row['previous_jewelers']);
-                $sheet->setCellValue(cellAddr($startColumnIndex, 10, $current_row), $row['previous_total']);
+                $sheet->setCellValue(cellAddr($startColumnIndex, 4, $current_row), $primary_mlfsi);
+                $sheet->setCellValue(cellAddr($startColumnIndex, 5, $current_row), $primary_jewelers);
+                $sheet->setCellValue(cellAddr($startColumnIndex, 6, $current_row), $primary_total);
+                $sheet->setCellValue(cellAddr($startColumnIndex, 8, $current_row), $previous_mlfsi);
+                $sheet->setCellValue(cellAddr($startColumnIndex, 9, $current_row), $previous_jewelers);
+                $sheet->setCellValue(cellAddr($startColumnIndex, 10, $current_row), $previous_total);
 
-                $inc_dec = $row['primary_total'] - $row['previous_total'];
-                $pct = ($row['previous_total'] != 0) ? ($inc_dec / abs($row['previous_total'])) * 100 : (($row['primary_total'] != 0) ? 100 : 0);
+                $inc_dec = $primary_total - $previous_total;
+                $pct = ($previous_total != 0) ? ($inc_dec / abs($previous_total)) * 100 : (($primary_total != 0) ? 100 : 0);
 
                 $sheet->setCellValue(cellAddr($startColumnIndex, 12, $current_row), $inc_dec);
                 if ($pct >= 1000 || $pct <= -1000) {
@@ -1104,13 +1229,14 @@ foreach ($export_combinations as $index => $combo) {
         }
     }
     
-    // Reset current_row for next sheet and increment sheet index
-    $current_row = 1;
+    // Freeze ONLY rows 1-10 (no column freeze)
+    $sheet->freezePane('A11');
+    
     $sheet_index++;
 }
 
 // Remove default empty sheet if we created additional sheets
-while ($spreadsheet->getSheetCount() > count($export_combinations)) {
+while ($spreadsheet->getSheetCount() > count($region_groups)) {
     $spreadsheet->removeSheetByIndex($spreadsheet->getSheetCount() - 1);
 }
 
