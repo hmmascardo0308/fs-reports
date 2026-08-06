@@ -1,4 +1,6 @@
 <?php
+// lock_period.php
+
 session_start();
 require_once __DIR__ . '/../config/config.php';
 
@@ -39,7 +41,7 @@ $message_type = '';
 
 // Handle lock Action
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action_type'])) {
-    if (isset($_POST['selected_groups']) && is_array($_POST['selected_groups'])) {
+    if (isset($_POST['selected_zones']) && is_array($_POST['selected_zones'])) {
         $success_count = 0;
         $action = $_POST['action_type']; // 'lock'
 
@@ -49,25 +51,25 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action_type'])) {
         if ($action === 'lock') {
             // Lock action: set status = 'Locked', locked_by, locked_date
             $new_status = 'Locked';
-            $update_stmt = $conn->prepare("UPDATE comparative_report SET status = ?, locked_by = ?, locked_date = ? WHERE mainzone <=> ? AND zone <=> ? AND transaction_type <=> ? AND transaction_month BETWEEN ? AND ?");
+            $update_stmt = $conn->prepare("UPDATE fs_raw_data SET status = ?, locked_by = ?, locked_date = ? WHERE mainzone <=> ? AND zone <=> ? AND transaction_month BETWEEN ? AND ?");
         }
 
         if ($update_stmt) {
-            foreach ($_POST['selected_groups'] as $group_json) {
-                $parts = json_decode($group_json, true);
-                if (is_array($parts) && count($parts) === 3) {
+            foreach ($_POST['selected_zones'] as $zone_json) {
+                $parts = json_decode($zone_json, true);
+                if (is_array($parts) && count($parts) === 2) {
                     
                     $current_datetime = date('Y-m-d H:i:s');
                     
-                    $update_stmt->bind_param("ssssssss", 
+                    // FIXED: Added 7th "s" to match 7 parameters
+                    $update_stmt->bind_param("sssssss", 
                         $new_status,           // status
                         $username,              // by
                         $current_datetime,      // date
                         $parts[0],              // mainzone
                         $parts[1],              // zone
-                        $parts[2],              // transaction_type
-                        $start_date,
-                        $end_date
+                        $start_date,            // start of month range
+                        $end_date               // end of month range
                     );
                     
                     if ($update_stmt->execute()) {
@@ -79,7 +81,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action_type'])) {
         }
 
         if ($success_count > 0) {
-            $message = "$success_count group(s) locked successfully.";
+            $message = "$success_count zone(s) locked successfully.";
             $message_type = "success";
         } else {
             $message = "No records updated.";
@@ -91,22 +93,36 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action_type'])) {
     }
 }
 
-// Fetch filtered data with lock information
+// Fetch filtered data - grouped by zone only
 $query = "SELECT 
             mainzone, 
-            zone, 
-            transaction_type, 
+            zone,
+            GROUP_CONCAT(DISTINCT transaction_type ORDER BY transaction_type) as transaction_types,
             MAX(uploaded_date) as uploaded_date,
-            COUNT(*) as record_count,
-            COUNT(DISTINCT CASE WHEN status = 'Locked' THEN region END) as locked_region_count,
-            COUNT(DISTINCT CASE WHEN status = 'Unlocked' THEN region END) as unlocked_region_count,
-            COUNT(DISTINCT CASE WHEN status IS NULL OR status NOT IN ('Locked', 'Unlocked') THEN region END) as no_status_region_count,
-            COUNT(DISTINCT CASE WHEN status_void = 'Void' THEN region END) as void_region_count,
+            SUM(record_count) as total_record_count,
+            COUNT(DISTINCT transaction_type) as type_count,
+            SUM(locked_region_count) as locked_region_count,
+            SUM(unlocked_region_count) as unlocked_region_count,
+            SUM(void_region_count) as void_region_count,
             MAX(locked_by) as locked_by,
             MAX(locked_date) as locked_date
-          FROM comparative_report 
-          WHERE transaction_month BETWEEN ? AND ?
-          GROUP BY mainzone, zone, transaction_type
+          FROM (
+              SELECT 
+                mainzone, 
+                zone, 
+                transaction_type, 
+                MAX(uploaded_date) as uploaded_date,
+                COUNT(*) as record_count,
+                COUNT(DISTINCT CASE WHEN status = 'Locked' THEN region END) as locked_region_count,
+                COUNT(DISTINCT CASE WHEN status = 'Unlocked' THEN region END) as unlocked_region_count,
+                COUNT(DISTINCT CASE WHEN status_void = 'Void' THEN region END) as void_region_count,
+                MAX(locked_by) as locked_by,
+                MAX(locked_date) as locked_date
+              FROM fs_raw_data 
+              WHERE transaction_month BETWEEN ? AND ?
+              GROUP BY mainzone, zone, transaction_type
+          ) as grouped_data
+          GROUP BY mainzone, zone
           ORDER BY mainzone, zone";
 
 $stmt = $conn->prepare($query);
@@ -169,7 +185,7 @@ $result = $stmt->get_result();
                     
                     <div class="filter-group action-buttons">
                         <button type="submit"><i class="fas fa-filter"></i> Apply Filter</button>
-                        <a href="lock_period.php" class="reset-btn" style="padding: 8px 20px; text-decoration: none; color: white; border-radius: 4px;"><i class="fa-solid fa-rotate"></i> Clear</a>
+                        <a href="lock_period_raw.php" class="reset-btn" style="padding: 8px 20px; text-decoration: none; color: white; border-radius: 4px;"><i class="fa-solid fa-rotate"></i> Clear</a>
                     </div>
                 </form>
             </div>
@@ -179,19 +195,18 @@ $result = $stmt->get_result();
             $total_records = 0;
             $unique_mainzones = [];
             $unique_zones = [];
-            $unique_types = [];
             $locked_count = 0;
             $pending_count = 0;
             
             if ($result && $result->num_rows > 0) {
                 $result->data_seek(0); // Reset pointer
                 while ($row = $result->fetch_assoc()) {
-                    $total_records += $row['record_count'];
+                    $total_records += $row['total_record_count'];
                     $unique_mainzones[$row['mainzone']] = true;
                     $unique_zones[$row['zone']] = true;
-                    $unique_types[$row['transaction_type']] = true;
                     
-                    if ($row['unlocked_region_count'] == 0 && $row['no_status_region_count'] == 0 && $row['locked_region_count'] > 0) {
+                    // Check if all regions in this zone are locked
+                    if ($row['unlocked_region_count'] == 0 && $row['locked_region_count'] > 0) {
                         $locked_count++;
                     } else {
                         $pending_count++;
@@ -215,23 +230,19 @@ $result = $stmt->get_result();
                     <div class="stat-value"><?php echo count($unique_zones); ?></div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">Branch Types</div>
-                    <div class="stat-value"><?php echo count($unique_types); ?></div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-label">Locked Groups</div>
+                    <div class="stat-label">Locked Zones</div>
                     <div class="stat-value" style="color: #dc3545;"><?php echo $locked_count; ?></div>
                 </div>
-                <!-- <div class="stat-item">
-                    <div class="stat-label">No Status Groups</div>
+                <div class="stat-item">
+                    <div class="stat-label">Pending Zones</div>
                     <div class="stat-value" style="color: #ffc107;"><?php echo $pending_count; ?></div>
-                </div> -->
+                </div>
             </div>
 
             <form method="POST" id="actionForm">
                 <div class="action-buttons-container">
-                    <!-- <span id="selectedCount" class="selection-count">0 items selected</span> -->
-                    <a href="mark_reported.php" class="btn-report" style="text-decoration: none;"><i class="fas fa-check-circle"></i> Mark as Reported</a>
+                    <span id="selectedCount" class="selection-count">0 items selected</span>
+                    <a href="mark_reported_raw.php" class="btn-report" style="text-decoration: none;"><i class="fas fa-check-circle"></i> Mark as Reported</a>
                      
                     <button type="submit" name="action_type" value="lock" class="btn-lock" onclick="return confirmLockAction('lock')">
                         <i class="fas fa-lock"></i> Lock
@@ -246,7 +257,7 @@ $result = $stmt->get_result();
                             <tr>
                                 <th><i class="fa-solid fa-sitemap"></i> Main Zone</th>
                                 <th><i class="fa-solid fa-map-location-dot"></i> Zone</th>
-                                <th><i class="fa-solid fa-building"></i> Branch Type</th>
+                                <th><i class="fa-solid fa-building"></i> Branch Types</th>
                                 <th><i class="fa-solid fa-upload"></i> Uploaded Date</th>
                                 <th><i class="fa-solid fa-table-list"></i> Record Count</th>
                                 <th><i class="fa-solid fa-circle-check"></i> Status</th>
@@ -265,9 +276,18 @@ $result = $stmt->get_result();
                                     <tr>
                                         <td style="text-align: center;"><span class="badge badge-primary"><?php echo htmlspecialchars($row['mainzone'] ?: 'N/A'); ?></span></td>
                                         <td><?php echo htmlspecialchars($row['zone'] ?: 'N/A'); ?></td>
-                                        <td><?php echo htmlspecialchars($row['transaction_type'] ?: 'N/A'); ?></td>
+                                        <td>
+                                            <?php 
+                                            $types = explode(',', $row['transaction_types']);
+                                            $type_badges = [];
+                                            foreach ($types as $type) {
+                                                $type_badges[] = '<span class="badge badge-secondary" style="display: inline-block; margin: 2px 2px;">' . htmlspecialchars(trim($type)) . '</span>';
+                                            }
+                                            echo implode(' ', $type_badges);
+                                            ?>
+                                        </td>
                                         <td><?php echo date('F d, Y h:i:s A', strtotime($row['uploaded_date'])); ?></td>
-                                        <td style="text-align: center;"><strong><?php echo number_format($row['record_count']); ?></strong></td>
+                                        <td style="text-align: center;"><strong><?php echo number_format($row['total_record_count']); ?></strong></td>
                                         <td style="text-align: left; padding-left: 15px;">
                                             <?php
                                             $status_parts = [];
@@ -277,9 +297,6 @@ $result = $stmt->get_result();
                                             if ($row['unlocked_region_count'] > 0) {
                                                 $status_parts[] = '<span class="badge-unlocked" style="display: inline-block; margin-bottom: 2px;"><i class="fas fa-unlock"></i> Unlocked Regions: ' . $row['unlocked_region_count'] . '</span>';
                                             }
-                                            // if ($row['no_status_region_count'] > 0) {
-                                            //     $status_parts[] = '<span class="badge-nostatus" style="display: inline-block; margin-bottom: 2px;"><i class="fas fa-question-circle"></i> No Status: ' . $row['no_status_region_count'] . '</span>';
-                                            // }
 
                                             if (empty($status_parts)) {
                                                 echo '<span>-</span>';
@@ -309,12 +326,11 @@ $result = $stmt->get_result();
                                         </td>
                                         <td style="text-align: center;">
                                             <input type="checkbox" 
-                                                   name="selected_groups[]" 
+                                                   name="selected_zones[]" 
                                                    class="row-checkbox" 
                                                    value="<?php echo htmlspecialchars(json_encode([
                                                         $row['mainzone'], 
-                                                        $row['zone'], 
-                                                        $row['transaction_type']
+                                                        $row['zone']
                                                     ])); ?>"
                                                    onchange="updateSelectionCount()">
                                         </td>
@@ -406,7 +422,7 @@ $result = $stmt->get_result();
                 return false;
             }
             
-            return confirm('Are you sure you want to lock the selected ' + checkboxes.length + ' group(s)?');
+            return confirm('Are you sure you want to lock the selected ' + checkboxes.length + ' zone(s)?');
         }
     </script>
 <?php include '../footer.php'; ?>

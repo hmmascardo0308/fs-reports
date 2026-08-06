@@ -327,32 +327,26 @@ if (isset($_SESSION['password_change_success']) && $_SESSION['password_change_su
                                 <i class="fas fa-upload"></i> Upload Per Region-Area
                             </a>
                         </li>
-
-                           <li>
-                                <a href="upload_raw_data.php">
-                                    <i class="fa-solid fa-database"></i> Upload Raw Data
-                                </a>
-                            </li>
-
-                            <li>
-                                <a href="per_region_area.php">
-                                    <i class="fa-solid fa-database"></i> Generate Per Region-Area Report
-                                </a>
-                            </li>
-
+                        <li>
+                            <a href="upload_raw_data.php">
+                                <i class="fa-solid fa-database"></i> Upload Raw Data
+                            </a>
+                        </li>
+                        <li>
+                            <a href="per_region_area.php">
+                                <i class="fa-regular fa-file-lines"></i> Generate Per Region-Area Report
+                            </a>
+                        </li>
                         <li>
                             <a href="javascript:void(0)" onclick="openLockUnlockModal()">
                                 <i class="fas fa-lock"></i> Lock / Unlock Period
                             </a>
                         </li>
-
-                         <li>
-                                <a href="mark_reported.php">
-                                    <i class="fa-solid fa-check"></i> Reported Transactions
-                                </a>
-                            </li>
-
-
+                        <li>
+                            <a href="javascript:void(0)" onclick="openReportedTransactionsModal()">
+                                <i class="fa-solid fa-check"></i> Reported Transactions
+                            </a>
+                        </li>
                         <?php if ($user_type === "admin" || $user_type === "reports") : ?>
                             <li>
                                 <a href="javascript:void(0)" onclick="openComparativeReportModal()">
@@ -559,6 +553,26 @@ if (isset($_SESSION['password_change_success']) && $_SESSION['password_change_su
         </div>
     </div>
 
+    <!-- Reported Transactions Selection Modal -->
+    <div id="reportedTransactionsModal" class="password-modal">
+        <div class="password-modal-content" style="max-width: 450px; text-align: center; position: relative;">
+            <span onclick="closeReportedTransactionsModal()" style="position: absolute; right: 15px; top: 15px; cursor: pointer; font-size: 24px; color: #888; line-height: 1;">&times;</span>
+            <h2 style="margin-top: 10px; margin-bottom: 20px; color: #333; font-size: 1.5rem;">
+                <i class="fas fa-check-circle" style="color: #28a745; margin-right: 10px;"></i>Mark Transactions as Reported
+            </h2>
+            <p style="margin-bottom: 30px; color: #666; font-size: 1rem;">Please select the data source to mark transactions as reported:</p>
+            
+            <div style="display: flex; flex-direction: column; gap: 15px;">
+                <a href="mark_reported.php" class="btn" style="background-color: #28a745; color: white; text-decoration: none; padding: 12px; border-radius: 6px; font-weight: 600; transition: background 0.3s; display: block;">
+                    <i class="fas fa-file-excel" style="margin-right: 8px;"></i> Mark Transactions as Reported (From Per Region-Area)
+                </a>
+                <a href="mark_reported_raw.php" class="btn" style="background-color: #6f42c1; color: white; text-decoration: none; padding: 12px; border-radius: 6px; font-weight: 600; transition: background 0.3s; display: block;">
+                    <i class="fas fa-database" style="margin-right: 8px;"></i> Mark Transactions as Reported (From Raw Data)
+                </a>
+            </div>
+        </div>
+    </div>
+
     <script>
         // Toggle password visibility
         function togglePassword(inputId, button) {
@@ -604,6 +618,15 @@ if (isset($_SESSION['password_change_success']) && $_SESSION['password_change_su
 
         function closeComparativeReportModal() {
             document.getElementById('comparativeReportModal').classList.remove('show');
+        }
+
+        // Reported Transactions Modal functions
+        function openReportedTransactionsModal() {
+            document.getElementById('reportedTransactionsModal').classList.add('show');
+        }
+
+        function closeReportedTransactionsModal() {
+            document.getElementById('reportedTransactionsModal').classList.remove('show');
         }
         
         // Dropdown toggle functionality

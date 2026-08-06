@@ -38,6 +38,7 @@ if (isset($_GET['reset']) && $_GET['reset'] == '1') {
     unset($_SESSION['parsed_data_for_save']);
     unset($_SESSION['summary_data_for_save']);
     unset($_SESSION['duplicate_pending']);
+    unset($_SESSION['duplicate_blocked']);
     
     header("Location: upload_raw_data.php");
     exit;
@@ -522,25 +523,9 @@ function insertSummaryData(array $summary_data, string $uploaded_by): array
                 $final_zone = $region_profile['zone'];
             }
 
-            // Get transaction month/year from first row if available, or use current date
-            $transaction_month = date('Y-m-01');
-            $transaction_year = date('Y');
-            
-            // Try to get month/year from parsed data if available
-            global $parsed_data;
-            if (!empty($parsed_data)) {
-                foreach ($parsed_data as $row) {
-                    $date_str = isset($row[COL_DATE]) ? trim($row[COL_DATE]) : '';
-                    if (!empty($date_str)) {
-                        $date_info = parseTransactionDate($date_str);
-                        if ($date_info['month'] && $date_info['year']) {
-                            $transaction_month = $date_info['month'];
-                            $transaction_year = $date_info['year'];
-                            break;
-                        }
-                    }
-                }
-            }
+            // Get transaction month/year from item or use current
+            $transaction_month = isset($item['transaction_month']) ? $item['transaction_month'] : date('Y-m-01');
+            $transaction_year = isset($item['transaction_year']) ? $item['transaction_year'] : date('Y');
 
             // Create variables for bind_param (don't pass literal strings)
             $mlmatic_zone = $zone_from_upload; // Use the zone from the raw data as mlmatic_zone
@@ -594,6 +579,273 @@ function insertSummaryData(array $summary_data, string $uploaded_by): array
         'errors' => $error_count,
         'error_messages' => $errors
     ];
+}
+
+// UPDATED: Function to lock and void existing data and replace summary data - SKIP LOCKED/REPORTED
+function lockAndVoidExistingData(array $existing_data, string $username, array $new_summary_data): array
+{
+    global $conn;
+    
+    $updated_count = 0;
+    $error_count = 0;
+    $errors = [];
+    $updated_summary = [];
+    $skipped_locked_reported = [];
+
+    // Begin transaction
+    $conn->begin_transaction();
+
+    try {
+        // Get current time in Asia/Manila timezone
+        $timezone = new DateTimeZone('Asia/Manila');
+        $now = new DateTime('now', $timezone);
+        $current_datetime = $now->format('Y-m-d H:i:s');
+        $status_void = 'Void';
+        
+        foreach ($existing_data as $item) {
+            $zone = $item['zone'];
+            $transaction_month = $item['transaction_month'];
+            $record_count = $item['count'];
+            
+            // Check if this combination has Locked or Reported records
+            if ($item['has_locked'] || $item['has_reported']) {
+                // Skip this combination - cannot overwrite
+                $skipped_locked_reported[] = [
+                    'zone' => $zone,
+                    'month' => date('F Y', strtotime($transaction_month)),
+                    'reason' => ($item['has_locked'] ? 'LOCKED' : '') . 
+                                ($item['has_locked'] && $item['has_reported'] ? ' & ' : '') . 
+                                ($item['has_reported'] ? 'REPORTED' : '')
+                ];
+                continue; // Skip to next combination
+            }
+            
+            try {
+                // STEP 1: Update fs_raw_data table - Lock and Void existing records (only non-locked/non-reported)
+                $query = "UPDATE fs_reports.fs_raw_data 
+                          SET 
+                            status = 'Locked',
+                            locked_date = ?,
+                            locked_by = ?,
+                            status_void = ?,
+                            voided_by = ?,
+                            voided_at = ?
+                          WHERE mlmatic_zone = ? 
+                            AND transaction_month = ? 
+                            AND (status IS NULL OR status != 'Locked')
+                            AND (reported_status IS NULL OR reported_status != 'Reported')";
+                $stmt = $conn->prepare($query);
+                $stmt->bind_param("sssssss", 
+                    $current_datetime,   // locked_date
+                    $username,           // locked_by
+                    $status_void,        // status_void
+                    $username,           // voided_by
+                    $current_datetime,   // voided_at
+                    $zone,               // mlmatic_zone
+                    $transaction_month   // transaction_month
+                );
+                $stmt->execute();
+                $raw_updated = $stmt->affected_rows;
+                
+                // STEP 2: Delete existing summary records for this zone + transaction_month (only non-locked/non-reported)
+                $delete_query = "DELETE FROM fs_reports.fs_raw_data_summary 
+                                WHERE mlmatic_zone = ? 
+                                  AND transaction_month = ?
+                                  AND NOT EXISTS (
+                                    SELECT 1 FROM fs_reports.fs_raw_data 
+                                    WHERE fs_reports.fs_raw_data.mlmatic_zone = fs_reports.fs_raw_data_summary.mlmatic_zone
+                                    AND fs_reports.fs_raw_data.transaction_month = fs_reports.fs_raw_data_summary.transaction_month
+                                    AND (fs_reports.fs_raw_data.status = 'Locked' OR fs_reports.fs_raw_data.reported_status = 'Reported')
+                                  )";
+                $delete_stmt = $conn->prepare($delete_query);
+                $delete_stmt->bind_param("ss", $zone, $transaction_month);
+                $delete_stmt->execute();
+                $deleted_count = $delete_stmt->affected_rows;
+                
+                // STEP 3: Insert new summary data for this zone + transaction_month
+                $new_summary_inserted = 0;
+                foreach ($new_summary_data as $summary_item) {
+                    // Check if this summary item belongs to this zone and month
+                    $item_zone = isset($summary_item['zone']) ? trim($summary_item['zone']) : '';
+                    $item_month = isset($summary_item['transaction_month']) ? $summary_item['transaction_month'] : '';
+                    
+                    if ($item_zone === $zone && $item_month === $transaction_month) {
+                        // Insert this summary item
+                        $insert_result = insertSingleSummaryItem($summary_item, $username, $current_datetime, $conn);
+                        if ($insert_result['success']) {
+                            $new_summary_inserted++;
+                        } else {
+                            $error_count++;
+                            $errors[] = "Failed to insert summary item for zone $zone: " . $insert_result['error'];
+                        }
+                    }
+                }
+                
+                $total_updated = $raw_updated + $deleted_count + $new_summary_inserted;
+                $updated_count += $total_updated;
+                
+                $updated_summary[] = [
+                    'zone' => $zone,
+                    'month' => date('F Y', strtotime($transaction_month)),
+                    'raw_updated' => $raw_updated,
+                    'summary_deleted' => $deleted_count,
+                    'summary_inserted' => $new_summary_inserted,
+                    'total_updated' => $total_updated,
+                    'record_count' => $record_count
+                ];
+                
+            } catch (Exception $e) {
+                $error_count++;
+                $errors[] = "Failed to update records for zone $zone, month $transaction_month: " . $e->getMessage();
+                error_log("Error locking/voiding data: " . $e->getMessage());
+            }
+        }
+
+        // Commit transaction
+        $conn->commit();
+
+    } catch (Exception $e) {
+        $conn->rollback();
+        $error_count++;
+        $errors[] = "Transaction failed: " . $e->getMessage();
+        error_log("Lock and void transaction error: " . $e->getMessage());
+    }
+
+    return [
+        'updated' => $updated_count,
+        'updated_summary' => $updated_summary,
+        'skipped_locked_reported' => $skipped_locked_reported,
+        'errors' => $error_count,
+        'error_messages' => $errors
+    ];
+}
+
+// Helper function to insert a single summary item
+function insertSingleSummaryItem(array $summary_item, string $uploaded_by, string $uploaded_date, $conn): array
+{
+    try {
+        // Extract data from summary item
+        $gl_region = isset($summary_item['region']) ? trim($summary_item['region']) : '';
+        $mlmatic_area = isset($summary_item['area']) ? trim($summary_item['area']) : '';
+        $gl_code = isset($summary_item['code']) ? trim($summary_item['code']) : '';
+        $gl_desc = isset($summary_item['gl_description']) ? trim($summary_item['gl_description']) : '';
+        $transaction_type = isset($summary_item['branch_type']) ? trim($summary_item['branch_type']) : '';
+        $amount = isset($summary_item['total_amount']) ? $summary_item['total_amount'] : 0;
+        $row_count = isset($summary_item['total_count']) ? $summary_item['total_count'] : 0;
+        $branch_id = isset($summary_item['branch_id']) ? trim($summary_item['branch_id']) : '';
+        $branch_name = isset($summary_item['branch_name']) ? trim($summary_item['branch_name']) : '';
+        $zone_from_upload = isset($summary_item['zone']) ? trim($summary_item['zone']) : '';
+        $transaction_month = isset($summary_item['transaction_month']) ? $summary_item['transaction_month'] : date('Y-m-01');
+        $transaction_year = isset($summary_item['transaction_year']) ? $summary_item['transaction_year'] : date('Y');
+
+        // Get area code (last letter of area)
+        $area = getAreaCode($mlmatic_area);
+
+        // Get region profile using gl_region
+        $region_profile = getRegionProfile($gl_region);
+        $mainzone = $region_profile['mainzone'] ?? '';
+        $region = $region_profile['region'] ?? '';
+        $region_code = $region_profile['region_code'] ?? '';
+        $region_id = $region_profile['regionID_MLmatic'] ?? '';
+        
+        // Get the zone from masterdata.branch_profile using gl_region
+        $zone_from_masterdata = getZoneFromGlRegion($gl_region);
+        
+        // Use zone from masterdata if available, otherwise use the zone from the uploaded data
+        $final_zone = !empty($zone_from_masterdata) ? $zone_from_masterdata : $zone_from_upload;
+        
+        // If zone is still empty, try to get from region profile
+        if (empty($final_zone) && !empty($region_profile['zone'])) {
+            $final_zone = $region_profile['zone'];
+        }
+
+        // Prepare insert statement for fs_raw_data_summary
+        $query = "INSERT INTO fs_reports.fs_raw_data_summary (
+            transaction_month, transaction_year,
+            mainzone, mlmatic_zone, zone,
+            region, gl_region,
+            area, mlmatic_area,
+            region_code, region_id,
+            gl_code, gl_desc,
+            amount, row_counts,
+            transaction_type,
+            branch_id, branch_name,
+            uploaded_by, uploaded_date
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+        $stmt = $conn->prepare($query);
+        if (!$stmt) {
+            return ['success' => false, 'error' => $conn->error];
+        }
+
+        $mlmatic_zone = $zone_from_upload;
+        
+        $stmt->bind_param(
+            "ssssssssssssssdsssss",
+            $transaction_month,
+            $transaction_year,
+            $mainzone,
+            $mlmatic_zone,
+            $final_zone,
+            $region,
+            $gl_region,
+            $area,
+            $mlmatic_area,
+            $region_code,
+            $region_id,
+            $gl_code,
+            $gl_desc,
+            $amount,
+            $row_count,
+            $transaction_type,
+            $branch_id,
+            $branch_name,
+            $uploaded_by,
+            $uploaded_date
+        );
+
+        if ($stmt->execute()) {
+            return ['success' => true, 'inserted_id' => $conn->insert_id];
+        } else {
+            return ['success' => false, 'error' => $stmt->error];
+        }
+        
+    } catch (Exception $e) {
+        return ['success' => false, 'error' => $e->getMessage()];
+    }
+}
+
+// Function to prepare summary data with month/year
+function prepareSummaryDataForInsertion(array $summary_data, array $parsed_data): array
+{
+    $prepared_data = [];
+    
+    // Get transaction month/year from parsed data
+    $transaction_month = date('Y-m-01');
+    $transaction_year = date('Y');
+    
+    if (!empty($parsed_data)) {
+        foreach ($parsed_data as $row) {
+            $date_str = isset($row[COL_DATE]) ? trim($row[COL_DATE]) : '';
+            if (!empty($date_str)) {
+                $date_info = parseTransactionDate($date_str);
+                if ($date_info['month'] && $date_info['year']) {
+                    $transaction_month = $date_info['month'];
+                    $transaction_year = $date_info['year'];
+                    break;
+                }
+            }
+        }
+    }
+    
+    // Add month/year to each summary item
+    foreach ($summary_data as $item) {
+        $item['transaction_month'] = $transaction_month;
+        $item['transaction_year'] = $transaction_year;
+        $prepared_data[] = $item;
+    }
+    
+    return $prepared_data;
 }
 
 // Function to clean malformed CSV fields with backslash and quotes
@@ -995,7 +1247,7 @@ function mergeParsedData(array $all_data): array
     return $merged;
 }
 
-// Function to check if data already exists for a given zone and month
+// UPDATED: Function to check if data already exists for a given zone and month
 function checkExistingData(array $parsed_data): array
 {
     global $conn;
@@ -1028,21 +1280,50 @@ function checkExistingData(array $parsed_data): array
         
         $checked_combinations[] = $key;
         
-        // Check if this combination exists in the database
+        // Check if this combination exists in the database - CHECK BOTH status AND reported_status
         try {
-            $query = "SELECT COUNT(*) as count FROM fs_reports.fs_raw_data 
+            // Get count and the upload date(s) - Check if ANY records exist (regardless of status)
+            // But also check specifically for Locked or Reported status
+            $query = "SELECT 
+                        COUNT(*) as count,
+                        MAX(uploaded_date) as last_uploaded_date,
+                        MIN(uploaded_date) as first_uploaded_date,
+                        GROUP_CONCAT(DISTINCT DATE_FORMAT(uploaded_date, '%Y-%m-%d %H:%i:%s') ORDER BY uploaded_date DESC SEPARATOR ', ') as all_upload_dates,
+                        SUM(CASE WHEN status = 'Locked' THEN 1 ELSE 0 END) as locked_count,
+                        SUM(CASE WHEN status = 'Void' THEN 1 ELSE 0 END) as void_count,
+                        SUM(CASE WHEN reported_status = 'Reported' THEN 1 ELSE 0 END) as reported_count
+                      FROM fs_reports.fs_raw_data 
                       WHERE mlmatic_zone = ? AND transaction_month = ?";
             $stmt = $conn->prepare($query);
             $stmt->bind_param("ss", $zone, $transaction_month);
             $stmt->execute();
             $result = $stmt->get_result();
-            $row_count = $result->fetch_assoc();
+            $row_data = $result->fetch_assoc();
             
-            if ($row_count['count'] > 0) {
+            if ($row_data && $row_data['count'] > 0) {
+                // Check if there are Locked or Reported records
+                $has_locked = ($row_data['locked_count'] ?? 0) > 0;
+                $has_reported = ($row_data['reported_count'] ?? 0) > 0;
+                
+                $upload_date_display = $row_data['last_uploaded_date'];
+                if ($row_data['first_uploaded_date'] !== $row_data['last_uploaded_date']) {
+                    $upload_date_display = "Latest: " . $row_data['last_uploaded_date'] . " (First: " . $row_data['first_uploaded_date'] . ")";
+                }
+                
                 $existing_records[] = [
                     'zone' => $zone,
                     'transaction_month' => $transaction_month,
-                    'count' => $row_count['count']
+                    'count' => $row_data['count'],
+                    'uploaded_date' => $upload_date_display,
+                    'last_uploaded_date' => $row_data['last_uploaded_date'],
+                    'first_uploaded_date' => $row_data['first_uploaded_date'],
+                    'all_upload_dates' => $row_data['all_upload_dates'],
+                    'locked_count' => $row_data['locked_count'] ?? 0,
+                    'void_count' => $row_data['void_count'] ?? 0,
+                    'reported_count' => $row_data['reported_count'] ?? 0,
+                    'has_locked' => $has_locked,
+                    'has_reported' => $has_reported,
+                    'can_overwrite' => !$has_locked && !$has_reported // Can only overwrite if NOT locked AND NOT reported
                 ];
             }
         } catch (Exception $e) {
@@ -1160,7 +1441,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['file_upload'])) {
     }
 }
 
-// Handle duplicate actions (Replace, Skip, Cancel)
+// Handle duplicate actions (Cancel, Proceed) - UPDATED
 if (isset($_POST['duplicate_action']) && isset($_SESSION['pending_save']) && $_SESSION['pending_save'] === true) {
     $action = $_POST['duplicate_action'];
     $parsed_data = $_SESSION['parsed_data_for_save'] ?? [];
@@ -1180,143 +1461,74 @@ if (isset($_POST['duplicate_action']) && isset($_SESSION['pending_save']) && $_S
         unset($_SESSION['parsed_data_for_save']);
         unset($_SESSION['summary_data_for_save']);
         unset($_SESSION['duplicate_pending']);
+        unset($_SESSION['duplicate_blocked']);
         $_SESSION['error_message'] = "Save operation cancelled.";
         header("Location: upload_raw_data.php");
         exit;
     }
     
-    if ($action === 'replace') {
-        // Delete existing data for the affected combinations
-        $deleted_count = 0;
-        foreach ($existing_data as $item) {
-            try {
-                $query = "DELETE FROM fs_reports.fs_raw_data 
-                          WHERE mlmatic_zone = ? AND transaction_month = ?";
-                $stmt = $conn->prepare($query);
-                $stmt->bind_param("ss", $item['zone'], $item['transaction_month']);
-                $stmt->execute();
-                $deleted_count += $stmt->affected_rows;
-            } catch (Exception $e) {
-                error_log("Error deleting existing data: " . $e->getMessage());
-            }
-        }
+    if ($action === 'proceed') {
+        // Prepare summary data with month/year
+        $prepared_summary_data = prepareSummaryDataForInsertion($summary_data, $parsed_data);
         
-        // Now insert the new data
-        $detailed_result = insertDetailedData($parsed_data, $username);
-        $summary_result = insertSummaryData($summary_data, $username);
+        // Lock and void existing data in fs_raw_data AND update fs_raw_data_summary
+        $lock_result = lockAndVoidExistingData($existing_data, $username, $prepared_summary_data);
         
-        if ($detailed_result['inserted'] > 0 || $summary_result['inserted'] > 0) {
-            $success_message = "✅ Data saved to database!<br>";
-            $success_message .= "✅ Replaced " . $deleted_count . " existing records<br>";
-            $success_message .= "✅ Inserted " . $detailed_result['inserted'] . " new detailed rows";
-            if ($detailed_result['errors'] > 0) {
-                $success_message .= " (⚠️ " . $detailed_result['errors'] . " errors)";
-            }
-            $success_message .= "<br>";
-            $success_message .= "✅ Summary: " . $summary_result['inserted'] . " rows inserted";
-            if ($summary_result['errors'] > 0) {
-                $success_message .= " (⚠️ " . $summary_result['errors'] . " errors)";
-            }
-            $_SESSION['success_message'] = $success_message;
-        } else {
-            $_SESSION['error_message'] = "❌ Failed to save data to database.";
-        }
-        
-        // Clear pending flags
-        unset($_SESSION['pending_save']);
-        unset($_SESSION['duplicate_check']);
-        unset($_SESSION['parsed_data_for_save']);
-        unset($_SESSION['summary_data_for_save']);
-        unset($_SESSION['duplicate_pending']);
-        
-        header("Location: upload_raw_data.php?view=raw");
-        exit;
-    }
-    
-    if ($action === 'skip') {
-        // Skip duplicate entries - filter out rows that would be duplicates
-        $filtered_data = [];
-        $skipped_duplicates = 0;
-        
+        // Insert new detailed data into fs_raw_data (only for non-locked/non-reported)
+        // First filter out data that belongs to locked/reported zones
+        $filtered_parsed_data = [];
         foreach ($parsed_data as $row) {
             $zone = isset($row[COL_ZONE]) ? trim($row[COL_ZONE]) : '';
             $date_str = isset($row[COL_DATE]) ? trim($row[COL_DATE]) : '';
-            
-            if (empty($zone) || empty($date_str)) {
-                $filtered_data[] = $row;
-                continue;
-            }
-            
             $date_info = parseTransactionDate($date_str);
             $transaction_month = $date_info['month'];
             
-            if (empty($transaction_month)) {
-                $filtered_data[] = $row;
-                continue;
-            }
-            
-            // Check if this combination exists in the duplicate list
-            $is_duplicate = false;
-            foreach ($existing_data as $dup) {
-                if ($dup['zone'] === $zone && $dup['transaction_month'] === $transaction_month) {
-                    $is_duplicate = true;
-                    break;
+            // Check if this zone+month is locked or reported
+            $is_locked_reported = false;
+            foreach ($existing_data as $item) {
+                if ($item['zone'] === $zone && $item['transaction_month'] === $transaction_month) {
+                    if ($item['has_locked'] || $item['has_reported']) {
+                        $is_locked_reported = true;
+                        break;
+                    }
                 }
             }
             
-            if (!$is_duplicate) {
-                $filtered_data[] = $row;
-            } else {
-                $skipped_duplicates++;
+            if (!$is_locked_reported) {
+                $filtered_parsed_data[] = $row;
             }
         }
         
-        if (empty($filtered_data)) {
-            $_SESSION['error_message'] = "❌ All rows were duplicates. No new data to insert.";
-            unset($_SESSION['pending_save']);
-            unset($_SESSION['duplicate_check']);
-            unset($_SESSION['parsed_data_for_save']);
-            unset($_SESSION['summary_data_for_save']);
-            unset($_SESSION['duplicate_pending']);
-            header("Location: upload_raw_data.php");
-            exit;
-        }
+        $detailed_result = insertDetailedData($filtered_parsed_data, $username);
         
-        // Insert only the filtered data
-        $detailed_result = insertDetailedData($filtered_data, $username);
-        
-        // Also filter summary data
-        $filtered_summary = [];
-        foreach ($summary_data as $item) {
-            $zone = $item['zone'] ?? '';
-            $month = $item['transaction_month'] ?? date('Y-m-01');
+        if ($detailed_result['inserted'] > 0 || $lock_result['updated'] > 0) {
+            $success_message = "Data saved to database!<br>";
             
-            $is_duplicate = false;
-            foreach ($existing_data as $dup) {
-                if ($dup['zone'] === $zone && $dup['transaction_month'] === $month) {
-                    $is_duplicate = true;
-                    break;
+            if (!empty($lock_result['skipped_locked_reported'])) {
+                $success_message .= "<div style='background: #fef3c7; padding: 10px; border-radius: 6px; margin: 10px 0; border: 1px solid #f59e0b;'>";
+                $success_message .= "<strong>⚠️ Skipped (Locked/Reported):</strong><br>";
+                foreach ($lock_result['skipped_locked_reported'] as $skipped) {
+                    $success_message .= "• " . htmlspecialchars($skipped['zone']) . " - " . htmlspecialchars($skipped['month']) . 
+                                       " (Reason: " . htmlspecialchars($skipped['reason']) . ")<br>";
                 }
+                $success_message .= "</div>";
             }
             
-            if (!$is_duplicate) {
-                $filtered_summary[] = $item;
+            $success_message .= "<li>Locked and voided existing records.</li>";
+            if (!empty($lock_result['updated_summary'])) {
+                $success_message .= "<ul>";
+                foreach ($lock_result['updated_summary'] as $item) {
+                    $success_message .= "<li><strong>" . htmlspecialchars($item['zone']) . "</strong> - " . htmlspecialchars($item['month']) . 
+                                       " (Locked/Voided " . $item['record_count'] . " records, Replaced " . $item['summary_inserted'] . " summary records)</li>";
+                }
+                $success_message .= "</ul>";
             }
-        }
-        
-        $summary_result = insertSummaryData($filtered_summary, $username);
-        
-        if ($detailed_result['inserted'] > 0 || $summary_result['inserted'] > 0) {
-            $success_message = "✅ Data saved to database!<br>";
-            $success_message .= "✅ Skipped " . $skipped_duplicates . " duplicate records<br>";
-            $success_message .= "✅ Inserted " . $detailed_result['inserted'] . " new detailed rows";
+            if ($lock_result['errors'] > 0) {
+                $success_message .= "⚠️ " . $lock_result['errors'] . " errors occurred while processing records.<br>";
+            }
+            $success_message .= "<li> Inserted " . $detailed_result['inserted'] . " new detailed rows.</li>";
             if ($detailed_result['errors'] > 0) {
                 $success_message .= " (⚠️ " . $detailed_result['errors'] . " errors)";
-            }
-            $success_message .= "<br>";
-            $success_message .= "✅ Summary: " . $summary_result['inserted'] . " rows inserted";
-            if ($summary_result['errors'] > 0) {
-                $success_message .= " (⚠️ " . $summary_result['errors'] . " errors)";
             }
             $_SESSION['success_message'] = $success_message;
         } else {
@@ -1329,98 +1541,196 @@ if (isset($_POST['duplicate_action']) && isset($_SESSION['pending_save']) && $_S
         unset($_SESSION['parsed_data_for_save']);
         unset($_SESSION['summary_data_for_save']);
         unset($_SESSION['duplicate_pending']);
+        unset($_SESSION['duplicate_blocked']);
         
         header("Location: upload_raw_data.php?view=raw");
         exit;
     }
 }
 
-// Handle Save to Database - WITH UNKNOWN BRANCH CHECK AND DUPLICATE CHECK
+// ===== UPDATED: Handle Save to Database =====
 if (isset($_POST['save_to_database']) && !empty($_SESSION['parsed_data'])) {
-    // Check if there are unknown branch types
+    // Check if there are unknown branch types (remarks)
     $remarks_data_check = $_SESSION['remarks_data'] ?? [];
+    $skipped_data_check = $_SESSION['skipped_data'] ?? [];
     
-    if (!empty($remarks_data_check)) {
-        // There are unknown branch types - prevent saving
-        $unknown_count = count($remarks_data_check);
-        $error_message = "❌ Cannot save to database. Found <strong>$unknown_count</strong> unknown branch type(s) that are not in the masterdata branch profile.<br>";
-        $error_message .= "Please fix these unknown branch IDs first before saving:<br>";
+    $has_remarks = !empty($remarks_data_check);
+    $has_skipped = !empty($skipped_data_check);
+    
+    // Prevent saving if there are remarks OR skipped rows
+    if ($has_remarks || $has_skipped) {
+        $error_message = "❌ Cannot save to database. ";
+        $error_messages = [];
+        
+        if ($has_remarks) {
+            $unknown_count = count($remarks_data_check);
+            $error_messages[] = "Found <strong>$unknown_count</strong> unknown branch type(s) that are not in the masterdata branch profile.";
+        }
+        
+        if ($has_skipped) {
+            $skipped_count = count($skipped_data_check);
+            $error_messages[] = "Found <strong>$skipped_count</strong> skipped row(s) with missing or invalid data.";
+        }
+        
+        $error_message .= implode(" ", $error_messages);
+        $error_message .= "<br><br>Please fix these issues before saving:";
         $error_message .= "<ul style='margin: 10px 0 0 20px;'>";
         
-        // Show first 5 unknown branch IDs
-        $display_count = 0;
-        foreach ($remarks_data_check as $item) {
-            if ($display_count >= 5) {
-                $remaining = count($remarks_data_check) - 5;
-                if ($remaining > 0) {
-                    $error_message .= "<li>... and $remaining more unknown branch IDs</li>";
-                }
-                break;
-            }
-            $error_message .= "<li><strong>Branch ID:</strong> " . htmlspecialchars($item['branch_id']) . 
-                            " | <strong>Branch Name:</strong> " . htmlspecialchars($item['branch_name'] ?: 'N/A') . 
-                            " | <strong>GL Code:</strong> " . htmlspecialchars($item['code']) . "</li>";
-            $display_count++;
+        if ($has_remarks) {
+            $error_message .= "<li>Check the <strong>Remarks</strong> tab for unknown branch IDs</li>";
+        }
+        if ($has_skipped) {
+            $error_message .= "<li>Check the <strong>Skipped Rows</strong> tab for rows with missing/invalid data</li>";
         }
         $error_message .= "</ul>";
-        $error_message .= "<br><strong>Please check the Remarks tab for more details.</strong>";
         
         $_SESSION['error_message'] = $error_message;
-        header("Location: upload_raw_data.php?view=remarks");
+        
+        // Redirect to the most relevant tab
+        if ($has_remarks) {
+            header("Location: upload_raw_data.php?view=remarks");
+        } elseif ($has_skipped) {
+            header("Location: upload_raw_data.php?view=skipped");
+        } else {
+            header("Location: upload_raw_data.php?view=raw");
+        }
         exit;
     }
     
-    // Check for existing data by zone and month
+    // If no remarks and no skipped rows, proceed with duplicate check
     $parsed_data = $_SESSION['parsed_data'];
+    $summary_data = $_SESSION['summary_data'] ?? [];
+    
+    // Prepare summary data with month/year
+    $prepared_summary_data = prepareSummaryDataForInsertion($summary_data, $parsed_data);
+    
     $existing_data = checkExistingData($parsed_data);
     
-    if (!empty($existing_data)) {
-        // Build a detailed message showing what data already exists
-        $duplicate_message = "<strong>Duplicate Data Detected!</strong><br><br>";
-        $duplicate_message .= "The following Zone and Month combinations already exist in the database:<br><br>";
-        $duplicate_message .= "<div style='background: #f8fafc; padding: 15px; border-radius: 8px; margin: 10px 0;'>";
-        $duplicate_message .= "<table style='width: 100%; border-collapse: collapse;'>";
-        $duplicate_message .= "<tr style='background: #e2e8f0;'><th style='padding: 8px; text-align: left;'>Zone</th><th style='padding: 8px; text-align: left;'>Transaction Month</th><th style='padding: 8px; text-align: left;'>Existing Records</th></tr>";
+    // Check if any existing data has Locked or Reported status
+    $has_locked_or_reported = false;
+    $locked_or_reported_details = [];
+    
+    foreach ($existing_data as $item) {
+        if ($item['has_locked'] || $item['has_reported']) {
+            $has_locked_or_reported = true;
+            $locked_or_reported_details[] = $item;
+        }
+    }
+    
+    if ($has_locked_or_reported) {
+        // Build a detailed message showing what data already exists and cannot be overwritten
+        $duplicate_message = "<strong>⚠️ Cannot Overwrite - Data is Locked or Reported!</strong><br><br>";
+        $duplicate_message .= "The following Zone and Month combinations already exist in the database and are <strong>LOCKED</strong> or <strong>REPORTED</strong>:<br><br>";
+        $duplicate_message .= "<div style='background: #fef2f2; padding: 15px; border-radius: 8px; margin: 10px 0; border: 2px solid #dc2626; overflow-x: auto;'>";
+        $duplicate_message .= "<table style='width: 100%; border-collapse: collapse; min-width: 500px;'>";
+        $duplicate_message .= "<tr style='background: #fecaca;'>";
+        $duplicate_message .= "<th style='padding: 10px 12px; text-align: left; font-weight: 700; color: #1e293b;'>Zone</th>";
+        $duplicate_message .= "<th style='padding: 10px 12px; text-align: left; font-weight: 700; color: #1e293b;'>Transaction Month</th>";
+        $duplicate_message .= "<th style='padding: 10px 12px; text-align: left; font-weight: 700; color: #1e293b;'>Existing Records</th>";
+        $duplicate_message .= "<th style='padding: 10px 12px; text-align: left; font-weight: 700; color: #1e293b;'>Status</th>";
+        $duplicate_message .= "<th style='padding: 10px 12px; text-align: left; font-weight: 700; color: #1e293b;'>Uploaded Date</th>";
+        $duplicate_message .= "</tr>";
         
-        foreach ($existing_data as $item) {
+        foreach ($locked_or_reported_details as $item) {
             $month_display = date('F Y', strtotime($item['transaction_month']));
-            $duplicate_message .= "<tr><td style='padding: 8px; border-bottom: 1px solid #e2e8f0;'><strong>" . htmlspecialchars($item['zone']) . "</strong></td>";
-            $duplicate_message .= "<td style='padding: 8px; border-bottom: 1px solid #e2e8f0;'>" . htmlspecialchars($month_display) . "</td>";
-            $duplicate_message .= "<td style='padding: 8px; border-bottom: 1px solid #e2e8f0; text-align: center;'>" . $item['count'] . " records</td></tr>";
+            
+            // Determine status display
+            $status_parts = [];
+            if ($item['has_locked']) {
+                $status_parts[] = "<span style='color: #dc2626; font-weight: 700;'>🔒 LOCKED ({$item['locked_count']})</span>";
+            }
+            if ($item['has_reported']) {
+                $status_parts[] = "<span style='color: #b45309; font-weight: 700;'>📊 REPORTED ({$item['reported_count']})</span>";
+            }
+            $status_display = implode(' | ', $status_parts);
+            
+            // Format the upload date nicely
+            $upload_date_display = 'N/A';
+            if (isset($item['last_uploaded_date']) && !empty($item['last_uploaded_date'])) {
+                $date_obj = DateTime::createFromFormat('Y-m-d H:i:s', $item['last_uploaded_date']);
+                if ($date_obj) {
+                    $upload_date_display = $date_obj->format('F d, Y h:i:s A');
+                }
+            }
+            
+            $duplicate_message .= "<tr>";
+            $duplicate_message .= "<td style='padding: 10px 12px; border-bottom: 1px solid #e2e8f0;'><strong>" . htmlspecialchars($item['zone']) . "</strong></td>";
+            $duplicate_message .= "<td style='padding: 10px 12px; border-bottom: 1px solid #e2e8f0;'>" . htmlspecialchars($month_display) . "</td>";
+            $duplicate_message .= "<td style='padding: 10px 12px; border-bottom: 1px solid #e2e8f0; text-align: center; font-weight: 600;'>" . number_format($item['count']) . " records</td>";
+            $duplicate_message .= "<td style='padding: 10px 12px; border-bottom: 1px solid #e2e8f0;'>" . $status_display . "</td>";
+            $duplicate_message .= "<td style='padding: 10px 12px; border-bottom: 1px solid #e2e8f0; font-size: 13px; color: #1e293b;'>" . $upload_date_display . "</td>";
+            $duplicate_message .= "</tr>";
         }
         
         $duplicate_message .= "</table></div><br>";
-        $duplicate_message .= "Do you want to:<br><br>";
-        $duplicate_message .= "<strong>Cancel</strong> - Return to the upload page without saving<br>";
-        $duplicate_message .= "<strong>Skip & Continue</strong> - Skip duplicate entries and only insert new data<br>";
-        $duplicate_message .= "<strong>Replace</strong> - Delete existing data and insert new data (will remove old records)<br><br>";
         
-        // Store the duplicate check in session for the confirmation
-        $_SESSION['duplicate_check'] = $existing_data;
-        $_SESSION['pending_save'] = true;
-        $_SESSION['duplicate_action'] = 'pending';
+        // Check if ALL existing records are locked/reported or just some
+        $all_blocked = true;
+        foreach ($existing_data as $item) {
+            if (!$item['has_locked'] && !$item['has_reported']) {
+                $all_blocked = false;
+                break;
+            }
+        }
         
-        // Store the parsed data to use later
-        $_SESSION['parsed_data_for_save'] = $parsed_data;
-        $_SESSION['summary_data_for_save'] = $summary_data;
-        
-        // Show the duplicate warning
-        $_SESSION['error_message'] = $duplicate_message;
-        $_SESSION['duplicate_pending'] = true;
-        
-        // Redirect to show the warning
-        header("Location: upload_raw_data.php?view=raw&duplicate_check=1");
-        exit;
+        if ($all_blocked) {
+            // ALL combinations are locked/reported - cannot proceed at all
+            $duplicate_message .= "<div style='background: #fecaca; padding: 15px; border-radius: 8px; border: 2px solid #dc2626; margin: 15px 0;'>";
+            $duplicate_message .= "<strong style='color: #dc2626; font-size: 16px;'>❌ Cannot Proceed</strong><br>";
+            $duplicate_message .= "<span style='color: #dc2626;'>All Zone + Month combinations have existing data that is <strong>LOCKED</strong> or <strong>REPORTED</strong>. These cannot be overwritten.</span>";
+            $duplicate_message .= "</div>";
+            
+            // Show only Cancel option (no Proceed)
+            $_SESSION['error_message'] = $duplicate_message;
+            $_SESSION['duplicate_blocked'] = true;
+            $_SESSION['pending_save'] = false;
+            
+            header("Location: upload_raw_data.php?view=raw&duplicate_check=1");
+            exit;
+        } else {
+            // Some are blocked, some are not - show warning with option to proceed
+            $duplicate_message .= "<strong>⚠️ Some data cannot be overwritten:</strong><br>";
+            $duplicate_message .= "<ul style='margin: 10px 0 10px 20px;'>";
+            $duplicate_message .= "<li>🔒 <strong>LOCKED</strong> or <strong>REPORTED</strong> data (<span style='color: #dc2626;'>" . count($locked_or_reported_details) . " combinations</span>) - <strong>WILL BE SKIPPED</strong></li>";
+            
+            $overwritable = array_filter($existing_data, function($item) {
+                return $item['can_overwrite'];
+            });
+            if (!empty($overwritable)) {
+                $duplicate_message .= "<li>✅ <strong>Available</strong> data (" . count($overwritable) . " combinations) - <strong>WILL BE OVERWRITTEN</strong></li>";
+            }
+            $duplicate_message .= "</ul><br>";
+            $duplicate_message .= "Do you want to proceed with overwriting the available data?<br><br>";
+            $duplicate_message .= "<div style='display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px;'>";
+            $duplicate_message .= "<span style='background: #e2e8f0; padding: 6px 14px; border-radius: 4px;'><strong>Cancel</strong> - Return to upload page without saving</span>";
+            $duplicate_message .= "<span style='background: #fbbf24; padding: 6px 14px; border-radius: 4px;'><strong>Proceed</strong> - Overwrite available data, skip locked/reported</span>";
+            $duplicate_message .= "</div>";
+            
+            // Store the duplicate check in session for the confirmation
+            $_SESSION['duplicate_check'] = $existing_data;
+            $_SESSION['pending_save'] = true;
+            $_SESSION['duplicate_action'] = 'pending_partial';
+            
+            // Store the parsed data to use later
+            $_SESSION['parsed_data_for_save'] = $parsed_data;
+            $_SESSION['summary_data_for_save'] = $prepared_summary_data;
+            
+            // Show the duplicate warning
+            $_SESSION['error_message'] = $duplicate_message;
+            $_SESSION['duplicate_pending'] = true;
+            
+            // Redirect to show the warning
+            header("Location: upload_raw_data.php?view=raw&duplicate_check=1");
+            exit;
+        }
     }
     
-    // If no duplicates found, proceed with saving
-    $summary_data = $_SESSION['summary_data'] ?? [];
-    
+    // If no duplicates found (or only overwritable data), proceed with saving
     // Insert detailed data
     $detailed_result = insertDetailedData($parsed_data, $username);
     
-    // Insert summary data
-    $summary_result = insertSummaryData($summary_data, $username);
+    // Insert summary data using the prepared data
+    $summary_result = insertSummaryData($prepared_summary_data, $username);
     
     // Set success/error messages
     if ($detailed_result['inserted'] > 0 || $summary_result['inserted'] > 0) {
@@ -1569,6 +1879,8 @@ if (isset($_SESSION['error_message']) && empty($_POST)) {
 
 // Check if there are unknown branches for UI display
 $has_unknown_branches = !empty($remarks_data);
+$has_skipped_rows = !empty($skipped_data);
+$can_save = !$has_unknown_branches && !$has_skipped_rows;
 ?>
 
 <!DOCTYPE html>
@@ -1582,6 +1894,58 @@ $has_unknown_branches = !empty($remarks_data);
     <link rel="stylesheet" href="css/upload_raw.css?v=<?= time(); ?>">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 
+    <style>
+        /* Additional styles for hide/show functionality */
+        .upload-form-wrapper {
+            transition: opacity 0.3s ease, transform 0.3s ease;
+        }
+        .upload-form-wrapper.hidden {
+            opacity: 0;
+            transform: translateY(-10px);
+            display: none;
+        }
+        .upload-form-wrapper.visible {
+            opacity: 1;
+            transform: translateY(0);
+            display: block;
+        }
+        
+        /* Data preview container */
+        .data-preview-wrapper {
+            transition: opacity 0.3s ease, transform 0.3s ease;
+        }
+        .data-preview-wrapper.hidden {
+            opacity: 0;
+            transform: translateY(10px);
+            display: none;
+        }
+        .data-preview-wrapper.visible {
+            opacity: 1;
+            transform: translateY(0);
+            display: block;
+        }
+        
+        /* Reset button style when data is loaded */
+        .btn-reset-with-data {
+            background: #5d5d5d !important;
+            color: white !important;
+            padding: 10px 20px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            transition: all 0.2s;
+            border: none;
+            cursor: pointer;
+        }
+        .btn-reset-with-data:hover {
+            background: #b91c1c !important;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(220, 38, 38, 0.3);
+        }
+    </style>
 </head>
 <body>
     <main class="main-content">
@@ -1595,7 +1959,7 @@ $has_unknown_branches = !empty($remarks_data);
 
         <div class="content-wrapper">
             <div class="upload-container">
-                <h2>Upload Raw Data Files</h2>
+                <h2>Upload Raw Data Files (Per Zone)</h2>
 
                 <?php if (!empty($error_message)): ?>
                     <div class="alert alert-danger" id="errorAlert">
@@ -1609,755 +1973,810 @@ $has_unknown_branches = !empty($remarks_data);
                     </div>
                 <?php endif; ?>
 
-                <!-- Drag & Drop Upload Form - Multiple Files -->
-                <form id="uploadForm" action="" method="POST" enctype="multipart/form-data">
-                    <div class="drop-zone" id="dropZone">
-                        <i class="fa-solid fa-cloud-arrow-up"></i>
-                        <p><strong>Drag & drop your CSV files here</strong></p>
-                        <p style="font-size: 13px; color: #94a3b8;">or click to browse from your computer (CSV files only, multiple allowed)</p>
-                        <div id="file-list-display" style="margin-top: 10px; display: block; font-weight: 600; color: #2563eb;"></div>
-                        <input type="file" name="file_upload[]" id="fileInput" accept=".csv" multiple required>
-                    </div>
-                    <div class="button-group">
-                        <button type="submit" class="btn-submit" id="submitBtn">
-                            <i class="fa-solid fa-magnifying-glass"></i> Preview Data
-                        </button>
-                        <a href="?reset=1" class="btn-reset" id="resetBtn">
-                            <i class="fa-solid fa-rotate"></i> Reset
+                <!-- ===== WRAPPER FOR UPLOAD FORM ===== -->
+                <div id="uploadFormWrapper" class="upload-form-wrapper <?= !empty($parsed_data) ? 'hidden' : 'visible' ?>">
+                    <!-- Drag & Drop Upload Form - Multiple Files -->
+                    <form id="uploadForm" action="" method="POST" enctype="multipart/form-data">
+                        <div class="drop-zone" id="dropZone">
+                            <i class="fa-solid fa-cloud-arrow-up"></i>
+                            <p><strong>Drag & drop your CSV files here</strong></p>
+                            <p style="font-size: 13px; color: #94a3b8;">or click to browse from your computer (CSV files only, multiple allowed)</p>
+                            <div id="file-list-display" style="margin-top: 10px; display: block; font-weight: 600; color: #2563eb;"></div>
+                            <input type="file" name="file_upload[]" id="fileInput" accept=".csv" multiple required>
+                        </div>
+                        <div class="button-group">
+                            <button type="submit" class="btn-submit" id="submitBtn">
+                                <i class="fa-solid fa-magnifying-glass"></i> Preview Data
+                            </button>
+                            <a href="?reset=1" class="btn-reset" id="resetBtn">
+                                <i class="fa-solid fa-rotate"></i> Reset
+                            </a>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- ===== DATA PREVIEW WRAPPER ===== -->
+                <div id="dataPreviewWrapper" class="data-preview-wrapper <?= !empty($parsed_data) ? 'visible' : 'hidden' ?>">
+                    
+                    <!-- Show Reset button at top when data is loaded -->
+                    <?php if (!empty($parsed_data)): ?>
+                    <div style="display: flex; justify-content: flex-end; margin-bottom: 15px;">
+                        <a href="?reset=1" class="btn-reset-with-data" id="resetBtnTop">
+                            <i class="fa-solid fa-rotate"></i> Clear Data & Upload New
                         </a>
                     </div>
-                </form>
-
-                <!-- Save to Database Button - WITH UNKNOWN BRANCH CHECK -->
-                <?php if (!empty($parsed_data) && $view_mode === 'raw'): ?>
-                <form action="" method="POST" style="margin: 15px 0;" id="saveForm">
-                    <input type="hidden" name="save_to_database" value="1">
-                    <button type="submit" class="btn-save-database" <?= $has_unknown_branches ? 'disabled style="opacity: 0.5; cursor: not-allowed;"' : '' ?> 
-                        onclick="<?= $has_unknown_branches ? 'alert(\' Cannot save to database. Please fix unknown branch types first. Check the Remarks tab for details.\'); return false;' : 'return confirm(\'Are you sure you want to save this data to the database? This will insert ' . $total_rows . ' detailed rows and ' . $summary_total_rows . ' summary rows.\');' ?>">
-                        <i class="fa-solid fa-database"></i> 
-                        <?= $has_unknown_branches ? 'Saving Disabled (Please fix remarks)' : 'Save to Database' ?>
-                    </button>
-                    <?php if ($has_unknown_branches): ?>
-                        <div style="margin-top: 8px; padding: 10px; background: #ffebeb; border-radius: 6px; border: 1px solid #ffabab;">
-                            <i class="fa-solid fa-triangle-exclamation" style="color: #dc2626;"></i>
-                            <span style="color: #dc2626; font-size: 14px;">
-                                <strong> Cannot save:</strong> Found <strong><?= count($remarks_data) ?></strong> unknown branch type(s). 
-                                Please check the <a href="?view=remarks" style="color: #dc2626; font-weight: 600; text-decoration: underline;">Remarks tab</a> for details.
-                            </span>
-                        </div>
                     <?php endif; ?>
-                </form>
-                <?php endif; ?>
 
-                <!-- Duplicate Action Buttons -->
-                <?php if (isset($_SESSION['duplicate_pending']) && $_SESSION['duplicate_pending'] === true): ?>
-                <div style="margin-top: 15px; padding: 20px; background: #ffebeb; border: 2px solid #ff0000; border-radius: 8px;">
-                    <div style="display: flex; gap: 15px; flex-wrap: wrap; justify-content: center;">
-                        <form action="" method="POST" style="display: inline;">
-                            <input type="hidden" name="duplicate_action" value="cancel">
-                            <button type="submit" class="btn-cancel" style="background: #e2e8f0; color: #1e293b; padding: 10px 24px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; transition: all 0.2s;">
-                                <i class="fa-solid fa-times"></i> Cancel
-                            </button>
-                        </form>
-                        <form action="" method="POST" style="display: inline;">
-                            <input type="hidden" name="duplicate_action" value="skip">
-                            <button type="submit" class="btn-skip" style="background: #ba3838; color: white; padding: 10px 24px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; transition: all 0.2s;">
-                                <i class="fa-solid fa-forward"></i> Skip & Continue
-                            </button>
-                        </form>
-                        <form action="" method="POST" style="display: inline;">
-                            <input type="hidden" name="duplicate_action" value="replace">
-                            <button type="submit" class="btn-replace" style="background: #dc2626; color: white; padding: 10px 24px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; transition: all 0.2s;">
-                                <i class="fa-solid fa-arrows-rotate"></i> Replace Existing
-                            </button>
-                        </form>
-                    </div>
-                </div>
-                <?php endif; ?>
-
-                <!-- View Toggle Buttons -->
-                <?php if (!empty($parsed_data)): ?>
-                <div class="view-toggle">
-                    <span class="toggle-label"><i class="fa-solid fa-eye"></i> View Mode:</span>
-                    <a href="?view=raw&page=<?= $current_page ?>" class="btn-toggle <?= $view_mode === 'raw' ? 'active' : '' ?>">
-                        <i class="fa-solid fa-table"></i> Detailed
-                    </a>
-                    <a href="?view=summary" class="btn-toggle <?= $view_mode === 'summary' ? 'active' : '' ?>">
-                        <i class="fa-solid fa-chart-pie"></i> Summary (Region & Area)
-                    </a>
-                    <a href="?view=remarks" class="btn-toggle remarks-tab <?= $view_mode === 'remarks' ? 'active' : '' ?>">
-                        <i class="fa-solid fa-triangle-exclamation"></i> Remarks 
-                        <?php if (!empty($remarks_data)): ?>
-                            <span class="badge" style="background: #fec7c7; color: #ff0000; padding: 2px 8px; border-radius: 12px; font-size: 11px; margin-left: 5px;">
-                                <?= count($remarks_data) ?>
-                            </span>
+                    <!-- ===== Save to Database Button ===== -->
+                    <?php if (!empty($parsed_data) && $view_mode === 'raw'): ?>
+                    <form action="" method="POST" style="margin: 15px 0;" id="saveForm">
+                        <input type="hidden" name="save_to_database" value="1">
+                        <?php 
+                        $block_reason = [];
+                        if ($has_unknown_branches) $block_reason[] = 'unknown branch types (Remarks tab)';
+                        if ($has_skipped_rows) $block_reason[] = 'skipped rows (Skipped Rows tab)';
+                        ?>
+                        <button type="submit" class="btn-save-database" <?= !$can_save ? 'disabled style="opacity: 0.5; cursor: not-allowed;"' : '' ?> 
+                            onclick="<?= !$can_save ? 'alert(\'❌ Cannot save to database. Please fix the following issues first:\n\n• ' . implode('\n• ', $block_reason) . '\n\nCheck the corresponding tabs for details.\'); return false;' : 'return confirm(\'Are you sure you want to save this data to the database? This will insert ' . $total_rows . ' detailed rows and ' . $summary_total_rows . ' summary rows.\');' ?>">
+                            <i class="fa-solid fa-database"></i> 
+                            <?= !$can_save ? 'Saving Disabled (Fix issues first)' : 'Save to Database' ?>
+                        </button>
+                        <?php if (!$can_save): ?>
+                            <div style="margin-top: 8px; padding: 10px; background: #ffebeb; border-radius: 6px; border: 1px solid #ffabab;">
+                                <i class="fa-solid fa-triangle-exclamation" style="color: #dc2626;"></i>
+                                <span style="color: #dc2626; font-size: 14px;">
+                                    <strong>Cannot save:</strong> 
+                                    <?php if ($has_unknown_branches && $has_skipped_rows): ?>
+                                        Found <strong><?= count($remarks_data) ?></strong> unknown branch type(s) and <strong><?= count($skipped_data) ?></strong> skipped row(s).
+                                    <?php elseif ($has_unknown_branches): ?>
+                                        Found <strong><?= count($remarks_data) ?></strong> unknown branch type(s).
+                                    <?php elseif ($has_skipped_rows): ?>
+                                        Found <strong><?= count($skipped_data) ?></strong> skipped row(s).
+                                    <?php endif; ?>
+                                    Please check the 
+                                    <?php if ($has_unknown_branches): ?>
+                                        <a href="?view=remarks" style="color: #dc2626; font-weight: 600; text-decoration: underline;">Remarks tab</a>
+                                        <?php if ($has_skipped_rows): ?> and <?php endif; ?>
+                                    <?php endif; ?>
+                                    <?php if ($has_skipped_rows): ?>
+                                        <a href="?view=skipped" style="color: #dc2626; font-weight: 600; text-decoration: underline;">Skipped Rows tab</a>
+                                    <?php endif; ?>
+                                    for details.
+                                </span>
+                            </div>
                         <?php endif; ?>
-                    </a>
-                    <a href="?view=skipped" class="btn-toggle skipped-tab <?= $view_mode === 'skipped' ? 'active' : '' ?>">
-                        <i class="fa-solid fa-ban"></i> Skipped Rows
-                        <?php if (!empty($skipped_data)): ?>
-                            <span class="badge" style="background: #fde3b0; color: #b45309; padding: 2px 8px; border-radius: 12px; font-size: 11px; margin-left: 5px;">
-                                <?= count($skipped_data) ?>
-                            </span>
-                        <?php endif; ?>
-                    </a>
-                </div>
-                <?php endif; ?>
+                    </form>
+                    <?php endif; ?>
 
-                <!-- Data Preview -->
-                <div id="dataPreview" class="<?= empty($parsed_data) ? 'hidden' : '' ?>">
-                    
-                    <?php if ($view_mode === 'raw' && !empty($parsed_data)): ?>
-                        <!-- RAW DATA VIEW - WITH CATEGORY -->
-                        <div class="summary-stats">
-                            <span class="stat-item"><i class="fa-solid fa-file-lines"></i> <strong><?= $total_rows ?></strong> total rows</span>
-                            <span class="stat-item"><i class="fa-solid fa-columns"></i> <strong><?= count($display_headers) ?></strong> columns</span>
-                            <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
-                            <span class="stat-item"><i class="fa-solid fa-calculator"></i> Grand Total: <strong class="grand-total-value">₱<?= number_format($grand_total_amount, 2) ?></strong></span>
-                            <span class="stat-item"><?php if (!empty($file_names)): ?>
-                            <div><i class="fa-solid fa-file"></i> Processed files: <?= implode(', ', array_map('htmlspecialchars', $file_names)) ?></div>
-                                <?php endif; ?>
-                        </span> 
+                    <!-- Duplicate Action Buttons -->
+                    <?php if (isset($_SESSION['duplicate_pending']) && $_SESSION['duplicate_pending'] === true): ?>
+                    <div style="margin-top: 15px; padding: 20px; background: #ffebeb; border: 2px solid #ff0000; border-radius: 8px;">
+                        <div style="display: flex; gap: 15px; flex-wrap: wrap; justify-content: center;">
+                            <form action="" method="POST" style="display: inline;">
+                                <input type="hidden" name="duplicate_action" value="cancel">
+                                <button type="submit" class="btn-cancel" style="background: #e2e8f0; color: #1e293b; padding: 10px 24px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; transition: all 0.2s;">
+                                    <i class="fa-solid fa-times"></i> Cancel
+                                </button>
+                            </form>
+                            <?php if (!isset($_SESSION['duplicate_blocked']) || $_SESSION['duplicate_blocked'] !== true): ?>
+                            <form action="" method="POST" style="display: inline;">
+                                <input type="hidden" name="duplicate_action" value="proceed">
+                                <button type="submit" class="btn-proceed" style="background: #fbbf24; color: #1e293b; padding: 10px 24px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; transition: all 0.2s;">
+                                    <i class="fa-solid fa-check"></i> Proceed (Overwrite Available)
+                                </button>
+                            </form>
+                            <?php endif; ?>
                         </div>
-                        <div class="table-wrapper">
-                            <table class="preview-table">
-                                <thead>
-                                    <tr>
-                                        <th class="row-number">#</th>
-                                        <?php foreach ($display_headers as $col_header): ?>
-                                            <th>
-                                                <?= htmlspecialchars($col_header) ?>
-                                            </th>
-                                        <?php endforeach; ?>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <?php 
-                                    $row_counter = $offset + 1;
-                                    foreach ($page_rows as $row): 
-                                    ?>
+                    </div>
+                    <?php endif; ?>
+
+                    <!-- View Toggle Buttons -->
+                    <?php if (!empty($parsed_data)): ?>
+                    <div class="view-toggle">
+                        <span class="toggle-label"><i class="fa-solid fa-eye"></i> View Mode:</span>
+                        <a href="?view=raw&page=<?= $current_page ?>" class="btn-toggle <?= $view_mode === 'raw' ? 'active' : '' ?>">
+                            <i class="fa-solid fa-table"></i> Detailed
+                        </a>
+                        <a href="?view=summary" class="btn-toggle <?= $view_mode === 'summary' ? 'active' : '' ?>">
+                            <i class="fa-solid fa-chart-pie"></i> Summary (Region & Area)
+                        </a>
+                        <a href="?view=remarks" class="btn-toggle remarks-tab <?= $view_mode === 'remarks' ? 'active' : '' ?>">
+                            <i class="fa-solid fa-triangle-exclamation"></i> Remarks 
+                            <?php if (!empty($remarks_data)): ?>
+                                <span class="badge" style="background: #fec7c7; color: #ff0000; padding: 2px 8px; border-radius: 12px; font-size: 11px; margin-left: 5px;">
+                                    <?= count($remarks_data) ?>
+                                </span>
+                            <?php endif; ?>
+                        </a>
+                        <a href="?view=skipped" class="btn-toggle skipped-tab <?= $view_mode === 'skipped' ? 'active' : '' ?>">
+                            <i class="fa-solid fa-ban"></i> Skipped Rows
+                            <?php if (!empty($skipped_data)): ?>
+                                <span class="badge" style="background: #ffe3e3; color: #5e0000; padding: 2px 8px; border-radius: 12px; font-size: 11px; margin-left: 5px;">
+                                    <?= count($skipped_data) ?>
+                                </span>
+                            <?php endif; ?>
+                        </a>
+                    </div>
+                    <?php endif; ?>
+
+                    <!-- Data Preview Content -->
+                    <div id="dataPreview" class="<?= empty($parsed_data) ? 'hidden' : '' ?>">
+                        
+                        <?php if ($view_mode === 'raw' && !empty($parsed_data)): ?>
+                            <!-- RAW DATA VIEW - WITH CATEGORY -->
+                            <div class="summary-stats">
+                                <span class="stat-item"><i class="fa-solid fa-file-lines"></i> <strong><?= $total_rows ?></strong> total rows</span>
+                                <span class="stat-item"><i class="fa-solid fa-columns"></i> <strong><?= count($display_headers) ?></strong> columns</span>
+                                <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
+                                <span class="stat-item"><i class="fa-solid fa-calculator"></i> Grand Total: <strong class="grand-total-value">₱<?= number_format($grand_total_amount, 2) ?></strong></span>
+                                <span class="stat-item"><?php if (!empty($file_names)): ?>
+                                <div><i class="fa-solid fa-file"></i> Processed files: <?= implode(', ', array_map('htmlspecialchars', $file_names)) ?></div>
+                                    <?php endif; ?>
+                                </span> 
+                            </div>
+                            <div class="table-wrapper">
+                                <table class="preview-table">
+                                    <thead>
                                         <tr>
-                                            <td class="row-number"><?= $row_counter ?></td>
-                                            <?php foreach ($row as $val): ?>
-                                                <td><?= htmlspecialchars($val ?? '') ?></td>
+                                            <th class="row-number">#</th>
+                                            <?php foreach ($display_headers as $col_header): ?>
+                                                <th>
+                                                    <?= htmlspecialchars($col_header) ?>
+                                                </th>
                                             <?php endforeach; ?>
                                         </tr>
-                                    <?php 
-                                        $row_counter++;
-                                    endforeach; 
-                                    ?>
-                                </tbody>
-                                <tfoot>
-                                    <!-- Grand Total Row -->
-                                    <tr class="raw-grand-total">
-                                        <td class="row-number"></td>
+                                    </thead>
+                                    <tbody>
                                         <?php 
-                                        $total_columns = count($display_headers);
-                                        for ($i = 0; $i < $total_columns - 2; $i++): 
+                                        $row_counter = $offset + 1;
+                                        foreach ($page_rows as $row): 
                                         ?>
-                                            <td></td>
-                                        <?php endfor; ?>
-                                        <td style="text-align: right; font-weight: 700; color: #dc2626; font-size: 15px;">
-                                            ₱<?= number_format($grand_total_amount, 2) ?>
-                                        </td>
-                                            <td></td>
-
-                                    </tr>
-                                </tfoot>
-                            </table>
-                        </div>
-
-                        <!-- Raw Pagination Controls -->
-                        <div class="pagination-container">
-                            <div class="pagination-info">
-                                Showing <strong><?= $offset + 1 ?></strong> - 
-                                <strong><?= min($offset + $rows_per_page, $total_rows) ?></strong> 
-                                of <strong><?= $total_rows ?></strong> rows
-                            </div>
-                            
-                            <div class="pagination-controls">
-                                <?php if ($current_page > 1): ?>
-                                    <a href="?view=raw&page=1" class="pagination-link">
-                                        <i class="fa-solid fa-angles-left"></i>
-                                    </a>
-                                    <a href="?view=raw&page=<?= $current_page - 1 ?>" class="pagination-link">
-                                        <i class="fa-solid fa-chevron-left"></i> Previous
-                                    </a>
-                                <?php else: ?>
-                                    <span class="pagination-disabled"><i class="fa-solid fa-angles-left"></i></span>
-                                    <span class="pagination-disabled"><i class="fa-solid fa-chevron-left"></i> Previous</span>
-                                <?php endif; ?>
-                                
-                                <span class="page-indicator">Page <?= $current_page ?> of <?= $total_pages ?></span>
-                                
-                                <?php if ($current_page < $total_pages): ?>
-                                    <a href="?view=raw&page=<?= $current_page + 1 ?>" class="pagination-link">
-                                        Next <i class="fa-solid fa-chevron-right"></i>
-                                    </a>
-                                    <a href="?view=raw&page=<?= $total_pages ?>" class="pagination-link">
-                                        <i class="fa-solid fa-angles-right"></i>
-                                    </a>
-                                <?php else: ?>
-                                    <span class="pagination-disabled">Next <i class="fa-solid fa-chevron-right"></i></span>
-                                    <span class="pagination-disabled"><i class="fa-solid fa-angles-right"></i></span>
-                                <?php endif; ?>
-                            </div>
-                        </div>
-
-                    <?php elseif ($view_mode === 'summary' && !empty($summary_data)): ?>
-                        <!-- SUMMARY VIEW - Grouped by Region, Area, Zone, Code, Branch Type, Branch ID, Branch Name -->
-                        <div class="summary-stats">
-                            <span class="stat-item"><i class="fa-solid fa-layer-group"></i> <strong><?= count(array_unique(array_column($summary_data, 'region'))) ?></strong> regions</span>
-                            <span class="stat-item"><i class="fa-solid fa-cubes"></i> <strong><?= count(array_unique(array_column($summary_data, 'area'))) ?></strong> areas</span>
-                            <span class="stat-item"><i class="fa-solid fa-map-pin"></i> <strong><?= count(array_unique(array_column($summary_data, 'zone'))) ?></strong> zones</span>
-                            <span class="stat-item"><i class="fa-solid fa-tag"></i> <strong><?= $summary_total_rows ?></strong> unique combinations</span>
-                            <span class="stat-item"><i class="fa-solid fa-file-lines"></i> <strong><?= count(array_unique(array_column($summary_data, 'gl_description'))) ?></strong> unique GL Descriptions</span>
-                            <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
-                            <span class="stat-item"><?php if (!empty($file_names)): ?>
-                            <div><i class="fa-solid fa-file"></i> Processed files: <?= implode(', ', array_map('htmlspecialchars', $file_names)) ?></div>
-                                <?php endif; ?>
-                        </span> 
-                        </div>
-                      
-                        <div class="table-wrapper">
-                            <table class="preview-table">
-                                <thead>
-                                    <tr>
-                                        <th style="width: 40px;">#</th>
-                                        <th style="width: 7%;">Region</th>
-                                        <th style="width: 7%;">Area</th>
-                                        <th style="width: 7%;">Zone</th>
-                                        <th style="width: 4%;">Code</th>
-                                        <th style="width: 14%;">GL Description</th>
-                                        <th style="width: 8%;">Branch ID</th>
-                                        <th style="width: 10%;">Branch Name</th>
-                                        <th style="width: 8%;">Branch Type</th>
-                                        <th style="width: 9%;">Branch Amount</th>
-                                        <th style="width: 4%;">Branch Count</th>
-                                        <th style="width: 9%;">Showroom Amount</th>
-                                        <th style="width: 4%;">Showroom Count</th>
-                                        <th style="width: 9%;">Total Amount</th>
-                                        <th style="width: 7%;">Total Rows</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <?php 
-                                    if (!empty($summary_data)):
-                                        // Group data by Region, then Area, then Zone, then Code
-                                        $grouped_data = [];
-                                        foreach ($summary_data as $item) {
-                                            $region = isset($item['region']) ? $item['region'] : 'Unknown Region';
-                                            $area = isset($item['area']) ? $item['area'] : 'Unknown Area';
-                                            $zone = isset($item['zone']) ? $item['zone'] : '';
-                                            $code = isset($item['code']) ? $item['code'] : 'Unknown Code';
-                                            
-                                            if (!isset($grouped_data[$region])) {
-                                                $grouped_data[$region] = [];
-                                            }
-                                            if (!isset($grouped_data[$region][$area])) {
-                                                $grouped_data[$region][$area] = [];
-                                            }
-                                            if (!isset($grouped_data[$region][$area][$zone])) {
-                                                $grouped_data[$region][$area][$zone] = [];
-                                            }
-                                            if (!isset($grouped_data[$region][$area][$zone][$code])) {
-                                                $grouped_data[$region][$area][$zone][$code] = [];
-                                            }
-                                            $grouped_data[$region][$area][$zone][$code][] = $item;
-                                        }
-
-                                        ksort($grouped_data);
-                                        
-                                        $row_counter = 1;
-                                        $grand_total_all = 0;
-                                        $grand_branch_total = 0;
-                                        $grand_showroom_total = 0;
-                                        
-                                        foreach ($grouped_data as $region => $areas):
-                                            ksort($areas);
-                                            
-                                            $region_branch_total = 0;
-                                            $region_showroom_total = 0;
-                                            $region_total = 0;
-                                            $region_branch_count = 0;
-                                            $region_showroom_count = 0;
-                                            $region_total_count = 0;
-                                            
-                                            foreach ($areas as $area_items) {
-                                                foreach ($area_items as $zone_items) {
-                                                    foreach ($zone_items as $code_items) {
-                                                        foreach ($code_items as $item) {
-                                                            $region_branch_total += isset($item['branch_total']) ? $item['branch_total'] : 0;
-                                                            $region_showroom_total += isset($item['showroom_total']) ? $item['showroom_total'] : 0;
-                                                            $region_total += isset($item['total_amount']) ? $item['total_amount'] : 0;
-                                                            $region_branch_count += isset($item['branch_count']) ? $item['branch_count'] : 0;
-                                                            $region_showroom_count += isset($item['showroom_count']) ? $item['showroom_count'] : 0;
-                                                            $region_total_count += isset($item['total_count']) ? $item['total_count'] : 0;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                    ?>
-                                            <tr class="region-group-header">
-                                                <td colspan="15" style="font-size: 16px; color: #0f172a;">
-                                                    <i class="fa-solid fa-folder-open"></i> 
-                                                    <strong>REGION: <?= htmlspecialchars($region) ?></strong>
-                                                    <span style="float: right; font-weight: 600; color: #1e293b;">
-                                                        Branch: ₱<?= number_format($region_branch_total, 2) ?> (<?= $region_branch_count ?> rows) | 
-                                                        Showroom: ₱<?= number_format($region_showroom_total, 2) ?> (<?= $region_showroom_count ?> rows) | 
-                                                        Total: ₱<?= number_format($region_total, 2) ?> (<?= $region_total_count ?> rows)
-                                                    </span>
-                                                </td>
+                                            <tr>
+                                                <td class="row-number"><?= $row_counter ?></td>
+                                                <?php foreach ($row as $val): ?>
+                                                    <td><?= htmlspecialchars($val ?? '') ?></td>
+                                                <?php endforeach; ?>
                                             </tr>
-                                            
+                                        <?php 
+                                            $row_counter++;
+                                        endforeach; 
+                                        ?>
+                                    </tbody>
+                                    <tfoot>
+                                        <!-- Grand Total Row -->
+                                        <tr class="raw-grand-total">
+                                            <td class="row-number"></td>
                                             <?php 
-                                            foreach ($areas as $area => $zone_items):
-                                                $area_branch_total = 0;
-                                                $area_showroom_total = 0;
-                                                $area_total = 0;
-                                                $area_branch_count = 0;
-                                                $area_showroom_count = 0;
-                                                $area_total_count = 0;
+                                            $total_columns = count($display_headers);
+                                            for ($i = 0; $i < $total_columns - 2; $i++): 
+                                            ?>
+                                                <td></td>
+                                            <?php endfor; ?>
+                                            <td style="text-align: right; font-weight: 700; color: #dc2626; font-size: 15px;">
+                                                ₱<?= number_format($grand_total_amount, 2) ?>
+                                            </td>
+                                                <td></td>
+
+                                        </tr>
+                                    </tfoot>
+                                </table>
+                            </div>
+
+                            <!-- Raw Pagination Controls -->
+                            <div class="pagination-container">
+                                <div class="pagination-info">
+                                    Showing <strong><?= $offset + 1 ?></strong> - 
+                                    <strong><?= min($offset + $rows_per_page, $total_rows) ?></strong> 
+                                    of <strong><?= $total_rows ?></strong> rows
+                                </div>
+                                
+                                <div class="pagination-controls">
+                                    <?php if ($current_page > 1): ?>
+                                        <a href="?view=raw&page=1" class="pagination-link">
+                                            <i class="fa-solid fa-angles-left"></i>
+                                        </a>
+                                        <a href="?view=raw&page=<?= $current_page - 1 ?>" class="pagination-link">
+                                            <i class="fa-solid fa-chevron-left"></i> Previous
+                                        </a>
+                                    <?php else: ?>
+                                        <span class="pagination-disabled"><i class="fa-solid fa-angles-left"></i></span>
+                                        <span class="pagination-disabled"><i class="fa-solid fa-chevron-left"></i> Previous</span>
+                                    <?php endif; ?>
+                                    
+                                    <span class="page-indicator">Page <?= $current_page ?> of <?= $total_pages ?></span>
+                                    
+                                    <?php if ($current_page < $total_pages): ?>
+                                        <a href="?view=raw&page=<?= $current_page + 1 ?>" class="pagination-link">
+                                            Next <i class="fa-solid fa-chevron-right"></i>
+                                        </a>
+                                        <a href="?view=raw&page=<?= $total_pages ?>" class="pagination-link">
+                                            <i class="fa-solid fa-angles-right"></i>
+                                        </a>
+                                    <?php else: ?>
+                                        <span class="pagination-disabled">Next <i class="fa-solid fa-chevron-right"></i></span>
+                                        <span class="pagination-disabled"><i class="fa-solid fa-angles-right"></i></span>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+
+                        <?php elseif ($view_mode === 'summary' && !empty($summary_data)): ?>
+                            <!-- SUMMARY VIEW - Grouped by Region, Area, Zone, Code, Branch Type, Branch ID, Branch Name -->
+                            <div class="summary-stats">
+                                <span class="stat-item"><i class="fa-solid fa-layer-group"></i> <strong><?= count(array_unique(array_column($summary_data, 'region'))) ?></strong> regions</span>
+                                <span class="stat-item"><i class="fa-solid fa-cubes"></i> <strong><?= count(array_unique(array_column($summary_data, 'area'))) ?></strong> areas</span>
+                                <span class="stat-item"><i class="fa-solid fa-map-pin"></i> <strong><?= count(array_unique(array_column($summary_data, 'zone'))) ?></strong> zones</span>
+                                <span class="stat-item"><i class="fa-solid fa-tag"></i> <strong><?= $summary_total_rows ?></strong> unique combinations</span>
+                                <span class="stat-item"><i class="fa-solid fa-file-lines"></i> <strong><?= count(array_unique(array_column($summary_data, 'gl_description'))) ?></strong> unique GL Descriptions</span>
+                                <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
+                                <span class="stat-item"><?php if (!empty($file_names)): ?>
+                                <div><i class="fa-solid fa-file"></i> Processed files: <?= implode(', ', array_map('htmlspecialchars', $file_names)) ?></div>
+                                    <?php endif; ?>
+                                </span> 
+                            </div>
+                          
+                            <div class="table-wrapper">
+                                <table class="preview-table">
+                                    <thead>
+                                        <tr>
+                                            <th style="width: 40px;">#</th>
+                                            <th style="width: 7%;">Region</th>
+                                            <th style="width: 7%;">Area</th>
+                                            <th style="width: 7%;">Zone</th>
+                                            <th style="width: 4%;">Code</th>
+                                            <th style="width: 14%;">GL Description</th>
+                                            <th style="width: 8%;">Branch ID</th>
+                                            <th style="width: 10%;">Branch Name</th>
+                                            <th style="width: 8%;">Branch Type</th>
+                                            <th style="width: 9%;">Branch Amount</th>
+                                            <th style="width: 4%;">Branch Count</th>
+                                            <th style="width: 9%;">Showroom Amount</th>
+                                            <th style="width: 4%;">Showroom Count</th>
+                                            <th style="width: 9%;">Total Amount</th>
+                                            <th style="width: 7%;">Total Rows</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <?php 
+                                        if (!empty($summary_data)):
+                                            // Group data by Region, then Area, then Zone, then Code
+                                            $grouped_data = [];
+                                            foreach ($summary_data as $item) {
+                                                $region = isset($item['region']) ? $item['region'] : 'Unknown Region';
+                                                $area = isset($item['area']) ? $item['area'] : 'Unknown Area';
+                                                $zone = isset($item['zone']) ? $item['zone'] : '';
+                                                $code = isset($item['code']) ? $item['code'] : 'Unknown Code';
                                                 
-                                                foreach ($zone_items as $code_items) {
-                                                    foreach ($code_items as $items) {
-                                                        foreach ($items as $item) {
-                                                            $area_branch_total += isset($item['branch_total']) ? $item['branch_total'] : 0;
-                                                            $area_showroom_total += isset($item['showroom_total']) ? $item['showroom_total'] : 0;
-                                                            $area_total += isset($item['total_amount']) ? $item['total_amount'] : 0;
-                                                            $area_branch_count += isset($item['branch_count']) ? $item['branch_count'] : 0;
-                                                            $area_showroom_count += isset($item['showroom_count']) ? $item['showroom_count'] : 0;
-                                                            $area_total_count += isset($item['total_count']) ? $item['total_count'] : 0;
+                                                if (!isset($grouped_data[$region])) {
+                                                    $grouped_data[$region] = [];
+                                                }
+                                                if (!isset($grouped_data[$region][$area])) {
+                                                    $grouped_data[$region][$area] = [];
+                                                }
+                                                if (!isset($grouped_data[$region][$area][$zone])) {
+                                                    $grouped_data[$region][$area][$zone] = [];
+                                                }
+                                                if (!isset($grouped_data[$region][$area][$zone][$code])) {
+                                                    $grouped_data[$region][$area][$zone][$code] = [];
+                                                }
+                                                $grouped_data[$region][$area][$zone][$code][] = $item;
+                                            }
+
+                                            ksort($grouped_data);
+                                            
+                                            $row_counter = 1;
+                                            $grand_total_all = 0;
+                                            $grand_branch_total = 0;
+                                            $grand_showroom_total = 0;
+                                            
+                                            foreach ($grouped_data as $region => $areas):
+                                                ksort($areas);
+                                                
+                                                $region_branch_total = 0;
+                                                $region_showroom_total = 0;
+                                                $region_total = 0;
+                                                $region_branch_count = 0;
+                                                $region_showroom_count = 0;
+                                                $region_total_count = 0;
+                                                
+                                                foreach ($areas as $area_items) {
+                                                    foreach ($area_items as $zone_items) {
+                                                        foreach ($zone_items as $code_items) {
+                                                            foreach ($code_items as $item) {
+                                                                $region_branch_total += isset($item['branch_total']) ? $item['branch_total'] : 0;
+                                                                $region_showroom_total += isset($item['showroom_total']) ? $item['showroom_total'] : 0;
+                                                                $region_total += isset($item['total_amount']) ? $item['total_amount'] : 0;
+                                                                $region_branch_count += isset($item['branch_count']) ? $item['branch_count'] : 0;
+                                                                $region_showroom_count += isset($item['showroom_count']) ? $item['showroom_count'] : 0;
+                                                                $region_total_count += isset($item['total_count']) ? $item['total_count'] : 0;
+                                                            }
                                                         }
                                                     }
                                                 }
-                                            ?>
-                                                <tr class="area-subtotal-row">
-                                                    <td colspan="15" style="font-weight: 700; color: #0f172a; padding: 8px 15px !important;">
-                                                        <i class="fa-solid fa-caret-right"></i> 
-                                                        <strong>AREA: <?= htmlspecialchars($area) ?></strong>
+                                        ?>
+                                                <tr class="region-group-header">
+                                                    <td colspan="15" style="font-size: 16px; color: #0f172a;">
+                                                        <i class="fa-solid fa-folder-open"></i> 
+                                                        <strong>REGION: <?= htmlspecialchars($region) ?></strong>
                                                         <span style="float: right; font-weight: 600; color: #1e293b;">
-                                                            Branch: ₱<?= number_format($area_branch_total, 2) ?> (<?= $area_branch_count ?> rows) | 
-                                                            Showroom: ₱<?= number_format($area_showroom_total, 2) ?> (<?= $area_showroom_count ?> rows) | 
-                                                            Total: ₱<?= number_format($area_total, 2) ?> (<?= $area_total_count ?> rows)
+                                                            Branch: ₱<?= number_format($region_branch_total, 2) ?> (<?= $region_branch_count ?> rows) | 
+                                                            Showroom: ₱<?= number_format($region_showroom_total, 2) ?> (<?= $region_showroom_count ?> rows) | 
+                                                            Total: ₱<?= number_format($region_total, 2) ?> (<?= $region_total_count ?> rows)
                                                         </span>
                                                     </td>
                                                 </tr>
                                                 
                                                 <?php 
-                                                ksort($zone_items);
-                                                foreach ($zone_items as $zone => $code_items):
-                                                    $zone_branch_total = 0;
-                                                    $zone_showroom_total = 0;
-                                                    $zone_total = 0;
-                                                    $zone_branch_count = 0;
-                                                    $zone_showroom_count = 0;
-                                                    $zone_total_count = 0;
+                                                foreach ($areas as $area => $zone_items):
+                                                    $area_branch_total = 0;
+                                                    $area_showroom_total = 0;
+                                                    $area_total = 0;
+                                                    $area_branch_count = 0;
+                                                    $area_showroom_count = 0;
+                                                    $area_total_count = 0;
                                                     
-                                                    foreach ($code_items as $items) {
-                                                        foreach ($items as $item) {
-                                                            $zone_branch_total += isset($item['branch_total']) ? $item['branch_total'] : 0;
-                                                            $zone_showroom_total += isset($item['showroom_total']) ? $item['showroom_total'] : 0;
-                                                            $zone_total += isset($item['total_amount']) ? $item['total_amount'] : 0;
-                                                            $zone_branch_count += isset($item['branch_count']) ? $item['branch_count'] : 0;
-                                                            $zone_showroom_count += isset($item['showroom_count']) ? $item['showroom_count'] : 0;
-                                                            $zone_total_count += isset($item['total_count']) ? $item['total_count'] : 0;
+                                                    foreach ($zone_items as $code_items) {
+                                                        foreach ($code_items as $items) {
+                                                            foreach ($items as $item) {
+                                                                $area_branch_total += isset($item['branch_total']) ? $item['branch_total'] : 0;
+                                                                $area_showroom_total += isset($item['showroom_total']) ? $item['showroom_total'] : 0;
+                                                                $area_total += isset($item['total_amount']) ? $item['total_amount'] : 0;
+                                                                $area_branch_count += isset($item['branch_count']) ? $item['branch_count'] : 0;
+                                                                $area_showroom_count += isset($item['showroom_count']) ? $item['showroom_count'] : 0;
+                                                                $area_total_count += isset($item['total_count']) ? $item['total_count'] : 0;
+                                                            }
                                                         }
                                                     }
-                                                    if (!empty($zone)):
                                                 ?>
-                                                    <tr class="zone-subtotal-row">
-                                                        <td colspan="15" style="font-weight: 600; color: #0f172a; padding: 6px 15px !important; background: #f1f5f9;">
-                                                            <i class="fa-solid fa-location-dot"></i> 
-                                                            <strong>ZONE: <?= htmlspecialchars($zone) ?></strong>
+                                                    <tr class="area-subtotal-row">
+                                                        <td colspan="15" style="font-weight: 700; color: #0f172a; padding: 8px 15px !important;">
+                                                            <i class="fa-solid fa-caret-right"></i> 
+                                                            <strong>AREA: <?= htmlspecialchars($area) ?></strong>
                                                             <span style="float: right; font-weight: 600; color: #1e293b;">
-                                                                Branch: ₱<?= number_format($zone_branch_total, 2) ?> (<?= $zone_branch_count ?> rows) | 
-                                                                Showroom: ₱<?= number_format($zone_showroom_total, 2) ?> (<?= $zone_showroom_count ?> rows) | 
-                                                                Total: ₱<?= number_format($zone_total, 2) ?> (<?= $zone_total_count ?> rows)
+                                                                Branch: ₱<?= number_format($area_branch_total, 2) ?> (<?= $area_branch_count ?> rows) | 
+                                                                Showroom: ₱<?= number_format($area_showroom_total, 2) ?> (<?= $area_showroom_count ?> rows) | 
+                                                                Total: ₱<?= number_format($area_total, 2) ?> (<?= $area_total_count ?> rows)
                                                             </span>
                                                         </td>
                                                     </tr>
-                                                <?php 
-                                                    endif;
-                                                    ksort($code_items);
-                                                    foreach ($code_items as $code => $items):
-                                                        usort($items, function($a, $b) {
-                                                            if ($a['branch_type'] != $b['branch_type']) return strcmp($a['branch_type'], $b['branch_type']);
-                                                            return strcmp($a['branch_id'], $b['branch_id']);
-                                                        });
+                                                    
+                                                    <?php 
+                                                    ksort($zone_items);
+                                                    foreach ($zone_items as $zone => $code_items):
+                                                        $zone_branch_total = 0;
+                                                        $zone_showroom_total = 0;
+                                                        $zone_total = 0;
+                                                        $zone_branch_count = 0;
+                                                        $zone_showroom_count = 0;
+                                                        $zone_total_count = 0;
                                                         
-                                                        foreach ($items as $idx => $item):
-                                                            $branch_type_class = strtolower(isset($item['branch_type']) ? $item['branch_type'] : 'unknown');
-                                                            $branch_total = isset($item['branch_total']) ? $item['branch_total'] : 0;
-                                                            $branch_count = isset($item['branch_count']) ? $item['branch_count'] : 0;
-                                                            $showroom_total = isset($item['showroom_total']) ? $item['showroom_total'] : 0;
-                                                            $showroom_count = isset($item['showroom_count']) ? $item['showroom_count'] : 0;
-                                                            $total_amount = isset($item['total_amount']) ? $item['total_amount'] : 0;
-                                                            $total_count = isset($item['total_count']) ? $item['total_count'] : 0;
-                                                            $gl_description = isset($item['gl_description']) ? $item['gl_description'] : '';
-                                                            $branch_id = isset($item['branch_id']) ? $item['branch_id'] : '';
-                                                            $branch_name = isset($item['branch_name']) ? $item['branch_name'] : '';
-                                                            
-                                                            $branch_negative = $branch_total < 0;
-                                                            $showroom_negative = $showroom_total < 0;
-                                                            $total_negative = $total_amount < 0;
+                                                        foreach ($code_items as $items) {
+                                                            foreach ($items as $item) {
+                                                                $zone_branch_total += isset($item['branch_total']) ? $item['branch_total'] : 0;
+                                                                $zone_showroom_total += isset($item['showroom_total']) ? $item['showroom_total'] : 0;
+                                                                $zone_total += isset($item['total_amount']) ? $item['total_amount'] : 0;
+                                                                $zone_branch_count += isset($item['branch_count']) ? $item['branch_count'] : 0;
+                                                                $zone_showroom_count += isset($item['showroom_count']) ? $item['showroom_count'] : 0;
+                                                                $zone_total_count += isset($item['total_count']) ? $item['total_count'] : 0;
+                                                            }
+                                                        }
+                                                        if (!empty($zone)):
                                                     ?>
-                                                        <tr class="code-row">
-                                                            <td style="text-align: center; color: #94a3b8; font-weight: 400;"><?= $row_counter ?></td>
-                                                            <td></td>
-                                                            <td></td>
-                                                            <td></td>
-                                                            <td style="padding-left: 30px;">
-                                                                <span class="code-value"><?= htmlspecialchars($code) ?></span>
-                                                            </td>
-                                                            <td style="
-                                                                max-width: 150px;
-                                                                width: 200px;
-                                                                white-space: normal;
-                                                                overflow-wrap: break-word;
-                                                                word-break: break-word;
-                                                                font-size: 12px;
-                                                                color: #475569;
-                                                            ">
-                                                                <?= htmlspecialchars($gl_description ?: '-') ?>
-                                                            </td>
-                                                            <td style="font-size: 12px; font-weight: 600; color: #1e293b;">
-                                                                <?= htmlspecialchars($branch_id ?: '-') ?>
-                                                            </td>
-                                                            <td style="font-size: 12px; color: #475569;">
-                                                                <?= htmlspecialchars($branch_name ?: '-') ?>
-                                                            </td>
-                                                            <td>
-                                                                <span class="branch-type-badge <?= $branch_type_class ?>">
-                                                                    <?= htmlspecialchars($item['branch_type'] ?? 'Unknown') ?>
+                                                        <tr class="zone-subtotal-row">
+                                                            <td colspan="15" style="font-weight: 600; color: #0f172a; padding: 6px 15px !important; background: #f1f5f9;">
+                                                                <i class="fa-solid fa-location-dot"></i> 
+                                                                <strong>ZONE: <?= htmlspecialchars($zone) ?></strong>
+                                                                <span style="float: right; font-weight: 600; color: #1e293b;">
+                                                                    Branch: ₱<?= number_format($zone_branch_total, 2) ?> (<?= $zone_branch_count ?> rows) | 
+                                                                    Showroom: ₱<?= number_format($zone_showroom_total, 2) ?> (<?= $zone_showroom_count ?> rows) | 
+                                                                    Total: ₱<?= number_format($zone_total, 2) ?> (<?= $zone_total_count ?> rows)
                                                                 </span>
                                                             </td>
-                                                            <td class="amount-column subtotal-amount-branch <?= $branch_negative ? 'negative-amount-branch' : '' ?>">
-                                                                <?= ($branch_total != 0) ? '₱' . number_format($branch_total, 2) : '-' ?>
-                                                            </td>
-                                                            <td class="count-column">
-                                                                <?= $branch_count > 0 ? $branch_count : '-' ?>
-                                                            </td>
-                                                            <td class="amount-column subtotal-amount-showroom <?= $showroom_negative ? 'negative-amount-showroom' : '' ?>">
-                                                                <?= ($showroom_total != 0) ? '₱' . number_format($showroom_total, 2) : '-' ?>
-                                                            </td>
-                                                            <td class="count-column">
-                                                                <?= $showroom_count > 0 ? $showroom_count : '-' ?>
-                                                            </td>
-                                                            <td class="amount-column <?= $total_negative ? 'negative-amount' : '' ?>" style="font-weight: 700; color: #0f172a;">
-                                                                ₱<?= number_format($total_amount, 2) ?>
-                                                            </td>
-                                                            <td class="count-column" style="font-weight: 600;">
-                                                                <?= $total_count ?>
-                                                            </td>
                                                         </tr>
-                                                        <?php 
-                                                        $row_counter++;
+                                                    <?php 
+                                                        endif;
+                                                        ksort($code_items);
+                                                        foreach ($code_items as $code => $items):
+                                                            usort($items, function($a, $b) {
+                                                                if ($a['branch_type'] != $b['branch_type']) return strcmp($a['branch_type'], $b['branch_type']);
+                                                                return strcmp($a['branch_id'], $b['branch_id']);
+                                                            });
+                                                            
+                                                            foreach ($items as $idx => $item):
+                                                                $branch_type_class = strtolower(isset($item['branch_type']) ? $item['branch_type'] : 'unknown');
+                                                                $branch_total = isset($item['branch_total']) ? $item['branch_total'] : 0;
+                                                                $branch_count = isset($item['branch_count']) ? $item['branch_count'] : 0;
+                                                                $showroom_total = isset($item['showroom_total']) ? $item['showroom_total'] : 0;
+                                                                $showroom_count = isset($item['showroom_count']) ? $item['showroom_count'] : 0;
+                                                                $total_amount = isset($item['total_amount']) ? $item['total_amount'] : 0;
+                                                                $total_count = isset($item['total_count']) ? $item['total_count'] : 0;
+                                                                $gl_description = isset($item['gl_description']) ? $item['gl_description'] : '';
+                                                                $branch_id = isset($item['branch_id']) ? $item['branch_id'] : '';
+                                                                $branch_name = isset($item['branch_name']) ? $item['branch_name'] : '';
+                                                                
+                                                                $branch_negative = $branch_total < 0;
+                                                                $showroom_negative = $showroom_total < 0;
+                                                                $total_negative = $total_amount < 0;
+                                                        ?>
+                                                            <tr class="code-row">
+                                                                <td style="text-align: center; color: #94a3b8; font-weight: 400;"><?= $row_counter ?></td>
+                                                                <td></td>
+                                                                <td></td>
+                                                                <td></td>
+                                                                <td style="padding-left: 30px;">
+                                                                    <span class="code-value"><?= htmlspecialchars($code) ?></span>
+                                                                </td>
+                                                                <td style="
+                                                                    max-width: 150px;
+                                                                    width: 200px;
+                                                                    white-space: normal;
+                                                                    overflow-wrap: break-word;
+                                                                    word-break: break-word;
+                                                                    font-size: 12px;
+                                                                    color: #475569;
+                                                                ">
+                                                                    <?= htmlspecialchars($gl_description ?: '-') ?>
+                                                                </td>
+                                                                <td style="font-size: 12px; font-weight: 600; color: #1e293b;">
+                                                                    <?= htmlspecialchars($branch_id ?: '-') ?>
+                                                                </td>
+                                                                <td style="font-size: 12px; color: #475569;">
+                                                                    <?= htmlspecialchars($branch_name ?: '-') ?>
+                                                                </td>
+                                                                <td>
+                                                                    <span class="branch-type-badge <?= $branch_type_class ?>">
+                                                                        <?= htmlspecialchars($item['branch_type'] ?? 'Unknown') ?>
+                                                                    </span>
+                                                                </td>
+                                                                <td class="amount-column subtotal-amount-branch <?= $branch_negative ? 'negative-amount-branch' : '' ?>">
+                                                                    <?= ($branch_total != 0) ? '₱' . number_format($branch_total, 2) : '-' ?>
+                                                                </td>
+                                                                <td class="count-column">
+                                                                    <?= $branch_count > 0 ? $branch_count : '-' ?>
+                                                                </td>
+                                                                <td class="amount-column subtotal-amount-showroom <?= $showroom_negative ? 'negative-amount-showroom' : '' ?>">
+                                                                    <?= ($showroom_total != 0) ? '₱' . number_format($showroom_total, 2) : '-' ?>
+                                                                </td>
+                                                                <td class="count-column">
+                                                                    <?= $showroom_count > 0 ? $showroom_count : '-' ?>
+                                                                </td>
+                                                                <td class="amount-column <?= $total_negative ? 'negative-amount' : '' ?>" style="font-weight: 700; color: #0f172a;">
+                                                                    ₱<?= number_format($total_amount, 2) ?>
+                                                                </td>
+                                                                <td class="count-column" style="font-weight: 600;">
+                                                                    <?= $total_count ?>
+                                                                </td>
+                                                            </tr>
+                                                            <?php 
+                                                            $row_counter++;
+                                                            endforeach; 
                                                         endforeach; 
                                                     endforeach; 
-                                                endforeach; 
+                                                    ?>
+                                                <?php 
+                                                endforeach;
+                                                
                                                 ?>
-                                            <?php 
+                                                <tr class="region-grand-total">
+                                                    <td colspan="15" style="font-size: 15px; padding: 12px 15px !important;">
+                                                        <i class="fa-solid fa-calculator"></i> 
+                                                        <strong>GRAND TOTAL - <?= htmlspecialchars($region) ?></strong>
+                                                        <span style="float: right; font-weight: 800; color: #000;">
+                                                            Branch: ₱<?= number_format($region_branch_total, 2) ?> | 
+                                                            Showroom: ₱<?= number_format($region_showroom_total, 2) ?> | 
+                                                            Total: ₱<?= number_format($region_total, 2) ?>
+                                                        </span>
+                                                    </td>
+                                                </tr>
+                                                <tr style="height: 5px;"><td colspan="15" style="padding: 0; border: none;"></td></tr>
+                                                
+                                                <?php 
+                                                $grand_branch_total += $region_branch_total;
+                                                $grand_showroom_total += $region_showroom_total;
+                                                $grand_total_all += $region_total;
                                             endforeach;
                                             
+                                            if (count($grouped_data) > 1):
                                             ?>
-                                            <tr class="region-grand-total">
-                                                <td colspan="15" style="font-size: 15px; padding: 12px 15px !important;">
-                                                    <i class="fa-solid fa-calculator"></i> 
-                                                    <strong>GRAND TOTAL - <?= htmlspecialchars($region) ?></strong>
-                                                    <span style="float: right; font-weight: 800; color: #000;">
-                                                        Branch: ₱<?= number_format($region_branch_total, 2) ?> | 
-                                                        Showroom: ₱<?= number_format($region_showroom_total, 2) ?> | 
-                                                        Total: ₱<?= number_format($region_total, 2) ?>
-                                                    </span>
-                                                </td>
-                                            </tr>
-                                            <tr style="height: 5px;"><td colspan="15" style="padding: 0; border: none;"></td></tr>
-                                            
+                                                <tr style="background-color: #ff5656 !important;">
+                                                    <td colspan="15" style="padding: 15px 15px !important; color: white !important; font-size: 17px; font-weight: 800;">
+                                                        <i class="fa-solid fa-crown"></i> 
+                                                        OVERALL GRAND TOTAL (All Regions)
+                                                        <span style="float: right; font-weight: 800; color: #ffffff;">
+                                                            Branch: ₱<?= number_format($grand_branch_total_direct, 2) ?> | 
+                                                            Showroom: ₱<?= number_format($grand_showroom_total_direct, 2) ?> | 
+                                                            Total: ₱<?= number_format($grand_total_amount, 2) ?>
+                                                        </span>
+                                                    </td>
+                                                </tr>
                                             <?php 
-                                            $grand_branch_total += $region_branch_total;
-                                            $grand_showroom_total += $region_showroom_total;
-                                            $grand_total_all += $region_total;
-                                        endforeach;
-                                        
-                                        if (count($grouped_data) > 1):
-                                        ?>
-                                            <tr style="background-color: #ff5656 !important;">
-                                                <td colspan="15" style="padding: 15px 15px !important; color: white !important; font-size: 17px; font-weight: 800;">
-                                                    <i class="fa-solid fa-crown"></i> 
-                                                    OVERALL GRAND TOTAL (All Regions)
-                                                    <span style="float: right; font-weight: 800; color: #ffffff;">
-                                                        Branch: ₱<?= number_format($grand_branch_total_direct, 2) ?> | 
-                                                        Showroom: ₱<?= number_format($grand_showroom_total_direct, 2) ?> | 
-                                                        Total: ₱<?= number_format($grand_total_amount, 2) ?>
-                                                    </span>
-                                                </td>
-                                            </tr>
-                                        <?php 
-                                        endif;
-                                    else: 
-                                        ?>
-                                        <tr>
-                                            <td colspan="15" style="text-align: center; padding: 40px; color: #94a3b8;">
-                                                <i class="fa-solid fa-inbox" style="font-size: 24px; display: block; margin-bottom: 10px;"></i>
-                                                No summary data available.
-                                            </td>
-                                        </tr>
-                                    <?php endif; ?>
-                                </tbody>
-                            </table>
-                        </div>
-
-                        <div style="margin-top: 15px; padding: 10px 15px; background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
-                            <span style="color: #64748b; font-size: 13px;">
-                                <i class="fa-solid fa-info-circle"></i> Each code is broken down by Branch Type, Branch ID, and Branch Name.
-                            </span>
-                        </div>
-
-                    <?php elseif ($view_mode === 'remarks'): ?>
-                        <!-- REMARKS VIEW - Unknown Branch Types -->
-                        <?php if (!empty($remarks_data)): ?>
-                            <div style="background: #ffebeb; border: 1px solid #ffabab; border-radius: 8px; padding: 15px 20px; margin-bottom: 15px;">
-                                <div style="display: flex; align-items: center; gap: 10px;">
-                                    <i class="fa-solid fa-triangle-exclamation" style="color: #ad0000; font-size: 20px;"></i>
-                                    <div>
-                                        <strong style="color: #ff0000;">Unknown Branch Types</strong>
-                                        <div style="font-size: 13px; color: #ad0000; margin-top: 2px;">
-                                            These Branch IDs were not found in the masterdata branch profile.
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div class="summary-stats">
-                                <span class="stat-item"><i class="fa-solid fa-question-circle"></i> <strong><?= count($remarks_data) ?></strong> unique unknown branch ID combinations</span>
-                                <span class="stat-item"><i class="fa-solid fa-layer-group"></i> <strong><?= count(array_unique(array_column($remarks_data, 'region'))) ?></strong> regions affected</span>
-                                <span class="stat-item"><i class="fa-solid fa-cubes"></i> <strong><?= count(array_unique(array_column($remarks_data, 'area'))) ?></strong> areas affected</span>
-                                <span class="stat-item"><i class="fa-solid fa-map-pin"></i> <strong><?= count(array_unique(array_column($remarks_data, 'zone'))) ?></strong> zones affected</span>
-                                <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
-                                <span class="stat-item"><?php if (!empty($file_names)): ?>
-                                    <div><i class="fa-solid fa-file"></i> Processed files: <?= implode(', ', array_map('htmlspecialchars', $file_names)) ?></div>
-                                <?php endif; ?></span> 
-                            </div>
-
-                            <div class="table-wrapper">
-                                <table class="preview-table remarks-table">
-                                    <thead>
-                                        <tr>
-                                            <th style="width: 40px;">#</th>
-                                            <th style="width: 10%;">Region</th>
-                                            <th style="width: 10%;">Area</th>
-                                            <th style="width: 10%;">Zone</th>
-                                            <th style="width: 10%;">GL Code</th>
-                                            <th style="width: 13%;">Branch ID</th>
-                                            <th style="width: 12%;">Branch Name</th>
-                                            <th style="width: 10%;">Total Amount</th>
-                                            <th style="width: 8%;">Transactions</th>
-                                            <th style="width: 18%;">Transaction Details</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        <?php 
-                                        $row_counter = 1;
-                                        $grand_unknown_total = 0;
-                                        $grand_unknown_count = 0;
-                                        
-                                        foreach ($remarks_data as $index => $item):
-                                            $grand_unknown_total += $item['total_amount'];
-                                            $grand_unknown_count += $item['row_count'];
-                                            $transaction_count = count($item['transactions']);
-                                        ?>
+                                            endif;
+                                        else: 
+                                            ?>
                                             <tr>
-                                                <td style="text-align: center; color: #94a3b8;"><?= $row_counter ?></td>
-                                                <td><strong><?= htmlspecialchars($item['region']) ?></strong></td>
-                                                <td><?= htmlspecialchars($item['area']) ?></td>
-                                                <td><?= htmlspecialchars($item['zone'] ?: '-') ?></td>
-                                                <td><span class="code-value"><?= htmlspecialchars($item['code']) ?></span></td>
-                                                <td>
-                                                    <span class="remarks-unknown-badge" style="background: #ffedd5; color: #c2410c; padding: 4px 10px; border-radius: 12px; font-size: 12px;">
-                                                        <i class="fa-solid fa-question-circle"></i> 
-                                                        <?= htmlspecialchars($item['branch_id']) ?>
-                                                    </span>
-                                                </td>
-                                                <td><?= htmlspecialchars($item['branch_name'] ?: '-') ?></td>
-                                                <td class="amount-column" style="font-weight: 600; color: #ff0000;">
-                                                    ₱<?= number_format($item['total_amount'], 2) ?>
-                                                </td>
-                                                <td class="count-column" style="font-weight: 600;">
-                                                    <?= $transaction_count ?>
-                                                </td>
-                                                <td>
-                                                    <button class="expand-btn" onclick="toggleTransactions(<?= $index ?>)" style="background: #f1f5f9; border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; color: #1e293b;">
-                                                        <i class="fa-solid fa-chevron-down" id="icon_<?= $index ?>"></i> 
-                                                        View
-                                                    </button>
-                                                    <div id="transactions_<?= $index ?>" style="display: none; margin-top: 8px; max-height: 200px; overflow-y: auto; background: #f8fafc; padding: 8px; border-radius: 4px;">
-                                                        <?php foreach ($item['transactions'] as $t): ?>
-                                                            <div style="font-size: 12px; color: #6b7280; padding: 3px 0; border-bottom: 1px solid #e2e8f0;">
-                                                                <?= htmlspecialchars($t['date']) ?> - 
-                                                                <span class="amount-detail" style="font-weight: 600; color: #dc2626;">₱<?= number_format($t['amount'], 2) ?></span>
-                                                                <?php if (!empty($t['branch_name'])): ?>
-                                                                    - <?= htmlspecialchars($t['branch_name']) ?>
-                                                                <?php endif; ?>
-                                                            </div>
-                                                        <?php endforeach; ?>
-                                                    </div>
+                                                <td colspan="15" style="text-align: center; padding: 40px; color: #94a3b8;">
+                                                    <i class="fa-solid fa-inbox" style="font-size: 24px; display: block; margin-bottom: 10px;"></i>
+                                                    No summary data available.
                                                 </td>
                                             </tr>
-                                        <?php 
-                                            $row_counter++;
-                                            endforeach; 
-                                        ?>
-                                            <tr style="background-color: #ffdede !important; border-top: 3px solid #ff0000;">
-                                                <td colspan="7" style="text-align: right; font-weight: 800; color: #ae0000; font-size: 14px; padding: 12px;">
-                                                    <i class="fa-solid fa-calculator"></i> TOTAL UNKNOWN:
-                                                </td>
-                                                <td class="amount-column" style="font-weight: 800; color: #ae0000; font-size: 15px;">
-                                                    ₱<?= number_format($grand_unknown_total, 2) ?>
-                                                </td>
-                                                <td style="text-align: center; font-weight: 600; color: #ae0000;">
-                                                    <?= $grand_unknown_count ?>
-                                                </td>
-                                                <td></td>
-                                            </tr>
+                                        <?php endif; ?>
                                     </tbody>
                                 </table>
                             </div>
-                        <?php else: ?>
-                            <!-- No remarks found - Success message -->
-                            <div style="background: #f0fdf4; border: 2px solid #22c55e; border-radius: 12px; padding: 40px 30px; text-align: center; margin: 20px 0;">
-                                <div style="font-size: 48px; margin-bottom: 15px; color: #22c55e;">
-                                    <i class="fa-solid fa-check-circle"></i>
-                                </div>
-                                <h3 style="color: #15803d; font-size: 24px; margin-bottom: 10px;">All Branch IDs Recognized!</h3>
-                                <p style="color: #166534; font-size: 16px; max-width: 500px; margin: 0 auto;">
-                                    All Branch IDs in the uploaded data are successfully matched with the masterdata branch profile.
-                                </p>
-                                <div style="margin-top: 20px; display: flex; gap: 15px; justify-content: center; flex-wrap: wrap;">
-                                    <span style="background: #dcfce7; color: #15803d; padding: 8px 16px; border-radius: 20px; font-size: 14px;">
-                                        <i class="fa-solid fa-check"></i> All branches verified
-                                    </span>
-                                    <span style="background: #dcfce7; color: #15803d; padding: 8px 16px; border-radius: 20px; font-size: 14px;">
-                                        <i class="fa-solid fa-database"></i> Masterdata up to date
-                                    </span>
-                                </div>
-                            </div>
-                            
-                            <!-- Show summary stats even when no remarks -->
-                            <div class="summary-stats" style="margin-top: 20px;">
-                                <span class="stat-item"><i class="fa-solid fa-check-circle" style="color: #22c55e;"></i> <strong>0</strong> unknown branch IDs</span>
-                                <span class="stat-item"><i class="fa-solid fa-thumbs-up" style="color: #22c55e;"></i> All <strong><?= $total_rows ?></strong> rows processed successfully</span>
-                                <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
-                                <?php if (!empty($file_names)): ?>
-                                    <span class="stat-item">
-                                        <i class="fa-solid fa-file"></i> Processed files: <?= implode(', ', array_map('htmlspecialchars', $file_names)) ?>
-                                    </span>
-                                <?php endif; ?>
-                            </div>
-                            
-                            <!-- Show a mini preview of the data -->
-                            <div style="margin-top: 20px; background: #f8fafc; border-radius: 8px; padding: 20px; border: 1px solid #e2e8f0;">
-                                <p style="color: #64748b; text-align: center; font-size: 14px;">
-                                    <i class="fa-solid fa-info-circle"></i> All uploaded data has been successfully matched with the masterdata.
-                                    <br>Switch to <a href="?view=raw" style="color: #2563eb; text-decoration: none; font-weight: 600;">Detailed View</a> or 
-                                    <a href="?view=summary" style="color: #2563eb; text-decoration: none; font-weight: 600;">Summary View</a> to explore the data.
-                                </p>
-                            </div>
-                        <?php endif; ?>
 
-                    <?php elseif ($view_mode === 'skipped'): ?>
-                        <!-- SKIPPED ROWS VIEW -->
-                        <?php if (!empty($skipped_data)): ?>
-                            <div style="background: #ffebeb; border: 1px solid #ffabab; border-radius: 8px; padding: 15px 20px; margin-bottom: 15px;">
-                                <div style="display: flex; align-items: center; gap: 10px;">
-                                    <i class="fa-solid fa-ban" style="color: #dc2626; font-size: 20px;"></i>
-                                    <div>
-                                        <strong style="color: #dc2626;">Skipped Rows</strong>
-                                        <div style="font-size: 13px; color: #dc2626; margin-top: 2px;">
-                                            Rows excluded from the preview due to missing or invalid data.
+                            <div style="margin-top: 15px; padding: 10px 15px; background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
+                                <span style="color: #64748b; font-size: 13px;">
+                                    <i class="fa-solid fa-info-circle"></i> Each code is broken down by Branch Type, Branch ID, and Branch Name.
+                                </span>
+                            </div>
+
+                        <?php elseif ($view_mode === 'remarks'): ?>
+                            <!-- ===== REMARKS VIEW ===== -->
+                            <?php if (!empty($remarks_data)): ?>
+                                <div style="background: #ffebeb; border: 1px solid #ffabab; border-radius: 8px; padding: 15px 20px; margin-bottom: 15px;">
+                                    <div style="display: flex; align-items: center; gap: 10px;">
+                                        <i class="fa-solid fa-triangle-exclamation" style="color: #ad0000; font-size: 20px;"></i>
+                                        <div>
+                                            <strong style="color: #ff0000;">Unknown Branch Types</strong>
+                                            <div style="font-size: 13px; color: #ad0000; margin-top: 2px;">
+                                                These Branch IDs were not found in the masterdata branch profile.
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
-                            </div>
 
-                            <div class="summary-stats">
-                                <span class="stat-item"><i class="fa-solid fa-ban"></i> <strong><?= count($skipped_data) ?></strong> skipped rows</span>
-                                <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
-                            </div>
+                                <div class="summary-stats">
+                                    <span class="stat-item"><i class="fa-solid fa-question-circle"></i> <strong><?= count($remarks_data) ?></strong> unique unknown branch ID combinations</span>
+                                    <span class="stat-item"><i class="fa-solid fa-layer-group"></i> <strong><?= count(array_unique(array_column($remarks_data, 'region'))) ?></strong> regions affected</span>
+                                    <span class="stat-item"><i class="fa-solid fa-cubes"></i> <strong><?= count(array_unique(array_column($remarks_data, 'area'))) ?></strong> areas affected</span>
+                                    <span class="stat-item"><i class="fa-solid fa-map-pin"></i> <strong><?= count(array_unique(array_column($remarks_data, 'zone'))) ?></strong> zones affected</span>
+                                    <?php if (!empty($skipped_data)): ?>
+                                        <span class="stat-item" style="background: #fde3b0; padding: 4px 12px; border-radius: 12px;">
+                                            <i class="fa-solid fa-ban" style="color: #b45309;"></i> 
+                                            <strong style="color: #b45309;"><?= count($skipped_data) ?></strong> skipped rows also found
+                                        </span>
+                                    <?php endif; ?>
+                                    <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
+                                    <span class="stat-item"><?php if (!empty($file_names)): ?>
+                                        <div><i class="fa-solid fa-file"></i> Processed files: <?= implode(', ', array_map('htmlspecialchars', $file_names)) ?></div>
+                                    <?php endif; ?></span> 
+                                </div>
 
-                            <div class="table-wrapper">
-                                <table class="preview-table skipped-table">
-                                    <thead>
-                                        <tr>
-                                            <th style="width: 60px;">Row # base on CSV file</th>
-                                            <th style="width: 28%;">Reason</th>
-                                            <?php foreach ($display_headers as $col_header): ?>
-                                                <th><?= htmlspecialchars($col_header) ?></th>
-                                            <?php endforeach; ?>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        <?php foreach ($skipped_data as $item): ?>
+                                <div class="table-wrapper">
+                                    <table class="preview-table remarks-table">
+                                        <thead>
                                             <tr>
-                                                <td style="text-align: center; color: #94a3b8;"><?= $item['row_number'] ?></td>
-                                                <td>
-                                                    <span class="remarks-unknown-badge" style="background: #ffedd5; color: #c2410c; padding: 4px 10px; border-radius: 12px; font-size: 12px;">
-                                                        <i class="fa-solid fa-triangle-exclamation"></i> <?= htmlspecialchars($item['reason']) ?>
-                                                    </span>
-                                                </td>
-                                                <?php foreach ($item['raw_data'] as $val): ?>
-                                                    <td><?= htmlspecialchars($val ?? '') ?></td>
+                                                <th style="width: 40px;">#</th>
+                                                <th style="width: 10%;">Region</th>
+                                                <th style="width: 10%;">Area</th>
+                                                <th style="width: 10%;">Zone</th>
+                                                <th style="width: 10%;">GL Code</th>
+                                                <th style="width: 13%;">Branch ID</th>
+                                                <th style="width: 12%;">Branch Name</th>
+                                                <th style="width: 10%;">Total Amount</th>
+                                                <th style="width: 8%;">Transactions</th>
+                                                <th style="width: 18%;">Transaction Details</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <?php 
+                                            $row_counter = 1;
+                                            $grand_unknown_total = 0;
+                                            $grand_unknown_count = 0;
+                                            
+                                            foreach ($remarks_data as $index => $item):
+                                                $grand_unknown_total += $item['total_amount'];
+                                                $grand_unknown_count += $item['row_count'];
+                                                $transaction_count = count($item['transactions']);
+                                            ?>
+                                                <tr>
+                                                    <td style="text-align: center; color: #94a3b8;"><?= $row_counter ?></td>
+                                                    <td><strong><?= htmlspecialchars($item['region']) ?></strong></td>
+                                                    <td><?= htmlspecialchars($item['area']) ?></td>
+                                                    <td><?= htmlspecialchars($item['zone'] ?: '-') ?></td>
+                                                    <td><span class="code-value"><?= htmlspecialchars($item['code']) ?></span></td>
+                                                    <td>
+                                                        <span class="remarks-unknown-badge" style="background: #ffedd5; color: #c2410c; padding: 4px 10px; border-radius: 12px; font-size: 12px;">
+                                                            <i class="fa-solid fa-question-circle"></i> 
+                                                            <?= htmlspecialchars($item['branch_id']) ?>
+                                                        </span>
+                                                    </td>
+                                                    <td><?= htmlspecialchars($item['branch_name'] ?: '-') ?></td>
+                                                    <td class="amount-column" style="font-weight: 600; color: #ff0000;">
+                                                        ₱<?= number_format($item['total_amount'], 2) ?>
+                                                    </td>
+                                                    <td class="count-column" style="font-weight: 600;">
+                                                        <?= $transaction_count ?>
+                                                    </td>
+                                                    <td>
+                                                        <button class="expand-btn" onclick="toggleTransactions(<?= $index ?>)" style="background: #f1f5f9; border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; color: #1e293b;">
+                                                            <i class="fa-solid fa-chevron-down" id="icon_<?= $index ?>"></i> 
+                                                            View
+                                                        </button>
+                                                        <div id="transactions_<?= $index ?>" style="display: none; margin-top: 8px; max-height: 200px; overflow-y: auto; background: #f8fafc; padding: 8px; border-radius: 4px;">
+                                                            <?php foreach ($item['transactions'] as $t): ?>
+                                                                <div style="font-size: 12px; color: #6b7280; padding: 3px 0; border-bottom: 1px solid #e2e8f0;">
+                                                                    <?= htmlspecialchars($t['date']) ?> - 
+                                                                    <span class="amount-detail" style="font-weight: 600; color: #dc2626;">₱<?= number_format($t['amount'], 2) ?></span>
+                                                                    <?php if (!empty($t['branch_name'])): ?>
+                                                                        - <?= htmlspecialchars($t['branch_name']) ?>
+                                                                    <?php endif; ?>
+                                                                </div>
+                                                            <?php endforeach; ?>
+                                                        </div>
+                                                    </td>
+                                                </tr>
+                                            <?php 
+                                                $row_counter++;
+                                                endforeach; 
+                                            ?>
+                                                <tr style="background-color: #ffdede !important; border-top: 3px solid #ff0000;">
+                                                    <td colspan="7" style="text-align: right; font-weight: 800; color: #ae0000; font-size: 14px; padding: 12px;">
+                                                        <i class="fa-solid fa-calculator"></i> TOTAL UNKNOWN:
+                                                    </td>
+                                                    <td class="amount-column" style="font-weight: 800; color: #ae0000; font-size: 15px;">
+                                                        ₱<?= number_format($grand_unknown_total, 2) ?>
+                                                    </td>
+                                                    <td style="text-align: center; font-weight: 600; color: #ae0000;">
+                                                        <?= $grand_unknown_count ?>
+                                                    </td>
+                                                    <td></td>
+                                                </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            <?php else: ?>
+                                <!-- No remarks found - Success message -->
+                                <div style="background: #f0fdf4; border: 2px solid #22c55e; border-radius: 12px; padding: 40px 30px; text-align: center; margin: 20px 0;">
+                                    <div style="font-size: 48px; margin-bottom: 15px; color: #22c55e;">
+                                        <i class="fa-solid fa-check-circle"></i>
+                                    </div>
+                                    <h3 style="color: #15803d; font-size: 24px; margin-bottom: 10px;">All Branch IDs Recognized!</h3>
+                                    <p style="color: #166534; font-size: 16px; max-width: 500px; margin: 0 auto;">
+                                        All Branch IDs in the uploaded data are successfully matched with the masterdata branch profile.
+                                    </p>
+                                    <div style="margin-top: 20px; display: flex; gap: 15px; justify-content: center; flex-wrap: wrap;">
+                                        <span style="background: #dcfce7; color: #15803d; padding: 8px 16px; border-radius: 20px; font-size: 14px;">
+                                            <i class="fa-solid fa-check"></i> All branches verified
+                                        </span>
+                                        <span style="background: #dcfce7; color: #15803d; padding: 8px 16px; border-radius: 20px; font-size: 14px;">
+                                            <i class="fa-solid fa-database"></i> Masterdata up to date
+                                        </span>
+                                    </div>
+                                </div>
+                                
+                                <!-- Show summary stats even when no remarks -->
+                                <div class="summary-stats" style="margin-top: 20px;">
+                                    <span class="stat-item"><i class="fa-solid fa-check-circle" style="color: #22c55e;"></i> <strong>0</strong> unknown branch IDs</span>
+                                    <span class="stat-item"><i class="fa-solid fa-thumbs-up" style="color: #22c55e;"></i> All <strong><?= $total_rows ?></strong> rows processed successfully</span>
+                                    <?php if (!empty($skipped_data)): ?>
+                                        <span class="stat-item" style="background: #fde3b0; padding: 4px 12px; border-radius: 12px;">
+                                            <i class="fa-solid fa-ban" style="color: #b45309;"></i> 
+                                            <strong style="color: #b45309;"><?= count($skipped_data) ?></strong> skipped rows found
+                                        </span>
+                                    <?php endif; ?>
+                                    <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
+                                    <?php if (!empty($file_names)): ?>
+                                        <span class="stat-item">
+                                            <i class="fa-solid fa-file"></i> Processed files: <?= implode(', ', array_map('htmlspecialchars', $file_names)) ?>
+                                        </span>
+                                    <?php endif; ?>
+                                </div>
+                                
+                                <!-- Show a mini preview of the data -->
+                                <div style="margin-top: 20px; background: #f8fafc; border-radius: 8px; padding: 20px; border: 1px solid #e2e8f0;">
+                                    <p style="color: #64748b; text-align: center; font-size: 14px;">
+                                        <i class="fa-solid fa-info-circle"></i> All uploaded data has been successfully matched with the masterdata.
+                                        <br>Switch to <a href="?view=raw" style="color: #2563eb; text-decoration: none; font-weight: 600;">Detailed View</a> or 
+                                        <a href="?view=summary" style="color: #2563eb; text-decoration: none; font-weight: 600;">Summary View</a> to explore the data.
+                                    </p>
+                                </div>
+                            <?php endif; ?>
+
+                        <?php elseif ($view_mode === 'skipped'): ?>
+                            <!-- ===== SKIPPED ROWS VIEW ===== -->
+                            <?php if (!empty($skipped_data)): ?>
+                                <div style="background: #ffebeb; border: 1px solid #ffabab; border-radius: 8px; padding: 15px 20px; margin-bottom: 15px;">
+                                    <div style="display: flex; align-items: center; gap: 10px;">
+                                        <i class="fa-solid fa-ban" style="color: #dc2626; font-size: 20px;"></i>
+                                        <div>
+                                            <strong style="color: #dc2626;">Skipped Rows</strong>
+                                            <div style="font-size: 13px; color: #dc2626; margin-top: 2px;">
+                                                Rows excluded from the preview due to missing or invalid data.
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="summary-stats">
+                                    <span class="stat-item"><i class="fa-solid fa-ban"></i> <strong><?= count($skipped_data) ?></strong> skipped rows</span>
+                                    <?php if (!empty($remarks_data)): ?>
+                                        <span class="stat-item" style="background: #ffebeb; padding: 4px 12px; border-radius: 12px;">
+                                            <i class="fa-solid fa-triangle-exclamation" style="color: #dc2626;"></i> 
+                                            <strong style="color: #dc2626;"><?= count($remarks_data) ?></strong> unknown branch types also found
+                                        </span>
+                                    <?php endif; ?>
+                                    <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
+                                </div>
+
+                                <div class="table-wrapper">
+                                    <table class="preview-table skipped-table">
+                                        <thead>
+                                            <tr>
+                                                <th style="width: 60px;">Row # base on CSV file</th>
+                                                <th style="width: 28%;">Reason</th>
+                                                <?php foreach ($display_headers as $col_header): ?>
+                                                    <th><?= htmlspecialchars($col_header) ?></th>
                                                 <?php endforeach; ?>
                                             </tr>
-                                        <?php endforeach; ?>
-                                    </tbody>
-                                </table>
-                            </div>
-                        <?php else: ?>
-                            <!-- No skipped rows found - Success message -->
-                            <div style="background: #f0fdf4; border: 2px solid #22c55e; border-radius: 12px; padding: 40px 30px; text-align: center; margin: 20px 0;">
-                                <div style="font-size: 48px; margin-bottom: 15px; color: #22c55e;">
-                                    <i class="fa-solid fa-check-circle"></i>
+                                        </thead>
+                                        <tbody>
+                                            <?php foreach ($skipped_data as $item): ?>
+                                                <tr>
+                                                    <td style="text-align: center; color: #94a3b8;"><?= $item['row_number'] ?></td>
+                                                    <td>
+                                                        <span class="remarks-unknown-badge" style="background: #ffedd5; color: #c2410c; padding: 4px 10px; border-radius: 12px; font-size: 12px;">
+                                                            <i class="fa-solid fa-triangle-exclamation"></i> <?= htmlspecialchars($item['reason']) ?>
+                                                        </span>
+                                                    </td>
+                                                    <?php foreach ($item['raw_data'] as $val): ?>
+                                                        <td><?= htmlspecialchars($val ?? '') ?></td>
+                                                    <?php endforeach; ?>
+                                                </tr>
+                                            <?php endforeach; ?>
+                                        </tbody>
+                                    </table>
                                 </div>
-                                <h3 style="color: #15803d; font-size: 24px; margin-bottom: 10px;">No Rows Skipped!</h3>
-                                <p style="color: #166534; font-size: 16px; max-width: 500px; margin: 0 auto;">
-                                    All rows from the uploaded files were successfully processed. No rows were skipped due to missing or invalid data.
-                                </p>
-                                <div style="margin-top: 20px; display: flex; gap: 15px; justify-content: center; flex-wrap: wrap;">
-                                    <span style="background: #dcfce7; color: #15803d; padding: 8px 16px; border-radius: 20px; font-size: 14px;">
-                                        <i class="fa-solid fa-check"></i> All <?= $total_rows ?> rows processed
-                                    </span>
-                                    <span style="background: #dcfce7; color: #15803d; padding: 8px 16px; border-radius: 20px; font-size: 14px;">
-                                        <i class="fa-solid fa-file-lines"></i> Clean data set
-                                    </span>
+                            <?php else: ?>
+                                <!-- No skipped rows found - Success message -->
+                                <div style="background: #f0fdf4; border: 2px solid #22c55e; border-radius: 12px; padding: 40px 30px; text-align: center; margin: 20px 0;">
+                                    <div style="font-size: 48px; margin-bottom: 15px; color: #22c55e;">
+                                        <i class="fa-solid fa-check-circle"></i>
+                                    </div>
+                                    <h3 style="color: #15803d; font-size: 24px; margin-bottom: 10px;">No Rows Skipped!</h3>
+                                    <p style="color: #166534; font-size: 16px; max-width: 500px; margin: 0 auto;">
+                                        All rows from the uploaded files were successfully processed. No rows were skipped due to missing or invalid data.
+                                    </p>
+                                    <div style="margin-top: 20px; display: flex; gap: 15px; justify-content: center; flex-wrap: wrap;">
+                                        <span style="background: #dcfce7; color: #15803d; padding: 8px 16px; border-radius: 20px; font-size: 14px;">
+                                            <i class="fa-solid fa-check"></i> All <?= $total_rows ?> rows processed
+                                        </span>
+                                        <span style="background: #dcfce7; color: #15803d; padding: 8px 16px; border-radius: 20px; font-size: 14px;">
+                                            <i class="fa-solid fa-file-lines"></i> Clean data set
+                                        </span>
+                                    </div>
                                 </div>
-                            </div>
-                            
-                            <!-- Show summary stats even when no skipped rows -->
-                            <div class="summary-stats" style="margin-top: 20px;">
-                                <span class="stat-item"><i class="fa-solid fa-check-circle" style="color: #22c55e;"></i> <strong>0</strong> skipped rows</span>
-                                <span class="stat-item"><i class="fa-solid fa-thumbs-up" style="color: #22c55e;"></i> All <strong><?= $total_rows ?></strong> rows processed successfully</span>
-                                <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
-                                <?php if (!empty($file_names)): ?>
-                                    <span class="stat-item">
-                                        <i class="fa-solid fa-file"></i> Processed files: <?= implode(', ', array_map('htmlspecialchars', $file_names)) ?>
-                                    </span>
-                                <?php endif; ?>
-                            </div>
-                            
-                            <!-- Show a mini preview of the data -->
-                            <div style="margin-top: 20px; background: #f8fafc; border-radius: 8px; padding: 20px; border: 1px solid #e2e8f0;">
-                                <p style="color: #64748b; text-align: center; font-size: 14px;">
-                                    <i class="fa-solid fa-info-circle"></i> All uploaded data has been successfully processed with no skipped rows.
-                                    <br>Switch to <a href="?view=raw" style="color: #2563eb; text-decoration: none; font-weight: 600;">Detailed View</a> or 
-                                    <a href="?view=summary" style="color: #2563eb; text-decoration: none; font-weight: 600;">Summary View</a> to explore the data.
-                                </p>
-                            </div>
+                                
+                                <!-- Show summary stats even when no skipped rows -->
+                                <div class="summary-stats" style="margin-top: 20px;">
+                                    <span class="stat-item"><i class="fa-solid fa-check-circle" style="color: #22c55e;"></i> <strong>0</strong> skipped rows</span>
+                                    <span class="stat-item"><i class="fa-solid fa-thumbs-up" style="color: #22c55e;"></i> All <strong><?= $total_rows ?></strong> rows processed successfully</span>
+                                    <?php if (!empty($remarks_data)): ?>
+                                        <span class="stat-item" style="background: #ffebeb; padding: 4px 12px; border-radius: 12px;">
+                                            <i class="fa-solid fa-triangle-exclamation" style="color: #dc2626;"></i> 
+                                            <strong style="color: #dc2626;"><?= count($remarks_data) ?></strong> unknown branch types found
+                                        </span>
+                                    <?php endif; ?>
+                                    <span class="stat-item"><i class="fa-solid fa-files"></i> Files: <strong><?= count($file_names) ?></strong></span>
+                                    <?php if (!empty($file_names)): ?>
+                                        <span class="stat-item">
+                                            <i class="fa-solid fa-file"></i> Processed files: <?= implode(', ', array_map('htmlspecialchars', $file_names)) ?>
+                                        </span>
+                                    <?php endif; ?>
+                                </div>
+                                
+                                <!-- Show a mini preview of the data -->
+                                <div style="margin-top: 20px; background: #f8fafc; border-radius: 8px; padding: 20px; border: 1px solid #e2e8f0;">
+                                    <p style="color: #64748b; text-align: center; font-size: 14px;">
+                                        <i class="fa-solid fa-info-circle"></i> All uploaded data has been successfully processed with no skipped rows.
+                                        <br>Switch to <a href="?view=raw" style="color: #2563eb; text-decoration: none; font-weight: 600;">Detailed View</a> or 
+                                        <a href="?view=summary" style="color: #2563eb; text-decoration: none; font-weight: 600;">Summary View</a> to explore the data.
+                                    </p>
+                                </div>
+                            <?php endif; ?>
+
                         <?php endif; ?>
-
-                    <?php endif; ?>
+                    </div>
                 </div>
-
             </div>
         </div>
     </main>
@@ -2482,10 +2901,15 @@ $has_unknown_branches = !empty($remarks_data);
         fileListDisplay.style.color = '#16a34a';
     }
 
-    document.getElementById('resetBtn').addEventListener('click', function(e) {
-        if (!confirm('Are you sure you want to clear all uploaded data?')) {
-            e.preventDefault();
-        }
+    // Reset button handlers - show upload form again
+    document.querySelectorAll('#resetBtn, #resetBtnTop').forEach(function(btn) {
+        btn.addEventListener('click', function(e) {
+            if (!confirm('Are you sure you want to clear all uploaded data?')) {
+                e.preventDefault();
+                return;
+            }
+            // Allow the reset to proceed - page will reload with reset=1
+        });
     });
 
     setTimeout(() => {
@@ -2509,16 +2933,32 @@ $has_unknown_branches = !empty($remarks_data);
         }, 30000);
     });
 
-    // Prevent saving if there are unknown branches
+    // Prevent saving if there are unknown branches OR skipped rows
     document.addEventListener('DOMContentLoaded', function() {
         const saveForm = document.getElementById('saveForm');
         if (saveForm) {
             saveForm.addEventListener('submit', function(e) {
                 const hasUnknownBranches = <?= $has_unknown_branches ? 'true' : 'false' ?>;
-                if (hasUnknownBranches) {
+                const hasSkippedRows = <?= $has_skipped_rows ? 'true' : 'false' ?>;
+                
+                if (hasUnknownBranches || hasSkippedRows) {
                     e.preventDefault();
-                    alert('Cannot save to database. Please fix unknown branch types first.\n\nCheck the Remarks tab for details on which branch IDs are not in the masterdata.');
-                    window.location.href = '?view=remarks';
+                    let message = 'Cannot save to database. Please fix the following issues:\n\n';
+                    if (hasUnknownBranches) {
+                        message += '• ' + <?= count($remarks_data) ?> + ' unknown branch types (Remarks tab)\n';
+                    }
+                    if (hasSkippedRows) {
+                        message += '• ' + <?= count($skipped_data) ?> + ' skipped rows (Skipped Rows tab)\n';
+                    }
+                    message += '\nCheck the corresponding tabs for details.';
+                    alert(message);
+                    
+                    // Redirect to the most relevant tab
+                    <?php if ($has_unknown_branches): ?>
+                        window.location.href = '?view=remarks';
+                    <?php elseif ($has_skipped_rows): ?>
+                        window.location.href = '?view=skipped';
+                    <?php endif; ?>
                     return false;
                 }
             });
@@ -2555,7 +2995,7 @@ $has_unknown_branches = !empty($remarks_data);
 
     resetInactivityTimer();
 
-    // Add CSS for pagination links
+    // Add CSS for pagination links and Proceed button
     const style = document.createElement('style');
     style.textContent = `
         .pagination-link {
@@ -2643,12 +3083,10 @@ $has_unknown_branches = !empty($remarks_data);
             background: #cbd5e1 !important;
         }
 
-        .btn-skip:hover {
-            background: #750000 !important;
-        }
-
-        .btn-replace:hover {
-            background: #b91c1c !important;
+        .btn-proceed:hover {
+            background: #d97706 !important;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.4);
         }
     `;
     document.head.appendChild(style);
