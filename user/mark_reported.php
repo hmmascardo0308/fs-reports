@@ -341,7 +341,7 @@ if (!$all_zones_present) {
                                         </td>
                                         <td style="text-align: center;">
                                             <?php if ($row['reported_status'] === 'Reported'): ?>
-                                                <span class="badge-reported" style="background: #28a745; color: white; padding: 5px 12px; border-radius: 20px; font-weight: bold;">
+                                                <span class="badge-reported" style="background: #28a745; color: white; padding: 5px 12px; border-radius: 20px; font-weight: bold; font-size: 12px;">
                                                     <i class="fas fa-check-circle"></i> Reported
                                                 </span>
                                             <?php else: ?>

@@ -369,9 +369,6 @@ $result = $stmt->get_result();
                         <i class="fas fa-unlock-alt"></i> Unlock
                     </button>
                 </div>
-
-            
-
                 <!-- Data Table -->
                 <div class="table-container">
                     <table>
@@ -385,7 +382,7 @@ $result = $stmt->get_result();
                                 <th><i class="fa-solid fa-database"></i> Record Count</th>
                                 <th><i class="fa-solid fa-user"></i> Uploaded By</th>
                                 <th><i class="fa-solid fa-circle-check"></i> Status</th>
-                                <th><i class="fa-solid fa-list-check"></i> Additional Status</th>
+                                <th><i class="fa-solid fa-list-check"></i> Void Status</th>
                                 <th><i class="fa-solid fa-flag"></i> Reported Status</th>
                                 <th><i class="fa-solid fa-user-check"></i> Reported By / Date</th>
                                 <th><i class="fa-solid fa-unlock-keyhole"></i> Unlocked By / Date</th>

@@ -247,7 +247,7 @@ $result = $stmt->get_result();
                     <button type="submit" name="action_type" value="lock" class="btn-lock" onclick="return confirmLockAction('lock')">
                         <i class="fas fa-lock"></i> Lock
                     </button>
-                    <a href="unlock_period.php" class="btn-unlock" style="text-decoration: none;"><i class="fas fa-unlock-alt"></i> Unlock</a>
+                    <a href="unlock_period_raw.php" class="btn-unlock" style="text-decoration: none;"><i class="fas fa-unlock-alt"></i> Unlock</a>
                 </div>
 
                 <!-- Data Table -->
@@ -261,7 +261,7 @@ $result = $stmt->get_result();
                                 <th><i class="fa-solid fa-upload"></i> Uploaded Date</th>
                                 <th><i class="fa-solid fa-table-list"></i> Record Count</th>
                                 <th><i class="fa-solid fa-circle-check"></i> Status</th>
-                                <th><i class="fa-solid fa-clipboard-check"></i> Additional Status</th>
+                                <th><i class="fa-solid fa-clipboard-check"></i> Void Status</th>
                                 <th><i class="fa-solid fa-lock"></i> Locked By / Date</th>
                                 <th style="text-align: center;">
                                     <i class="fa-solid fa-gears"></i> Action

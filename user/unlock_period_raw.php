@@ -28,7 +28,7 @@ $search_region = isset($_GET['search_region']) ? trim($_GET['search_region']) : 
 $message = '';
 $message_type = '';
 
-// Handle Unlock Action
+// Handle Unlock Action - Unlock by ZONE only
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action_type'])) {
     if (isset($_POST['selected_groups']) && is_array($_POST['selected_groups'])) {
         $success_count = 0;
@@ -37,26 +37,26 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action_type'])) {
         $total_selected = count($_POST['selected_groups']);
         $action = $_POST['action_type']; // 'unlock'
         
-        // Prepare check statement
-        $check_stmt = $conn->prepare("SELECT status, status_void, reported_status FROM fs_raw_data WHERE region <=> ? AND mainzone <=> ? AND zone <=> ? AND transaction_type <=> ? AND uploaded_date <=> ? LIMIT 1");
+        // Prepare check statement - Check by zone only
+        $check_stmt = $conn->prepare("SELECT status, status_void, reported_status FROM fs_raw_data WHERE mainzone <=> ? AND zone <=> ? LIMIT 1");
         $update_stmt = null;
 
         if ($action === 'unlock') {
-            // Unlock action: set status = 'Unlocked', unlock_by, unlock_date
+            // Unlock action: set status = 'Unlocked', unlock_by, unlock_date for ALL records in the zone
             $new_status = 'Unlocked';
-            $update_stmt = $conn->prepare("UPDATE fs_raw_data SET status = ?, unlock_by = ?, unlock_date = ? WHERE region <=> ? AND mainzone <=> ? AND zone <=> ? AND transaction_type <=> ? AND uploaded_date <=> ?");
+            $update_stmt = $conn->prepare("UPDATE fs_raw_data SET status = ?, unlock_by = ?, unlock_date = ? WHERE mainzone <=> ? AND zone <=> ?");
         }
 
         if ($update_stmt) {
             foreach ($_POST['selected_groups'] as $group_json) {
                 $parts = json_decode($group_json, true);
-                if (is_array($parts) && count($parts) === 5) {
+                if (is_array($parts) && count($parts) === 2) {
                     
-                    // Check current status
+                    // Check current status for this zone
                     $current_status = null;
                     $current_status_void = null;
                     $current_reported_status = null;
-                    $check_stmt->bind_param("sssss", $parts[0], $parts[1], $parts[2], $parts[3], $parts[4]);
+                    $check_stmt->bind_param("ss", $parts[0], $parts[1]);
                     $check_stmt->execute();
                     $check_stmt->bind_result($current_status, $current_status_void, $current_reported_status);
                     $check_stmt->fetch();
@@ -82,15 +82,13 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action_type'])) {
 
                     $current_datetime = date('Y-m-d H:i:s');
                     
-                    $update_stmt->bind_param("ssssssss", 
+                    // Update ALL records in this zone - 5 parameters for 5 placeholders
+                    $update_stmt->bind_param("sssss", 
                         $new_status,           // status
                         $username,              // unlock_by
                         $current_datetime,      // unlock_date
-                        $parts[0],              // region
-                        $parts[1],              // mainzone
-                        $parts[2],              // zone
-                        $parts[3],              // transaction_type
-                        $parts[4]               // uploaded_date
+                        $parts[0],              // mainzone
+                        $parts[1]               // zone
                     );
                     
                     if ($update_stmt->execute()) {
@@ -105,19 +103,19 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action_type'])) {
         
         // Build appropriate message
         if ($success_count > 0) {
-            $message = "$success_count group(s) unlocked successfully.";
+            $message = "$success_count zone(s) unlocked successfully.";
             if ($reported_count > 0) {
-                $message .= " $reported_count group(s) skipped because they are marked as Reported.";
+                $message .= " $reported_count zone(s) skipped because they are marked as Reported.";
             }
             if ($already_processed_count > 0) {
-                $message .= " $already_processed_count group(s) skipped because they are already unlocked or void.";
+                $message .= " $already_processed_count zone(s) skipped because they are already unlocked or void.";
             }
             $message_type = "success";
         } elseif ($reported_count == $total_selected) {
-            $message = "Cannot unlock transactions that are marked as Reported. Please unmark them as Reported first.";
+            $message = "Cannot unlock zones that are marked as Reported.";
             $message_type = "error";
         } elseif ($already_processed_count == $total_selected) {
-            $message = "Transactions are already unlocked, void, or not locked. No changes made.";
+            $message = "Zones are already unlocked, void, or not locked. No changes made.";
             $message_type = "error";
         } else {
             $message = "No records updated.";
@@ -138,15 +136,14 @@ if ($selected_month && !preg_match('/^\d{4}-\d{2}$/', $selected_month)) {
 $start_date = $selected_month . '-01';
 $end_date = date('Y-m-t', strtotime($start_date));
 
-// Fetch filtered data with lock/unlock information
-$query = "SELECT DISTINCT 
-            region,
+// Fetch filtered data - Group by zone only (not by branch type or uploaded date)
+$query = "SELECT 
             mainzone, 
-            zone, 
-            transaction_type,
-            uploaded_by, 
-            uploaded_date,
+            zone,
             COUNT(*) as record_count,
+            GROUP_CONCAT(DISTINCT transaction_type ORDER BY transaction_type SEPARATOR '|') as transaction_types,
+            GROUP_CONCAT(DISTINCT DATE(uploaded_date) ORDER BY uploaded_date SEPARATOR '|') as uploaded_dates,
+            GROUP_CONCAT(DISTINCT uploaded_by ORDER BY uploaded_by SEPARATOR '|') as uploaded_bys,
             MAX(status) as status,
             MAX(status_void) as status_void,
             MAX(locked_by) as locked_by,
@@ -157,19 +154,12 @@ $query = "SELECT DISTINCT
             MAX(reported_status_by) as reported_status_by,
             MAX(reported_status_date) as reported_status_date
           FROM fs_raw_data 
-          WHERE transaction_month BETWEEN ? AND ?";
+          WHERE transaction_month BETWEEN ? AND ?
+          GROUP BY mainzone, zone
+          ORDER BY mainzone, zone";
 
-if (!empty($search_region)) {
-    $query .= " AND region LIKE ?";
-    $query .= " GROUP BY region, mainzone, zone, transaction_type, uploaded_by, uploaded_date ORDER BY mainzone, zone, region,uploaded_by, uploaded_date";
-    $stmt = $conn->prepare($query);
-    $search_param = "%" . $search_region . "%";
-    $stmt->bind_param("sss", $start_date, $end_date, $search_param);
-} else {
-    $query .= " GROUP BY region, mainzone, zone, transaction_type, uploaded_by,uploaded_date ORDER BY mainzone, zone, region,uploaded_by, uploaded_date";
-    $stmt = $conn->prepare($query);
-    $stmt->bind_param("ss", $start_date, $end_date);
-}
+$stmt = $conn->prepare($query);
+$stmt->bind_param("ss", $start_date, $end_date);
 
 $stmt->execute();
 $result = $stmt->get_result();
@@ -184,48 +174,6 @@ $result = $stmt->get_result();
     <link rel="icon" href="../images/MLW%20Logo.png" type="image/png"/>
     <link rel="stylesheet" href="css/lock_unlock.css?v=<?= time(); ?>">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-    
-    <style>
-        .badge-branch {
-            background-color: #e0f2fe;
-            color: #003450;
-            border: 1px solid #00456b;
-        }
-        .badge-showroom {
-            background-color: #fef3c7;
-            color: #702b00;
-            border: 1px solid #6c5600;
-        }
-        .badge-reported {
-            background-color: #d4edda;
-            color: #155724;
-            border: 1px solid #28a745;
-            border-radius: 4px;
-            padding: 8px;
-            font-size: 12px;
-        }
-        .badge-not-reported {
-            background-color: #f8d7da;
-            color: #721c24;
-            border: 1px solid #dc3545;
-            border-radius: 4px;
-            padding: 8px;
-            font-size: 12px;
-        }
-        .badge-reported-blocked {
-            background-color: #fff3cd;
-            color: #856404;
-            border: 1px solid #ffc107;
-        }
-        /* Disable checkbox style for reported items */
-        .row-checkbox:disabled {
-            cursor: not-allowed;
-            opacity: 0.5;
-        }
-        .reported-row {
-            background-color: #fffdf0 !important;
-        }
-    </style>
 </head>
 <body>
 
@@ -269,20 +217,9 @@ $result = $stmt->get_result();
                         >
                     </div>
                     
-                    <div class="filter-group">
-                        <label for="search_region"><i class="fas fa-search"></i> Search Region</label>
-                        <input 
-                            type="text" 
-                            name="search_region" 
-                            id="search_region" 
-                            value="<?php echo htmlspecialchars($search_region); ?>" 
-                            placeholder="All Region..."
-                        >
-                    </div>
-
                     <div class="filter-group action-buttons">
                         <button type="submit"><i class="fas fa-filter"></i> Apply Filter</button>
-                        <a href="unlock_period_raw.php" class="reset-btn" style="padding: 8px 20px; text-decoration: none; color: white; border-radius: 4px;"><i class="fa-solid fa-rotate"></i> Clear</a>
+                        <a href="unlock_period_raw.php" class="reset-btn" style="padding: 8px 20px; text-decoration: none; color: white; border-radius: 4px; background-color: #6c757d;"><i class="fa-solid fa-rotate"></i> Clear</a>
                     </div>
                 </form>
             </div>
@@ -290,7 +227,6 @@ $result = $stmt->get_result();
             <!-- Summary Statistics -->
             <?php 
             $total_records = 0;
-            $unique_regions = [];
             $unique_mainzones = [];
             $unique_zones = [];
             $unique_types = [];
@@ -298,15 +234,21 @@ $result = $stmt->get_result();
             $unlocked_count = 0;
             $reported_count = 0;
             $not_reported_count = 0;
+            $rows_data = [];
             
             if ($result && $result->num_rows > 0) {
-                $result->data_seek(0); // Reset pointer
+                $result->data_seek(0);
                 while ($row = $result->fetch_assoc()) {
+                    $rows_data[] = $row;
                     $total_records += $row['record_count'];
-                    $unique_regions[$row['region']] = true;
                     $unique_mainzones[$row['mainzone']] = true;
                     $unique_zones[$row['zone']] = true;
-                    $unique_types[$row['transaction_type']] = true;
+                    
+                    // Split combined transaction types
+                    $types = explode('|', $row['transaction_types']);
+                    foreach ($types as $type) {
+                        $unique_types[trim($type)] = true;
+                    }
                     
                     if ($row['status'] === 'Locked') {
                         $locked_count++;
@@ -320,7 +262,6 @@ $result = $stmt->get_result();
                         $not_reported_count++;
                     }
                 }
-                $result->data_seek(0); // Reset pointer again for display
             }
             ?>
             
@@ -328,10 +269,6 @@ $result = $stmt->get_result();
                 <div class="stat-item">
                     <div class="stat-label">Total Records</div>
                     <div class="stat-value"><?php echo number_format($total_records); ?></div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-label">Regions</div>
-                    <div class="stat-value"><?php echo count($unique_regions); ?></div>
                 </div>
                 <div class="stat-item">
                     <div class="stat-label">Main Zones</div>
@@ -346,31 +283,33 @@ $result = $stmt->get_result();
                     <div class="stat-value"><?php echo count($unique_types); ?></div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">Locked Groups</div>
+                    <div class="stat-label">Locked Zones</div>
                     <div class="stat-value" style="color: #dc3545;"><?php echo $locked_count; ?></div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">Unlocked Groups</div>
+                    <div class="stat-label">Unlocked Zones</div>
                     <div class="stat-value" style="color: #28a745;"><?php echo $unlocked_count; ?></div>
                 </div>
                 <div class="stat-item">
-                    <div class="stat-label">Reported Groups</div>
+                    <div class="stat-label">Reported Zones</div>
                     <div class="stat-value" style="color: #155724;"><?php echo $reported_count; ?></div>
                 </div>
             </div>
 
             <form method="POST" id="actionForm">
                 <div class="action-buttons-container">
-                    <a href="mark_reported.php" class="btn-report" style="text-decoration: none;"><i class="fas fa-check-circle"></i> Mark as Reported</a>
+                    <a href="mark_reported.php" class="btn-report" style="text-decoration: none;">
+                        <i class="fas fa-check-circle"></i> Mark as Reported
+                    </a>
 
-                    <a href="lock_period_raw.php" class="btn-lock" style="text-decoration: none;"><i class="fas fa-lock"></i> Lock</a>
+                    <a href="lock_period_raw.php" class="btn-lock" style="text-decoration: none; padding: 10px 20px; background-color: #dc3545; color: white; border-radius: 4px; display: inline-block;">
+                        <i class="fas fa-lock"></i> Lock
+                    </a>
 
-                    <button type="submit" name="action_type" value="unlock" class="btn-unlock" onclick="return confirmAction('unlock')">
+                    <button type="submit" name="action_type" value="unlock" class="btn-unlock" onclick="return confirmAction('unlock')" >
                         <i class="fas fa-unlock-alt"></i> Unlock
                     </button>
                 </div>
-
-            
 
                 <!-- Data Table -->
                 <div class="table-container">
@@ -379,13 +318,12 @@ $result = $stmt->get_result();
                             <tr>
                                 <th><i class="fa-solid fa-layer-group"></i> Main Zone</th>
                                 <th><i class="fa-solid fa-map"></i> Zone</th>
-                                <th><i class="fa-solid fa-earth-asia"></i> Region</th>
-                                <th><i class="fa-solid fa-code-branch"></i> Branch Type</th>
-                                <th><i class="fa-solid fa-calendar-days"></i> Uploaded Date</th>
+                                <th><i class="fa-solid fa-code-branch"></i> Branch Types</th>
+                                <th><i class="fa-solid fa-calendar-days"></i> Uploaded Dates</th>
                                 <th><i class="fa-solid fa-database"></i> Record Count</th>
                                 <th><i class="fa-solid fa-user"></i> Uploaded By</th>
                                 <th><i class="fa-solid fa-circle-check"></i> Status</th>
-                                <th><i class="fa-solid fa-list-check"></i> Additional Status</th>
+                                <th><i class="fa-solid fa-list-check"></i> Void Status</th>
                                 <th><i class="fa-solid fa-flag"></i> Reported Status</th>
                                 <th><i class="fa-solid fa-user-check"></i> Reported By / Date</th>
                                 <th><i class="fa-solid fa-unlock-keyhole"></i> Unlocked By / Date</th>
@@ -397,26 +335,69 @@ $result = $stmt->get_result();
                             </tr>
                         </thead>
                         <tbody>
-                            <?php if ($result && $result->num_rows > 0): ?>
-                                <?php while ($row = $result->fetch_assoc()): 
+                            <?php if (!empty($rows_data)): ?>
+                                <?php 
+                                $current_mainzone = '';
+                                foreach ($rows_data as $row): 
                                     $is_reported = ($row['reported_status'] === 'Reported');
                                     $is_locked = ($row['status'] === 'Locked');
                                     $can_unlock = $is_locked && !$is_reported;
+                                    
+                                    // Display mainzone headers for grouping
+                                    $show_mainzone = ($current_mainzone !== $row['mainzone']);
+                                    if ($show_mainzone) {
+                                        $current_mainzone = $row['mainzone'];
+                                    }
+                                    
+                                    // Split and display branch types
+                                    $types = explode('|', $row['transaction_types']);
+                                    $type_badges = '';
+                                    foreach ($types as $type) {
+                                        $type = trim($type);
+                                        $type_class = 'badge';
+                                        if ($type === 'Branch') {
+                                            $type_class .= ' badge-branch';
+                                        } elseif ($type === 'Showroom') {
+                                            $type_class .= ' badge-showroom';
+                                        } elseif ($type === 'Entity') {
+                                            $type_class .= ' badge-entity';
+                                        } else {
+                                            $type_class .= ' badge-secondary';
+                                        }
+                                        $type_badges .= '<span class="' . $type_class . '">' . htmlspecialchars($type) . '</span> ';
+                                    }
+                                    
+                                    // Split uploaded dates
+                                    $uploaded_dates = explode('|', $row['uploaded_dates']);
+                                    $dates_display = '';
+                                    foreach ($uploaded_dates as $date) {
+                                        $dates_display .= date('M d, Y', strtotime(trim($date))) . '<br>';
+                                    }
+                                    
+                                    // Split uploaded by
+                                    $uploaded_bys = explode('|', $row['uploaded_bys']);
+                                    $bys_display = '';
+                                    foreach ($uploaded_bys as $by) {
+                                        $bys_display .= htmlspecialchars(trim($by)) . '<br>';
+                                    }
                                 ?>
                                     <tr class="<?php echo $is_reported ? 'reported-row' : ''; ?>">
-                                        <td style="text-align: center;"><span class="badge badge-primary"><?php echo htmlspecialchars($row['mainzone'] ?: 'N/A'); ?></span></td>
-                                        <td><?php echo htmlspecialchars($row['zone'] ?: 'N/A'); ?></td>
-                                        <td><?php echo htmlspecialchars($row['region'] ?: 'N/A'); ?></td>
-                                        <td>
-                                            <?php 
-                                            $type = $row['transaction_type'] ?? '';
-                                            $type_class = ($type === 'Branch') ? 'badge-branch' : (($type === 'Showroom') ? 'badge-showroom' : '');
-                                            ?>
-                                            <span class="badge <?= $type_class ?>"><?= htmlspecialchars($type ?: 'N/A') ?></span>
+                                        <td style="text-align: center;">
+                                            <?php if ($show_mainzone): ?>
+                                                <span class="badge badge-primary"><?php echo htmlspecialchars($row['mainzone'] ?: 'N/A'); ?></span>
+                                            <?php endif; ?>
                                         </td>
-                                        <td><?php echo date('F d, Y h:i:s A', strtotime($row['uploaded_date'])); ?></td>
-                                        <td style="text-align: center;"><strong><?php echo number_format($row['record_count']); ?></strong></td>
-                                        <td><?php echo htmlspecialchars($row['uploaded_by'] ?: 'N/A'); ?></td>
+                                        <td>
+                                            <strong><?php echo htmlspecialchars($row['zone'] ?: 'N/A'); ?></strong>
+                                        </td>
+                                        <td>
+                                            <?php echo $type_badges; ?>
+                                        </td>
+                                        <td><?php echo $dates_display; ?></td>
+                                        <td style="text-align: center;">
+                                            <span class="record-count-badge"><?php echo number_format($row['record_count']); ?></span>
+                                        </td>
+                                        <td><?php echo $bys_display; ?></td>
 
                                         <td style="text-align: center;">
                                             <?php if ($row['status'] === 'Locked'): ?>
@@ -429,7 +410,7 @@ $result = $stmt->get_result();
                                         </td>
                                         <td style="text-align: center;">
                                             <?php if ($row['status_void'] === 'Void'): ?>
-                                                <span class="badge-void" style="color: red; font-weight: bold;">Void</span>
+                                                <span class="badge-void"><i class="fas fa-ban"></i> Void</span>
                                             <?php else: ?>
                                                 <span>-</span>
                                             <?php endif; ?>
@@ -438,7 +419,7 @@ $result = $stmt->get_result();
                                             <?php if ($row['reported_status'] === 'Reported'): ?>
                                                 <span class="badge-reported"><i class="fas fa-check-circle"></i> Reported</span>
                                             <?php else: ?>
-                                                <span class="badge-not-reported"><i class="fas fa-times-circle"></i> Not Reported</span>
+                                                <span class="badge-not-reported" style="font-style:italic; font-size: 12px; color:#6c757d"><i class="fas fa-times-circle"></i> Not Reported</span>
                                             <?php endif; ?>
                                         </td>
                                         <td>
@@ -462,32 +443,36 @@ $result = $stmt->get_result();
                                             <?php endif; ?>
                                         </td>
                                         <td style="text-align: center;">
-                                            <input type="checkbox" 
-                                                   name="selected_groups[]" 
-                                                   class="row-checkbox" 
-                                                   value="<?php echo htmlspecialchars(json_encode([
-                                                        $row['region'],
-                                                        $row['mainzone'], 
-                                                        $row['zone'], 
-                                                        $row['transaction_type'], 
-                                                        $row['uploaded_date']
-                                                    ])); ?>"
-                                                   data-status="<?php echo $row['status']; ?>"
-                                                   data-void="<?php echo htmlspecialchars($row['status_void'] ?? ''); ?>"
-                                                   data-reported="<?php echo htmlspecialchars($row['reported_status'] ?? ''); ?>"
-                                                   <?php echo $is_reported ? 'disabled' : ''; ?>
-                                                   <?php echo $is_reported ? 'title="Cannot unlock: This transaction is marked as Reported"' : ''; ?>
-                                                   onchange="updateSelectionCount()">
-                                            <?php if ($is_reported): ?>
-                                                <br><small style="color: #856404; font-size: 9px;">Reported</small>
+                                            <?php if ($can_unlock): ?>
+                                                <input type="checkbox" 
+                                                       name="selected_groups[]" 
+                                                       class="row-checkbox" 
+                                                       value="<?php echo htmlspecialchars(json_encode([
+                                                            $row['mainzone'], 
+                                                            $row['zone']
+                                                        ])); ?>"
+                                                       data-status="<?php echo $row['status']; ?>"
+                                                       data-void="<?php echo htmlspecialchars($row['status_void'] ?? ''); ?>"
+                                                       data-reported="<?php echo htmlspecialchars($row['reported_status'] ?? ''); ?>"
+                                                       onchange="updateSelectionCount()">
+                                            <?php else: ?>
+                                                <span style="color: #6c757d; font-size: 11px;">
+                                                    <?php if ($is_reported): ?>
+                                                        <i class="fas fa-lock" style="color: #856404;"></i> Reported
+                                                    <?php elseif (!$is_locked): ?>
+                                                        <i class="fas fa-unlock" style="color: #28a745;"></i> Unlocked
+                                                    <?php else: ?>
+                                                        <i class="fas fa-ban" style="color: #dc3545;"></i> Void
+                                                    <?php endif; ?>
+                                                </span>
                                             <?php endif; ?>
                                         </td>
                                     </tr>
-                                <?php endwhile; ?>
+                                <?php endforeach; ?>
                             <?php else: ?>
                                 <tr>
-                                    <td colspan="13" class="no-data">
-                                        <i class="fas fa-inbox" style="font-size: 48px; color: #dee2e6; margin-bottom: 10px;"></i>
+                                    <td colspan="12" class="no-data">
+                                        <i class="fas fa-inbox"></i>
                                         <br>
                                         No uploaded reports found for <?php echo date('F Y', strtotime($selected_month . '-01')); ?>.
                                     </td>
@@ -499,7 +484,6 @@ $result = $stmt->get_result();
             </form>
         </div>
     </main>
-
 
     <script>
         // Auto-hide modal after 3 seconds and redirect
@@ -530,7 +514,6 @@ $result = $stmt->get_result();
         function updateSelectionCount() {
             const checkboxes = document.querySelectorAll('.row-checkbox:checked');
             const total = document.querySelectorAll('.row-checkbox').length;
-            // You can add a counter display here if needed
         }
 
         // Toggle all checkboxes (only enabled ones)
@@ -566,7 +549,7 @@ $result = $stmt->get_result();
             const checkboxes = document.querySelectorAll('.row-checkbox:checked');
             
             if (checkboxes.length === 0) {
-                alert('Please select at least one item to ' + action + '.');
+                alert('Please select at least one zone to ' + action + '.');
                 return false;
             }
 
@@ -584,18 +567,19 @@ $result = $stmt->get_result();
             });
 
             if (hasVoid && action === 'unlock') {
-                alert("These transactions are already void and can't be edited (unlock) anymore.");
+                alert("These zones are already void and can't be edited (unlock) anymore.");
                 return false;
             }
 
             if (hasReported && action === 'unlock') {
-                alert("Cannot unlock transactions that are marked as 'Reported'. Please unmark them as Reported first.");
+                alert("Cannot unlock zones that are marked as 'Reported'.");
                 return false;
             }
             
-            return confirm('Are you sure you want to ' + action + ' the selected ' + checkboxes.length + ' group(s)?');
+            return confirm('Are you sure you want to ' + action + ' the selected ' + checkboxes.length + ' zone(s)? This will unlock ALL records in these zones.');
         }
     </script>
+    
 <?php include '../footer.php'; ?>
     
 </body>
