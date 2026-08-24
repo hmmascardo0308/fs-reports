@@ -1,4 +1,3 @@
-
 <?php
 session_start();
 require_once __DIR__ . '/../config/config.php';
@@ -1107,14 +1106,15 @@ if (!empty($selected_regions)) {
                 });
             });
 
-            // Collect summary rows with sort orders 6, 8, 11 (these are the total rows)
+            // Collect summary rows with sort orders 6, 8, 11.
+            // These are direct total rows, NOT GL detail rows.
+            // Therefore sub_order and gl_description_comparative MUST remain NULL.
             document.querySelectorAll('.report-tbody tr.summary-row[data-sort-order]').forEach(row => {
                 const sortOrder = row.dataset.sortOrder || '';
-                // Include 6, 8, 11 from summary rows (the total rows)
+
                 if (['6', '8', '11'].includes(sortOrder)) {
-                    // Summary rows don't have INJ-2 flag, they are already raw totals
                     adjustments.push({
-                        sort_order: parseInt(sortOrder) || 0,
+                        sort_order: parseInt(sortOrder, 10),
                         description: row.dataset.description || '',
                         sub_order: null,
                         gl_description_comparative: null,

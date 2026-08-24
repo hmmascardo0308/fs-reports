@@ -513,7 +513,7 @@ $comps_by_desc_json = json_encode($comps_by_desc);
         <div style="margin-top: 20px; text-align: right; display: flex; gap: 10px; justify-content: center;">
             <a href="comparative_report_original.php" style="text-decoration: none;" class="btn-preview"><i class="fa-solid fa-file"></i> Comparative Report (Original Data)</a>
             <a href="manual_adjustment_new.php" style="text-decoration: none;" class="btn-preview"><i class="fa-solid fa-file"></i> Comparative Report (Manual Adjustment)</a>
-            <a href="consolidated.php" style="text-decoration: none;" class="btn-preview"><i class="fa-solid fa-file"></i> Consolidated Report (Per Zone)</a>
+            <a href="consolidated_with_adjustment.php" style="text-decoration: none;" class="btn-preview"><i class="fa-solid fa-file"></i> Consolidated Report (Per Zone)</a>
         </div>
         </div>
 

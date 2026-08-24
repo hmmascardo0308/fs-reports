@@ -31,6 +31,9 @@ $user_type = $_SESSION['user_type'] ?? "unknown";
 $previewTable = '';
 $tempFilePaths = $_POST['temp_file_paths'] ?? [];
 
+// Get the selected month from POST - NO DEFAULT VALUE
+$selectedMonth = $_POST['transaction_month'] ?? '';
+
 function stripCsvBom(mixed $value): mixed
 {
     if (is_string($value)) {
@@ -158,12 +161,24 @@ function extractNumericAmount(mixed $value): float {
 
 // --- STAGE 1: UPLOAD & PREVIEW ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
-    $transactionMonth = $_POST['transaction_month'] ?? '';
-    $transactionYear = $_POST['transaction_year'] ?? '';
+    // Get the combined month input
+    $transactionMonthYear = $_POST['transaction_month'] ?? '';
+    $transactionMonth = '';
+    $transactionYear = '';
+    
+    // Parse the combined month input (format: YYYY-MM)
+    if (!empty($transactionMonthYear)) {
+        $parts = explode('-', $transactionMonthYear);
+        if (count($parts) === 2) {
+            $transactionYear = $parts[0];
+            $transactionMonth = $parts[1];
+        }
+    }
+    
     $file = $_FILES['csv_file'];
 
-    if (!empty($transactionMonth) && empty($transactionYear)) {
-        $uploadMessage = '<div class="error">Transaction Year is required when Transaction Month is selected.</div>';
+    if (empty($transactionMonthYear)) {
+        $uploadMessage = '<div class="error">⚠️ Please select a Transaction Month.</div>';
     } else {
         $fileList = [];
         if (is_array($file['name'])) {
@@ -298,29 +313,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                     $descriptionCol = 2;
                 }
 
-                // Find where NET Income appears - but keep processing until we find it
-                $cutoffRow = count($rows) - 1;
-                $foundNetIncome = false;
+                // Find NET Income row - we'll use it for display but NOT as cutoff
+                $netIncomeRowIndex = null;
                 foreach ($rows as $rowIndex => $row) {
                     foreach ($row as $cell) {
                         if (stripos(trim((string)$cell), 'NET Income') !== false) {
-                            $cutoffRow = $rowIndex - 1; // Stop BEFORE NET Income
-                            $foundNetIncome = true;
+                            $netIncomeRowIndex = $rowIndex;
                             break 2;
                         }
                     }
                 }
 
-                // Build preview
+                // Build preview - include ALL rows including NET Income
                 $previewTable .= '<div class="file-preview-container">';
                 $previewTable .= '<h4 class="file-name">📄 Preview: ' . htmlspecialchars($singleFile['name']) . '</h4>';
                 
                 // Metadata section - show cleaned values
                 $previewTable .= '<div class="metadata-section" style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #4a90d9;">';
                 $previewTable .= '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px;">';
-                $previewTable .= '<div><strong>🏷️ Region ID:</strong> <span style="color: #2d3748;">' . htmlspecialchars($regionID) . '</span></div>';
-                $previewTable .= '<div><strong>📍 Region Description:</strong> <span style="color: #2d3748;">' . htmlspecialchars($regionDescription) . '</span></div>';
-                $previewTable .= '<div><strong>📌 Area:</strong> <span style="color: #2d3748;">' . htmlspecialchars($area) . '</span></div>';
+                $previewTable .= '<div><strong><i class="fa-solid fa-tag"></i> Region ID:</strong> <span style="color: #2d3748;">' . htmlspecialchars($regionID) . '</span></div>';
+                $previewTable .= '<div><strong><i class="fa-solid fa-location-pin"></i> Region Description:</strong> <span style="color: #2d3748;">' . htmlspecialchars($regionDescription) . '</span></div>';
+                $previewTable .= '<div><strong><i class="fa-solid fa-location-arrow"></i> Area:</strong> <span style="color: #2d3748;">' . htmlspecialchars($area) . '</span></div>';
+                if ($netIncomeRowIndex !== null) {
+                    $previewTable .= '<div><strong><i class="fa-solid fa-money-bill"></i> NET Income found at row:</strong> <span style="color: #2d3748; font-weight: bold;">' . ($netIncomeRowIndex + 1) . '</span></div>';
+                }
                 $previewTable .= '</div>';
                 $previewTable .= '</div>';
 
@@ -338,11 +354,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                     $previewTable .= '</tr></thead>';
                 }
 
-                // Show data rows
+                // Show data rows - include ALL rows from dataStartRow to the end
                 $previewTable .= '<tbody>';
                 $rowCount = 0;
-                for ($rowIndex = $dataStartRow; $rowIndex <= $cutoffRow && $rowIndex < count($rows); $rowIndex++) {
+                $dataRowCount = 0;
+                $netIncomeRowDisplayed = false;
+                
+                for ($rowIndex = $dataStartRow; $rowIndex < count($rows); $rowIndex++) {
                     $row = $rows[$rowIndex];
+                    
+                    // Check if this is the NET Income row
+                    $isNetIncome = false;
+                    foreach ($row as $cell) {
+                        if (stripos(trim((string)$cell), 'NET Income') !== false) {
+                            $isNetIncome = true;
+                            break;
+                        }
+                    }
                     
                     $isEmpty = true;
                     foreach ($row as $cell) {
@@ -356,7 +384,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                     }
 
                     $rowCount++;
-                    $previewTable .= '<tr>';
+                    if (!$isNetIncome) {
+                        $dataRowCount++;
+                    }
+                    
+                    // Apply special styling for NET Income row
+                    $rowStyle = '';
+                    if ($isNetIncome) {
+                        $rowStyle = ' style="background: #fff5f5; font-weight: bold; border-top: 3px solid #e53e3e;"';
+                        $netIncomeRowDisplayed = true;
+                    }
+                    
+                    $previewTable .= '<tr' . $rowStyle . '>';
                     
                     foreach ($row as $colKey => $cell) {
                         $style = 'padding: 8px 12px; border: 1px solid #e2e8f0;';
@@ -367,6 +406,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                         if ($colKey == $glCodeCol && !empty($cellValue) && is_numeric($cellValue)) {
                             $style .= ' font-weight: 500; color: #2b6cb0;';
                         }
+                        if ($isNetIncome) {
+                            $style .= ' background: #fff5f5;';
+                            if (is_numeric(str_replace(',', '', $cellValue))) {
+                                $style .= ' color: #e53e3e; font-weight: bold;';
+                            }
+                        }
                         $previewTable .= "<td style='$style'>" . htmlspecialchars($cell ?? '') . "</td>";
                     }
                     
@@ -375,7 +420,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                         $currentCount = count($row);
                         if ($currentCount < $headerCount) {
                             for ($i = $currentCount; $i < $headerCount; $i++) {
-                                $previewTable .= "<td style='padding: 8px 12px; border: 1px solid #e2e8f0;'></td>";
+                                $previewTable .= "<td style='padding: 8px 12px; border: 1px solid #e2e8f0;" . ($isNetIncome ? " background: #fff5f5;" : "") . "'></td>";
                             }
                         }
                     }
@@ -389,7 +434,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
                 // Summary section
                 $totalRows = count($rows);
                 $previewTable .= '<div class="summary-bar" style="padding: 10px; background: #f8f9fa; border-radius: 4px; margin-top: 10px; font-size: 14px; color: #4a5568;">';
-                $previewTable .= '<small>📊 <strong>Summary:</strong> Total rows: ' . $totalRows . ' | Data rows: ' . $rowCount . ' | Header at row: ' . ($headerRowIndex + 1) . ' | Cutoff at: ' . ($cutoffRow + 1) . '</small>';
+                $previewTable .= '<small>📊 <strong>Summary:</strong> Total rows in file: ' . $totalRows . ' | Rows displayed: ' . $rowCount . ' | Data rows: ' . $dataRowCount . ' | Header at row: ' . ($headerRowIndex + 1);
+                if ($netIncomeRowIndex !== null) {
+                    $previewTable .= ' | <span style="color: #e53e3e; font-weight: bold;">NET Income at row: ' . ($netIncomeRowIndex + 1) . '</span>';
+                }
+                $previewTable .= '</small>';
                 $previewTable .= '</div>';
                 $previewTable .= '</div>';
 
@@ -402,8 +451,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['csv_file'])) {
 
 // --- STAGE 2: ACTUAL INSERTION ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
-    $transactionMonth = $_POST['transaction_month'] ?? '';
-    $transactionYear = $_POST['transaction_year'] ?? '';
+    // Get the combined month input
+    $transactionMonthYear = $_POST['transaction_month'] ?? '';
+    $transactionMonth = '';
+    $transactionYear = '';
+    
+    // Parse the combined month input (format: YYYY-MM)
+    if (!empty($transactionMonthYear)) {
+        $parts = explode('-', $transactionMonthYear);
+        if (count($parts) === 2) {
+            $transactionYear = $parts[0];
+            $transactionMonth = $parts[1];
+        }
+    }
+    
     $paths = $_POST['temp_file_paths'] ?? [];
     $uploadedBy = $_SESSION['username'];
     $forceInsert = isset($_POST['force_insert']);
@@ -423,7 +484,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
 
     if (!empty($paths)) {
         $conn->begin_transaction();
-        $lockedRegions = [];
+        $blockedRegions = [];
         $existingRegions = [];
         $voidedGroups = [];
         $checkedGroups = [];
@@ -443,22 +504,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ");
 
-            // MODIFIED: Check for status, reported_status, and unlock_by
+            // MODIFIED: Check for status_void and reported_status
             $checkStatusStmt = $conn->prepare("
-                SELECT status, reported_status, unlock_by 
+                SELECT status_void, reported_status, unlock_by 
                 FROM comparative_report 
                 WHERE region_id = ? AND area = ? AND transaction_type = ? 
                 AND transaction_month <=> ? AND status_void IS NULL 
                 LIMIT 1
             ");
             
-            // MODIFIED: Update statement to set lock and void status
+            // MODIFIED: Only set void status, no need for 'Locked' status
             $voidStmt = $conn->prepare("
                 UPDATE comparative_report 
-                SET status = 'Locked', 
-                    locked_by = ?, 
-                    locked_date = ?, 
-                    status_void = 'Void', 
+                SET status_void = 'Void', 
                     voided_by = ?, 
                     voided_at = ? 
                 WHERE region_id = ? AND area = ? AND transaction_type = ? 
@@ -801,28 +859,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
 
                 $debugInfo[] = "Final column detection: glCodeCol=$glCodeCol, descriptionCol=$descriptionCol, branchAmountCol=$branchAmountCol, showroomAmountCol=$showroomAmountCol, dataStartRow=$dataStartRow";
 
-                // Find where NET Income appears - MORE FLEXIBLE
-                $cutoffRow = count($rows) - 1;
-                $foundNetIncome = false;
+                // Find NET Income row - we'll use it for display but NOT as cutoff for insertion
+                $netIncomeRowIndex = null;
                 foreach ($rows as $rowIndex => $row) {
                     foreach ($row as $cell) {
                         $cellClean = trim((string)$cell);
                         if (stripos($cellClean, 'NET Income') !== false || 
                             stripos($cellClean, 'Net Income') !== false ||
                             (stripos($cellClean, 'Net') !== false && stripos($cellClean, 'Income') !== false)) {
-                            $cutoffRow = $rowIndex - 1; // Stop BEFORE NET Income
-                            $foundNetIncome = true;
-                            $debugInfo[] = "✓ Found NET Income at row $rowIndex, cutting off at row " . ($rowIndex - 1);
+                            $netIncomeRowIndex = $rowIndex;
+                            $debugInfo[] = "✓ Found NET Income at row " . ($rowIndex + 1) . " (will NOT be inserted)";
                             break 2;
                         }
                     }
                 }
                 
-                if (!$foundNetIncome) {
-                    $debugInfo[] = "⚠ NET Income not found, processing all rows until the end";
+                if ($netIncomeRowIndex === null) {
+                    $debugInfo[] = "⚠ NET Income not found in file";
                 }
 
-                $debugInfo[] = "Data detection: glCodeCol=$glCodeCol, descriptionCol=$descriptionCol, dataStartRow=$dataStartRow, cutoffRow=$cutoffRow";
+                $debugInfo[] = "Data detection: glCodeCol=$glCodeCol, descriptionCol=$descriptionCol, dataStartRow=$dataStartRow";
 
                 // Determine which amount columns are available
                 $transactionTypes = [];
@@ -845,7 +901,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                     $groupKey = $regionID . '|' . $area . '|' . $tt['type'] . '|' . ($dbTransactionMonth ?? 'NULL');
                     
                     if (!in_array($groupKey, $checkedGroups)) {
-                        $existingStatus = null;
+                        $existingStatusVoid = null;
                         $existingReportedStatus = null;
                         $existingUnlockedBy = null;
                         
@@ -854,27 +910,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                         $checkStatusStmt->store_result();
 
                         if ($checkStatusStmt->num_rows > 0) {
-                            $checkStatusStmt->bind_result($existingStatus, $existingReportedStatus, $existingUnlockedBy);
+                            $checkStatusStmt->bind_result($existingStatusVoid, $existingReportedStatus, $existingUnlockedBy);
                             $checkStatusStmt->fetch();
 
-                            // MODIFIED: Block if status is 'Locked' OR reported_status is 'Reported'
-                            if ($existingStatus === 'Locked' || $existingReportedStatus === 'Reported') {
-                                $lockedRegions[] = $regionID . '-' . $area . '-' . $tt['type'];
-                                $blockedReasons[] = "Region $regionID-$area-{$tt['type']} is BLOCKED - Status: '$existingStatus', Reported Status: '$existingReportedStatus'";
-                                $debugInfo[] = "🚫 Region is BLOCKED - Status: '$existingStatus', Reported Status: '$existingReportedStatus'";
+                            // MODIFIED: Block if status_void is 'Void' OR reported_status is 'Reported'
+                            if ($existingStatusVoid === 'Void' || $existingReportedStatus === 'Reported') {
+                                $blockedRegions[] = $regionID . '-' . $area . '-' . $tt['type'];
+                                $blockedReasons[] = "Region $regionID-$area-{$tt['type']} is BLOCKED - Status Void: '$existingStatusVoid', Reported Status: '$existingReportedStatus'";
+                                $debugInfo[] = "🚫 Region is BLOCKED - Status Void: '$existingStatusVoid', Reported Status: '$existingReportedStatus'";
                             } 
-                            // MODIFIED: Allow if status is NULL/empty AND unlock_by is NULL/empty/Unlocked AND reported_status is NULL/empty
-                            else if ((empty($existingStatus) || $existingStatus === '') && 
+                            // MODIFIED: Allow if status_void is NULL/empty AND unlock_by is NULL/empty/Unlocked AND reported_status is NULL/empty
+                            else if ((empty($existingStatusVoid) || $existingStatusVoid === '') && 
                                     (empty($existingReportedStatus) || $existingReportedStatus === '') && 
                                     (empty($existingUnlockedBy) || $existingUnlockedBy === 'Unlocked' || $existingUnlockedBy === '')) {
                                 // This is the condition where we allow uploading
                                 $existingRegions[] = $regionID . '-' . $area . '-' . $tt['type'];
-                                $debugInfo[] = "✓ Records exist but can be replaced - Status: '$existingStatus', Unlocked By: '$existingUnlockedBy', Reported Status: '$existingReportedStatus'";
+                                $debugInfo[] = "✓ Records exist but can be replaced - Status Void: '$existingStatusVoid', Unlocked By: '$existingUnlockedBy', Reported Status: '$existingReportedStatus'";
                             } else {
                                 // Any other state - block by default for safety
-                                $lockedRegions[] = $regionID . '-' . $area . '-' . $tt['type'];
-                                $blockedReasons[] = "Region $regionID-$area-{$tt['type']} is BLOCKED - Unknown state - Status: '$existingStatus', Unlocked By: '$existingUnlockedBy', Reported Status: '$existingReportedStatus'";
-                                $debugInfo[] = "🚫 Region is BLOCKED - Unknown state - Status: '$existingStatus', Unlocked By: '$existingUnlockedBy', Reported Status: '$existingReportedStatus'";
+                                $blockedRegions[] = $regionID . '-' . $area . '-' . $tt['type'];
+                                $blockedReasons[] = "Region $regionID-$area-{$tt['type']} is BLOCKED - Unknown state - Status Void: '$existingStatusVoid', Unlocked By: '$existingUnlockedBy', Reported Status: '$existingReportedStatus'";
+                                $debugInfo[] = "🚫 Region is BLOCKED - Unknown state - Status Void: '$existingStatusVoid', Unlocked By: '$existingUnlockedBy', Reported Status: '$existingReportedStatus'";
                             }
                         } else {
                             $debugInfo[] = "No existing records found for " . $tt['type'];
@@ -884,20 +940,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                     }
                 }
 
-                // Check if any region is locked or blocked
+                // Check if any region is blocked
                 $regionBlocked = false;
                 foreach ($transactionTypes as $tt) {
-                    if (in_array($regionID . '-' . $area . '-' . $tt['type'], $lockedRegions)) {
+                    if (in_array($regionID . '-' . $area . '-' . $tt['type'], $blockedRegions)) {
                         $regionBlocked = true;
                         break;
                     }
                 }
                 if ($regionBlocked) {
-                    $debugInfo[] = "✗ SKIPPING - Region is blocked (Locked or Reported)";
+                    $debugInfo[] = "✗ SKIPPING - Region is blocked (Voided or Reported)";
                     continue;
                 }
 
-                // MODIFIED: Handle force insert - void and lock existing records
+                // MODIFIED: Handle force insert - void existing records
                 if ($forceInsert) {
                     foreach ($transactionTypes as $tt) {
                         $groupKey = $regionID . '|' . $area . '|' . $tt['type'] . '|' . ($dbTransactionMonth ?? 'NULL');
@@ -913,9 +969,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                             
                             if ($count > 0) {
                                 $voidStmt->bind_param(
-                                    "ssssssss",
-                                    $uploadedBy,
-                                    $uploadedDate,
+                                    "ssssss",
                                     $uploadedBy,
                                     $uploadedDate,
                                     $regionID,
@@ -925,7 +979,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                                 );
                                 $voidStmt->execute();
                                 $voidedGroups[] = $groupKey;
-                                $debugInfo[] = "✓ Voided and locked existing records for " . $tt['type'] . " (force insert enabled)";
+                                $debugInfo[] = "✓ Voided existing records for " . $tt['type'] . " (force insert enabled)";
                             }
                         }
                     }
@@ -947,15 +1001,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                 $fileInsertCount = 0;
                 $fileSkippedCount = 0;
                 
-                // Process data rows
-                for ($rowIndex = $dataStartRow; $rowIndex < count($rows) && $rowIndex <= $cutoffRow; $rowIndex++) {
+                // Process data rows - STOP before NET Income row
+                $processUntilRow = ($netIncomeRowIndex !== null) ? $netIncomeRowIndex - 1 : count($rows) - 1;
+                $debugInfo[] = "Processing rows from $dataStartRow to $processUntilRow (stopping before NET Income)";
+                
+                for ($rowIndex = $dataStartRow; $rowIndex <= $processUntilRow && $rowIndex < count($rows); $rowIndex++) {
                     $row = $rows[$rowIndex] ?? [];
                     
                     $rowString = implode(' ', $row);
                     // Skip summary rows - but be more specific
                     if (stripos($rowString, 'NET Income') !== false || 
+                        stripos($rowString, 'Net Income') !== false ||
                         (stripos($rowString, 'TOTAL') !== false && stripos($rowString, 'NET') !== false)) {
-                        $skippedRows[] = "Row $rowIndex: Summary row (NET Income or TOTAL)";
+                        $skippedRows[] = "Row $rowIndex: Summary row (NET Income or TOTAL) - SKIPPED from insertion";
                         $fileSkippedCount++;
                         continue;
                     }
@@ -1060,20 +1118,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
             $monthDisplay = $dateObj ? $dateObj->format('F Y') : ($transactionMonth ? date('F', mktime(0, 0, 0, (int)$transactionMonth, 1)) . ' ' . $transactionYear : $transactionYear);
 
             // MODIFIED: Check if any regions are blocked
-            if (!empty($lockedRegions)) {
+            if (!empty($blockedRegions)) {
                 $conn->rollback();
-                $lockedRegions = array_unique($lockedRegions);
-                $regionList = implode(', ', $lockedRegions);
+                $blockedRegions = array_unique($blockedRegions);
+                $regionList = implode(', ', $blockedRegions);
                 $blockedReasonsList = implode('<br>', array_unique($blockedReasons));
                 
                 $_SESSION['upload_message'] = "<div class='error'>
                     <strong>⛔ Upload Blocked!</strong><br><br>
-                    The following regions cannot be updated: <strong>{$regionList}</strong>. They are either <strong>LOCKED</strong> or have been <strong>REPORTED</strong>.<br><br>
+                    The following regions cannot be updated: <strong>{$regionList}</strong>. They are either <strong>VOIDED</strong> or have been <strong>REPORTED</strong>.<br><br>
                 </div>";
-                
-                //  <strong>Blocked Regions Details:</strong><br>
-                //     <div style='background:#f5f5f5;padding:10px;border-radius:5px;font-size:13px;'>$blockedReasonsList</div>
-
 
                 foreach ($paths as $p) {
                     if (file_exists($p)) {
@@ -1089,15 +1143,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                 $existingRegions = array_unique($existingRegions);
                 $regionList = implode(', ', $existingRegions);
                 $showConfirmModal = true;
-                $confirmMonth = $transactionMonth;
+                $confirmMonth = $transactionMonthYear; // Pass the combined month
                 $confirmYear = $transactionYear;
                 $confirmPaths = $paths;
-                $duplicateMessage = "📋 <strong>Existing Records Found</strong><br>
+                $duplicateMessage = "<i class='fa-solid fa-circle-info'></i> <strong>Existing Records Found</strong><br>
                     Transactions for the following regions already exist for {$monthDisplay}:<br>
                     <strong>{$regionList}</strong><br><br>
-                    These records are currently in an <strong>editable state</strong> (unlocked, not yet reported).<br>
-                    Do you want to <strong>replace</strong> them?<br>
-                    <span style='color:#e53e3e;font-size:13px;'>This will mark the old records as VOID and LOCK them.</span>";
+                    These records are currently in an <strong>editable state</strong>.";
             } else {
                 $conn->commit();
                 foreach ($paths as $p) {
@@ -1119,10 +1171,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                 $skippedOutput = implode("\n", $skippedRows);
                 $processedOutput = implode("\n", $processedRows);
                 
-                $_SESSION['upload_message'] = "<div class='success'>✅ Success! Processed all CSV files. <strong>$insertCount</strong> total records inserted for $periodDisplay.<br><br>
+                $_SESSION['upload_message'] = "<div class='success'><i class='fa-solid fa-check'></i> Success! Processed all CSV files. <strong>$insertCount</strong> total records inserted for $periodDisplay.<br><br>
                     <div class='debug-details'>
                         <details style='margin-top:10px;'>
-                            <summary style='cursor:pointer;font-weight:bold;color:#2d3748;'>📋 Processing Summary</summary>
+                            <summary style='cursor:pointer;font-weight:bold;color:#2d3748;'><i class='fa-solid fa-list'></i> Processing Summary</summary>
                             <div style='margin-top:10px;'>
                                 <p><strong>Total Records Inserted:</strong> $insertCount</p>
                                 <p><strong>Total Rows Skipped:</strong> " . count($skippedRows) . "</p>
@@ -1130,17 +1182,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                         </details>
                         " . (count($skippedRows) > 0 ? "
                         <details style='margin-top:10px;'>
-                            <summary style='cursor:pointer;font-weight:bold;color:#e53e3e;'>⚠️ Skipped Rows Details (" . count($skippedRows) . ")</summary>
+                            <summary style='cursor:pointer;font-weight:bold;color:#e53e3e;'><i class='fa-solid fa-triangle-exclamation'></i> Skipped Rows Details (" . count($skippedRows) . ")</summary>
                             <pre style='background:#fff5f5;padding:15px;border-radius:5px;font-size:12px;text-align:left;white-space:pre-wrap;word-wrap:break-word;max-height:300px;overflow-y:auto;margin:10px 0 0 0;color:#c53030;'>" . htmlspecialchars($skippedOutput) . "</pre>
                         </details>
                         " : "") . "
                         <details style='margin-top:10px;'>
-                            <summary style='cursor:pointer;font-weight:bold;color:#2d3748;'>📋 Detailed Debug Log</summary>
+                            <summary style='cursor:pointer;font-weight:bold;color:#2d3748;'><i class='fa-solid fa-circle-info'></i> Detailed Debug Log</summary>
                             <pre style='background:#f5f5f5;padding:15px;border-radius:5px;font-size:12px;text-align:left;white-space:pre-wrap;word-wrap:break-word;max-height:500px;overflow-y:auto;margin:10px 0 0 0;'>" . htmlspecialchars($debugOutput) . "</pre>
                         </details>
                         " . (count($processedRows) > 0 ? "
                         <details style='margin-top:10px;'>
-                            <summary style='cursor:pointer;font-weight:bold;color:#38a169;'>✅ Inserted Rows Details (" . count($processedRows) . ")</summary>
+                            <summary style='cursor:pointer;font-weight:bold;color:#38a169;'><i class='fa-solid fa-check-double'></i> Inserted Rows Details (" . count($processedRows) . ")</summary>
                             <pre style='background:#f0fff4;padding:15px;border-radius:5px;font-size:12px;text-align:left;white-space:pre-wrap;word-wrap:break-word;max-height:300px;overflow-y:auto;margin:10px 0 0 0;color:#276749;'>" . htmlspecialchars($processedOutput) . "</pre>
                         </details>
                         " : "") . "
@@ -1291,6 +1343,86 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
         .modal-message ul li {
             margin: 5px 0;
         }
+        .month-picker-container {
+            display: flex;
+            flex-direction: column;
+            margin-bottom: 15px;
+        }
+        .month-picker-container label {
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+        .month-picker-container input[type="month"] {
+            padding: 10px;
+            border: 1px solid #cbd5e0;
+            border-radius: 8px;
+            width: 220px;
+            font-size: 14px;
+        }
+        /* Style for empty month input when no value selected */
+        .month-picker-container input[type="month"]:invalid {
+            border-color: #e53e3e;
+        }
+        .month-picker-container input[type="month"]:invalid:focus {
+            border-color: #e53e3e;
+            box-shadow: 0 0 0 3px rgba(229, 62, 62, 0.15);
+        }
+        .required-star {
+            color: #e53e3e;
+            margin-left: 2px;
+        }
+        /* Highlight NET Income row in table */
+        .net-income-row {
+            background: #fff5f5 !important;
+            font-weight: bold !important;
+            border-top: 3px solid #e53e3e !important;
+        }
+        .net-income-row td {
+            background: #fff5f5 !important;
+        }
+        .net-income-row td.numeric-amount {
+            color: #e53e3e !important;
+            font-weight: bold !important;
+        }
+        /* Status Legend Styles */
+        .status-legend {
+            margin-bottom: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border: 1px solid #e2e8f0;
+        }
+        .status-legend h4 {
+            margin: 0 0 10px 0;
+            font-size: 14px;
+        }
+        .status-legend-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+            font-size: 13px;
+        }
+        .status-legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .status-dot {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .status-dot-active {
+            background: #38a169;
+        }
+        .status-dot-voided {
+            background: #e53e3e;
+        }
+        .status-dot-reported {
+            background: #f6ad55;
+        }
     </style>
 </head>
 <body>
@@ -1307,64 +1439,55 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
             <div class="card">
                 <h3>Upload Raw CSV Report (Per Zone)</h3>
 
+                <!-- Status Legend -->
+                <!-- <div class="status-legend">
+                    <h4><i class="fa-solid fa-circle-info"></i> Status Definitions:</h4>
+                    <div class="status-legend-grid">
+                        <div class="status-legend-item">
+                            <span class="status-dot status-dot-active"></span>
+                            <strong>Active</strong> - Current valid record (status_void = NULL)
+                        </div>
+                        <div class="status-legend-item">
+                            <span class="status-dot status-dot-voided"></span>
+                            <strong>Voided</strong> - Superseded by newer upload (status_void = 'Void')
+                        </div>
+                        <div class="status-legend-item">
+                            <span class="status-dot status-dot-reported"></span>
+                            <strong>Reported</strong> - Finalized, cannot be modified (reported_status = 'Reported')
+                        </div>
+                    </div>
+                </div> -->
+
                 <form class="upload-form" method="post" enctype="multipart/form-data" id="uploadForm">
                     <div style="display: flex; align-items: flex-end; gap: 20px; flex-wrap: wrap;">
-                        <div style="display: flex; flex-direction: column;">
-                            <label for="transaction_month" style="font-weight: 600; margin-bottom: 5px;">Transaction Month:</label>
-                            <select name="transaction_month" id="transaction_month" style="padding: 10px; border: 1px solid #cbd5e0; border-radius: 8px; width: 160px;">
-                                <option value="">-- Select Month --</option>
-                                <option value="01">January</option>
-                                <option value="02">February</option>
-                                <option value="03">March</option>
-                                <option value="04">April</option>
-                                <option value="05">May</option>
-                                <option value="06">June</option>
-                                <option value="07">July</option>
-                                <option value="08">August</option>
-                                <option value="09">September</option>
-                                <option value="10">October</option>
-                                <option value="11">November</option>
-                                <option value="12">December</option>
-                            </select>
+                        <div class="month-picker-container" style="margin-bottom: 0;">
+                            <label for="transaction_month">Transaction Month: <span class="required-star">*</span></label>
+                            <input type="month" name="transaction_month" id="transaction_month" required value="<?php echo htmlspecialchars($selectedMonth); ?>" placeholder="Select month">
                         </div>
 
-                        <div style="display: flex; flex-direction: column;">
-                            <label for="transaction_year" style="font-weight: 600; margin-bottom: 5px;">Transaction Year: <span id="year_required" style="color: #e53e3e; display: none;">*</span></label>
-                            <select name="transaction_year" id="transaction_year" style="padding: 10px; border: 1px solid #cbd5e0; border-radius: 8px; width: 160px;">
-                                <option value="">-- Select Year --</option>
-                                <?php
-                                    $currentYear = date("Y");
-                                    for ($i = $currentYear; $i >= $currentYear - 5; $i--):
-                                ?>
-                                    <option value="<?php echo $i; ?>"><?php echo $i; ?></option>
-                                <?php endfor; ?>
-                            </select>
-                        </div>
-
-                        <div style="display: flex; flex-direction: column;">
-                            <label style="font-weight: 600; margin-bottom: 5px;">Choose CSV File:</label>
-                            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                        <div style="display: flex; flex-direction: column; flex: 1;">
+                            <label style="font-weight: 600; margin-bottom: 5px;">Choose CSV File(s): <span class="required-star">*</span></label>
+                            <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
                                 <input type="file" name="csv_file[]" accept=".csv,text/csv" required multiple style="padding: 9px; border: 1px solid #cbd5e0; border-radius: 8px; flex: 1; min-width: 200px;">
-                                <button type="submit" style="margin-left: 0;"><i class="fa-solid fa-eye"></i> Preview</button>
-                                <a href="report.php" class="btn-generate"><i class="fa-regular fa-file"></i> View Report</a>
-                                <a href="comparative_report_csv.php" class="btn-reset"><i class="fa-solid fa-rotate"></i> Refresh</a>
+                                <button type="submit" style="padding: 9px 20px; background: #cf0101; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; white-space: nowrap;"><i class="fa-solid fa-eye"></i> Preview</button>
+                                <a href="report.php" style="padding: 7px 20px; background: #217346; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; text-decoration: none; white-space: nowrap; "><i class="fa-regular fa-file"></i> View Report</a>
+                                <a href="comparative_report_csv.php" style="padding: 9px 20px; background: #e2e8f0; color: #4a5568; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; text-decoration: none; white-space: nowrap; display: inline-flex; align-items: center; gap: 5px;"><i class="fa-solid fa-rotate"></i> Refresh</a>
                             </div>
                         </div>
                     </div>
                 </form>
 
                 <?php if (!empty($previewTable)): ?>
-                    <div style="background: #ffebeb; border: 1px solid #e14242; padding: 15px; border-radius: 8px; margin-bottom: 5px;">
+                    <div style="background: #ffebeb; border: 1px solid #e14242; padding: 15px; border-radius: 8px; margin-bottom: 5px; margin-top: 20px;">
                         <p style="margin-top:0;"><strong>Review and Save</strong></p>
-                        <form method="post">
+                        <form method="post" style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
                             <input type="hidden" name="do_insert" value="1">
-                            <input type="hidden" name="transaction_month" value="<?php echo htmlspecialchars($transactionMonth); ?>">
-                            <input type="hidden" name="transaction_year" value="<?php echo htmlspecialchars($transactionYear); ?>">
+                            <input type="hidden" name="transaction_month" value="<?php echo htmlspecialchars($selectedMonth); ?>">
                             <?php foreach ($tempFilePaths as $path): ?>
                                 <input type="hidden" name="temp_file_paths[]" value="<?php echo htmlspecialchars($path); ?>">
                             <?php endforeach; ?>
 
-                            <button type="submit" style="padding:12px 25px; background: linear-gradient(45deg, #ff524c, #8e0005); color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:bold;">
+                            <button type="submit" style="padding:10px 25px; background: linear-gradient(45deg, #ff524c, #8e0005); color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:bold;">
                                 <i class="fa-solid fa-arrow-up-from-bracket"></i> Proceed
                             </button>
                             <a href="?" style="margin-left:10px; color:#f56565; text-decoration:none;">Cancel</a>
@@ -1413,21 +1536,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                 <ul>
                     <li>New records will be inserted with the updated data</li>
                     <li>Old records will be marked as <strong>VOID</strong></li>
-                    <li>Old records will be <strong>LOCKED</strong></li>
-                    <!-- <li>Old records will have <strong>locked_by</strong>, <strong>locked_date</strong>, <strong>voided_by</strong>, and <strong>voided_at</strong> set</li> -->
+                    <!-- <li>Old records will have <strong>voided_by</strong> and <strong>voided_at</strong> set</li> -->
                 </ul>
-                <strong style="color:#e53e3e;">Do you want to proceed with replacing these records?</strong>
+                <strong style="color:#e53e3e;">Do you want to insert new records and void the previous?</strong>
             </div>
             <form method="post">
                 <input type="hidden" name="do_insert" value="1">
                 <input type="hidden" name="transaction_month" value="<?php echo htmlspecialchars($confirmMonth); ?>">
-                <input type="hidden" name="transaction_year" value="<?php echo htmlspecialchars($confirmYear); ?>">
                 <?php foreach ($confirmPaths as $path): ?>
                     <input type="hidden" name="temp_file_paths[]" value="<?php echo htmlspecialchars($path); ?>">
                 <?php endforeach; ?>
                 <input type="hidden" name="force_insert" value="1">
                 <div class="modal-actions">
-                    <button type="submit" class="btn-confirm">Yes, Replace Records</button>
+                    <button type="submit" class="btn-confirm">Yes</button>
                     <button type="button" class="btn-cancel" onclick="closeModal()">Cancel</button>
                 </div>
             </form>
@@ -1449,42 +1570,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['do_insert'])) {
                 if (messageContent && messageContent.textContent.includes('Success')) {
                     setTimeout(function() {
                         window.location.href = 'comparative_report_csv.php';
-                    }, 3000);
+                    }, 500);
                 }
             }
         }
 
         document.addEventListener("DOMContentLoaded", function () {
             const form = document.getElementById('uploadForm');
-            const monthSelect = document.getElementById('transaction_month');
-            const yearSelect = document.getElementById('transaction_year');
-            const yearRequired = document.getElementById('year_required');
-
-            monthSelect.addEventListener('change', function() {
-                if (this.value) {
-                    yearRequired.style.display = 'inline';
-                    yearSelect.setAttribute('required', 'required');
-                } else {
-                    yearRequired.style.display = 'none';
-                    yearSelect.removeAttribute('required');
-                }
-            });
+            const monthInput = document.getElementById('transaction_month');
 
             form.addEventListener('submit', function(e) {
-                const monthValue = monthSelect.value;
-                const yearValue = yearSelect.value;
-
-                if (monthValue && !yearValue) {
+                const monthValue = monthInput.value;
+                if (!monthValue) {
                     e.preventDefault();
-                    alert('Transaction Year is required when Transaction Month is selected.');
-                    yearSelect.focus();
-                    return false;
-                }
-
-                if (!monthValue && !yearValue) {
-                    e.preventDefault();
-                    alert('Please select at least a Transaction Year.');
-                    yearSelect.focus();
+                    alert('⚠️ Please select a Transaction Month before uploading.');
+                    monthInput.focus();
                     return false;
                 }
             });

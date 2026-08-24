@@ -191,8 +191,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['import_data'])) {
             $sub_order_cell = $worksheet->getCell('B' . $current_row);
             $sub_order = trim($sub_order_cell->getValue());
             
-            // Get description and gl_description_comparative from database
-            $gl_sql = "SELECT description, gl_description_comparative 
+            // Get gl_id, description, and gl_description_comparative from database
+            $gl_sql = "SELECT id, description, gl_description_comparative 
                        FROM fs_reports.gl_codes_past_tranx 
                        WHERE sort_order = ? AND sub_order = ?";
             $gl_stmt = $conn->prepare($gl_sql);
@@ -204,11 +204,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['import_data'])) {
                 $gl_result = null;
             }
             
+            $gl_id = null;
             $description = '';
             $gl_description_comparative = '';
             
             if ($gl_result && $gl_result->num_rows > 0) {
                 $gl_row = $gl_result->fetch_assoc();
+                $gl_id = $gl_row['id'];
                 $description = $gl_row['description'];
                 $gl_description_comparative = $gl_row['gl_description_comparative'];
             } else {
@@ -233,20 +235,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['import_data'])) {
                     continue;
                 }
                 
-                // Insert into past_transaction table
+                // Insert into past_transaction table with gl_id
                 $insert_sql = "INSERT INTO fs_reports.past_transaction 
-                              (sort_order, sub_order, description, gl_description_comparative, 
+                              (sort_order, sub_order, description, gl_description_comparative, gl_id,
                                amount, region, mainzone, zone, transaction_month, transaction_year, uploaded_by, uploaded_date) 
-                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 
                 $insert_stmt = $conn->prepare($insert_sql);
                 if ($insert_stmt) {
-                    // Bind parameters - note: transaction_month is date, transaction_year is year
-                    $insert_stmt->bind_param("iisssssssiss", 
+                    // Bind parameters - gl_id can be null
+                    $insert_stmt->bind_param("iississsssiss", 
                         $sort_order, 
                         $sub_order, 
                         $description, 
                         $gl_description_comparative,
+                        $gl_id,
                         $amount, 
                         $region_info['region'], 
                         $region_info['mainzone'], 
@@ -549,8 +552,8 @@ if ($preview_mode) {
             $sub_order_cell = $worksheet->getCell('B' . $current_row);
             $sub_order = trim($sub_order_cell->getValue());
 
-            // Get description and gl_description_comparative from fs_reports.gl_codes_past_tranx
-            $gl_sql = "SELECT description, gl_description_comparative 
+            // Get gl_id, description, and gl_description_comparative from fs_reports.gl_codes_past_tranx
+            $gl_sql = "SELECT id, description, gl_description_comparative 
                        FROM fs_reports.gl_codes_past_tranx 
                        WHERE sort_order = ? AND sub_order = ?";
             $gl_stmt = $conn->prepare($gl_sql);
@@ -562,11 +565,13 @@ if ($preview_mode) {
                 $gl_result = null;
             }
 
+            $gl_id = null;
             $description = '';
             $gl_description_comparative = '';
 
             if ($gl_result && $gl_result->num_rows > 0) {
                 $gl_row = $gl_result->fetch_assoc();
+                $gl_id = $gl_row['id'];
                 $description = $gl_row['description'];
                 $gl_description_comparative = $gl_row['gl_description_comparative'];
             } else {
@@ -595,6 +600,7 @@ if ($preview_mode) {
                 $temp_rows[$col][] = [
                         'sort_order' => $sort_order,
                         'sub_order' => $sub_order,
+                        'gl_id' => $gl_id,
                         'description' => $description,
                         'gl_description' => $gl_description_comparative,
                         'amount' => $amount_to_display, // Keep as float for summary calculations
@@ -875,6 +881,7 @@ if ($preview_mode) {
                                 <tr>
                                     <th>Sort Order</th>
                                     <th>Sub Order</th>
+                                    <th>GL ID</th>
                                     <th>Description</th>
                                     <th>GL Description</th>
                                     <th>Amount</th>
@@ -888,6 +895,7 @@ if ($preview_mode) {
                                 <tr>
                                     <td style="text-align: center;"><?php echo htmlspecialchars($row['sort_order']); ?></td>
                                     <td style="text-align: center;"><?php echo htmlspecialchars($row['sub_order']); ?></td>
+                                    <td style="text-align: center;"><?php echo htmlspecialchars($row['gl_id'] ?? ''); ?></td>
                                     <td><?php echo htmlspecialchars($row['description']); ?></td>
                                     <td><?php echo htmlspecialchars($row['gl_description']); ?></td>
                                     <td style="text-align: right;" class="<?php echo $row['amount'] < 0 ? 'amount-negative' : 'amount-positive'; ?>">

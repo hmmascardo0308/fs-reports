@@ -346,7 +346,7 @@ if (!$all_zones_present) {
                                                 </span>
                                             <?php else: ?>
                                                 <span style="color: #3f3f3f; font-style:italic; font-size: 14px;">
-                                                    <i class="fas fa-clock"></i> N / A
+                                                    —
                                                 </span>
                                             <?php endif; ?>
                                         </td>

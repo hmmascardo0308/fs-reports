@@ -544,11 +544,16 @@ if (isset($_SESSION['password_change_success']) && $_SESSION['password_change_su
             
             <div style="display: flex; flex-direction: column; gap: 15px;">
                 <a href="settings.php" class="btn" style="background-color: #007bff; color: white; text-decoration: none; padding: 12px; border-radius: 6px; font-weight: 600; transition: background 0.3s; display: block;">
-                    <i class="fas fa-file-excel" style="margin-right: 8px;"></i> Comparative Report (From Per Region-Area)
+                    <i class="fas fa-file-excel" style="margin-right: 8px;"></i> Comparative Report
                 </a>
                 <a href="comparative_report_raw_data.php" class="btn" style="background-color: #6f42c1; color: white; text-decoration: none; padding: 12px; border-radius: 6px; font-weight: 600; transition: background 0.3s; display: block;">
                     <i class="fas fa-database" style="margin-right: 8px;"></i> Comparative Report (From Raw Data)
                 </a>
+
+                <!-- <a href="#" class="btn" style="background-color: #6f42c1; color: white; text-decoration: none; padding: 12px; border-radius: 6px; font-weight: 600; transition: background 0.3s; display: block; cursor: not-allowed; opacity: 0.7;" onclick="event.preventDefault(); alert('This feature is coming soon!');">
+    <i class="fas fa-database" style="margin-right: 8px;"></i> Comparative Report (From Raw Data) 
+    <span style="font-size: 0.7rem; background: rgba(255,255,255,0.2); padding: 2px 8px; border-radius: 12px; margin-left: 5px;">Coming Soon</span>
+</a> -->
             </div>
         </div>
     </div>
@@ -564,11 +569,16 @@ if (isset($_SESSION['password_change_success']) && $_SESSION['password_change_su
             
             <div style="display: flex; flex-direction: column; gap: 15px;">
                 <a href="mark_reported.php" class="btn" style="background-color: #28a745; color: white; text-decoration: none; padding: 12px; border-radius: 6px; font-weight: 600; transition: background 0.3s; display: block;">
-                    <i class="fas fa-file-excel" style="margin-right: 8px;"></i> Mark Transactions as Reported (From Per Region-Area)
+                    <i class="fas fa-file-excel" style="margin-right: 8px;"></i> Mark Transactions as Reported
                 </a>
-                <a href="mark_reported_raw.php" class="btn" style="background-color: #6f42c1; color: white; text-decoration: none; padding: 12px; border-radius: 6px; font-weight: 600; transition: background 0.3s; display: block;">
+                <!-- <a href="mark_reported_raw.php" class="btn" style="background-color: #6f42c1; color: white; text-decoration: none; padding: 12px; border-radius: 6px; font-weight: 600; transition: background 0.3s; display: block;">
                     <i class="fas fa-database" style="margin-right: 8px;"></i> Mark Transactions as Reported (From Raw Data)
-                </a>
+                </a> -->
+
+                <a href="#" class="btn" style="background-color: #6f42c1; color: white; text-decoration: none; padding: 12px; border-radius: 6px; font-weight: 600; transition: background 0.3s; display: block; cursor: not-allowed; opacity: 0.7;" onclick="event.preventDefault(); alert('This feature is coming soon!');">
+    <i class="fas fa-database" style="margin-right: 8px;"></i> Mark Transactions as Reported (From Raw Data)
+    <span style="font-size: 0.7rem; background: rgba(255,255,255,0.2); padding: 2px 8px; border-radius: 12px; margin-left: 5px;">Coming Soon</span>
+</a>
             </div>
         </div>
     </div>
