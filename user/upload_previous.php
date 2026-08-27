@@ -192,7 +192,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['import_data'])) {
             $sub_order = trim($sub_order_cell->getValue());
             
             // Get gl_id, description, and gl_description_comparative from database
-            $gl_sql = "SELECT id, description, gl_description_comparative 
+            $gl_sql = "SELECT gl_id, description, gl_description_comparative 
                        FROM fs_reports.gl_codes_past_tranx 
                        WHERE sort_order = ? AND sub_order = ?";
             $gl_stmt = $conn->prepare($gl_sql);
@@ -210,7 +210,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['import_data'])) {
             
             if ($gl_result && $gl_result->num_rows > 0) {
                 $gl_row = $gl_result->fetch_assoc();
-                $gl_id = $gl_row['id'];
+                $gl_id = $gl_row['gl_id'];
                 $description = $gl_row['description'];
                 $gl_description_comparative = $gl_row['gl_description_comparative'];
             } else {
@@ -244,7 +244,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['import_data'])) {
                 $insert_stmt = $conn->prepare($insert_sql);
                 if ($insert_stmt) {
                     // Bind parameters - gl_id can be null
-                    $insert_stmt->bind_param("iississsssiss", 
+                    $insert_stmt->bind_param("iissssssssiss", 
                         $sort_order, 
                         $sub_order, 
                         $description, 
@@ -553,7 +553,7 @@ if ($preview_mode) {
             $sub_order = trim($sub_order_cell->getValue());
 
             // Get gl_id, description, and gl_description_comparative from fs_reports.gl_codes_past_tranx
-            $gl_sql = "SELECT id, description, gl_description_comparative 
+            $gl_sql = "SELECT gl_id, description, gl_description_comparative 
                        FROM fs_reports.gl_codes_past_tranx 
                        WHERE sort_order = ? AND sub_order = ?";
             $gl_stmt = $conn->prepare($gl_sql);
@@ -571,7 +571,7 @@ if ($preview_mode) {
 
             if ($gl_result && $gl_result->num_rows > 0) {
                 $gl_row = $gl_result->fetch_assoc();
-                $gl_id = $gl_row['id'];
+                $gl_id = $gl_row['gl_id'];
                 $description = $gl_row['description'];
                 $gl_description_comparative = $gl_row['gl_description_comparative'];
             } else {

@@ -1,4 +1,5 @@
 <?php
+// save_sub_order_fs_ho.php
 session_start();
 header('Content-Type: application/json');
 require_once __DIR__ . '/../config/config.php';
@@ -26,6 +27,18 @@ if (count($orderData) === 0) {
     exit;
 }
 
+$gl_type = $data['gl_type'] ?? 'new';
+
+if (!in_array($gl_type, ['old', 'new'], true)) {
+    http_response_code(400);
+    echo json_encode(['ok' => false, 'error' => 'Invalid GL type']);
+    exit;
+}
+
+$gl_table = ($gl_type === 'old')
+    ? 'fs_reports.gl_codes_ho'
+    : 'fs_reports.new_gl_codes_ho';
+
 mysqli_begin_transaction($conn);
 
 try {
@@ -33,10 +46,10 @@ try {
     $prefixes = [];
 
     // Helper to get prefix from existing gl_id for a description
-    $get_prefix = function($desc) use ($conn, &$prefixes) {
+    $get_prefix = function($desc) use ($conn, &$prefixes, $gl_table) {
         if (isset($prefixes[$desc])) return $prefixes[$desc];
         
-        $stmt = mysqli_prepare($conn, "SELECT gl_id FROM fs_reports.gl_codes_ho_new WHERE description = ? AND gl_id IS NOT NULL AND gl_id != '' LIMIT 1");
+        $stmt = mysqli_prepare($conn, "SELECT gl_id FROM $gl_table WHERE description = ? AND gl_id IS NOT NULL AND gl_id != '' LIMIT 1");
         mysqli_stmt_bind_param($stmt, 's', $desc);
         mysqli_stmt_execute($stmt);
         mysqli_stmt_bind_result($stmt, $gl_id);
@@ -66,7 +79,7 @@ try {
     
     // Update each row's sub_order and gl_id
     $update_stmt = mysqli_prepare($conn, 
-        "UPDATE fs_reports.gl_codes_ho_new
+        "UPDATE $gl_table
          SET sub_order = ?, gl_id = ?
          WHERE description = ? AND gl_description_comparative = ?"
     );
@@ -99,3 +112,5 @@ try {
     echo json_encode(['ok' => false, 'error' => $e->getMessage()]);
 }
 ?>
+
+

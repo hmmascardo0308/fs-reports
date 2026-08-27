@@ -1,4 +1,6 @@
 <?php
+
+// comparative_report_original.php
 session_start();
 require_once __DIR__ . '/../config/config.php';
 

@@ -294,8 +294,10 @@ border-radius: 5px;
 box-sizing: border-box;
 }
 .modal-footer {
-text-align: right;
-margin-top: 30px;
+ display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 12px;
 }
 .btn-save {
 background-color: #ff0000;
@@ -1009,4 +1011,90 @@ animation: spin 1s linear infinite;
 @keyframes spin {
 0% { transform: rotate(0deg); }
 100% { transform: rotate(360deg); }
+}
+
+
+/* =========================================================
+   GL CODE TYPE TOGGLE
+========================================================= */
+
+.gl-settings-toolbar {
+    margin-bottom: 20px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+
+.gl-toggle {
+    display: inline-flex;
+    align-items: center;
+    background: #e9ecef;
+    border: 1px solid #ced4da;
+    border-radius: 8px;
+    padding: 3px;
+}
+
+
+.gl-toggle a {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    text-decoration: none;
+    padding: 9px 17px;
+    border-radius: 6px;
+    color: #495057;
+    font-size: 14px;
+    font-weight: 600;
+    transition: all 0.2s ease;
+}
+
+
+.gl-toggle a:hover {
+    background: #dee2e6;
+    color: #212529;
+}
+
+
+.gl-toggle a.active {
+    background: #710000;
+    color: #ffffff;
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.15);
+}
+
+
+.gl-search-input {
+    flex: 1;
+    min-width: 260px;
+    padding: 9px 12px;
+    border: 1px solid #ced4da;
+    border-radius: 6px;
+    font-size: 14px;
+    outline: none;
+}
+
+
+.gl-search-input:focus {
+    border-color: #710000;
+    box-shadow: 0 0 0 2px rgba(0, 113, 85, 0.12);
+}
+
+
+/* =========================================================
+   DRAGGING
+========================================================= */
+
+.gl-table tr.dragging {
+    opacity: 0.45;
+}
+
+
+.drag-handle {
+    cursor: grab;
+}
+
+
+.drag-handle:active {
+    cursor: grabbing;
 }

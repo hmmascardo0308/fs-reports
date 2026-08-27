@@ -96,6 +96,47 @@ function getSortOrderRanges(string $gl_code_mode): array
     }
 }
 
+// ============================================================
+// HARDCODED GL MAPPING FOR OLD GL CODES
+// ============================================================
+
+// Mapping from past_transaction gl_id to old gl_codes_ho gl_id
+$old_gl_mapping = [
+    // COS (Cost of Sales) mappings
+    'COS-2' => 'COS-5',
+    'COS-3' => 'COS-6',
+    'COS-4' => 'COS-7',
+    
+    // MLE mappings
+    'MLE-2' => 'MLE-3',
+    
+    // TAE mappings
+    'TAE-15' => 'TAE-16',
+    'TAE-16' => 'TAE-17',
+    'TAE-17' => 'TAE-18',
+    'TAE-18' => 'TAE-19',
+    'TAE-19' => 'TAE-20',
+    'TAE-20' => 'TAE-21',
+    'TAE-21' => 'TAE-22',
+    'TAE-22' => 'TAE-23',
+    'TAE-23' => null, // none
+    
+    // TOI mappings
+    'TOI-18' => null, // none
+    'TOI-19' => 'TOI-18',
+    'TOI-20' => 'MLE-2',
+    'TOI-22' => 'INJ-5',
+    'TOI-23' => 'INJ-4',
+    'TOI-24' => null, // none
+    
+    // VEH mappings
+    'VEH-5' => 'VEH-6',
+    'VEH-6' => 'VEH-7',
+    'VEH-7' => 'VEH-8',
+    'VEH-8' => 'VEH-9',
+    'VEH-9' => 'VEH-10',
+];
+
 // Validate periods and GL code mode
 $show_error = false;
 $valid_filters = false;
@@ -555,6 +596,12 @@ function get_gl_id_total(
     string $mode
 ): float {
 
+    // past_transaction data is already keyed by gl_id;
+    // comparative_report data is keyed by numerical gl_code.
+    if (isset($data[$gl_id])) {
+        return (float)$data[$gl_id];
+    }
+
     $total = 0.0;
 
     foreach ($gl_mapping as $key => $codes_detailed) {
@@ -582,6 +629,232 @@ function get_gl_id_total(
 }
 
 // ============================================================
+// HELPER: GET DATA FROM COMPARATIVE REPORT TABLE
+// ============================================================
+
+function get_comparative_data(
+    mysqli $conn,
+    string $period,
+    array $params = [],
+    string $types = "",
+    bool $use_void_filter = true
+): array {
+
+    $data = [];
+
+    if (empty($period)) {
+        return $data;
+    }
+
+    $parts = explode('-', $period);
+    $year_val = $parts[0];
+    $month_val = $period . '-01';
+
+    $sql = "
+        SELECT
+            gl_code,
+            SUM(amount) AS total_amount
+        FROM fs_reports.comparative_report
+        WHERE 1=1
+        AND transaction_year = ?
+        AND transaction_month = ?
+        AND gl_code IS NOT NULL
+        AND gl_code != ''
+    ";
+
+    // Add void filter
+    if ($use_void_filter) {
+        $sql .= " AND (status_void IS NULL OR status_void != 'Void')";
+    }
+
+    $sql .= " GROUP BY gl_code";
+
+    $period_params = array_merge($params, [$year_val, $month_val]);
+    $period_types = $types . "ss";
+
+    $stmt = mysqli_prepare($conn, $sql);
+
+    if ($stmt) {
+
+        mysqli_stmt_bind_param(
+            $stmt,
+            $period_types,
+            ...$period_params
+        );
+
+        mysqli_stmt_execute($stmt);
+
+        $result = mysqli_stmt_get_result($stmt);
+
+        while ($row = mysqli_fetch_assoc($result)) {
+
+            $data[$row['gl_code']] =
+                (float)$row['total_amount'];
+        }
+
+        mysqli_stmt_close($stmt);
+    }
+
+    return $data;
+}
+
+// ============================================================
+// HELPER: GET DATA FROM PAST TRANSACTION TABLE (UPDATED)
+// ============================================================
+// Past transaction stores amounts under gl_id (e.g. 'MON-5').
+// For a given gl_id the comparative_report may have multiple
+// numerical gl_codes; past_transaction aggregates under the gl_id.
+// Example (old GL):
+//   gl_codes for MON-5 -> 4500004, 4040003
+//   comparative_report 2026-02: SUM(amount) WHERE gl_code IN (...) = 33400
+//   past_transaction    2025-02: SUM(amount) WHERE gl_id = 'MON-5'   = 37400
+// In mixed mode we map new gl_ids back to their old gl_ids and sum.
+
+function get_past_transaction_data(
+    mysqli $conn,
+    string $period,
+    array $gl_id_by_key,
+    string $gl_code_mode,
+    array $mixed_id_map = [],
+    array $old_gl_mapping = []
+): array {
+
+    $data = [];
+
+    if (empty($period)) {
+        return $data;
+    }
+
+    $parts = explode('-', $period);
+    $year_val = $parts[0];
+    $month_val = $period . '-01';
+
+    // Collect the gl_ids that actually exist in past_transaction
+    $gl_ids_to_query = [];
+
+    if ($gl_code_mode === 'old') {
+        // Use hardcoded mapping for old GL codes
+        // Get all gl_ids from the mapping that have a non-null target
+        $gl_ids_to_query = array_keys(array_filter($old_gl_mapping, function($val) {
+            return $val !== null;
+        }));
+        
+        // Also include any gl_ids from gl_id_by_key that might not be in the mapping
+        // but are needed for the report structure
+        foreach (array_unique(array_filter(array_values($gl_id_by_key))) as $gid) {
+            if (!in_array($gid, $gl_ids_to_query) && $gid !== '') {
+                // Check if this gl_id exists in the mapping keys
+                if (isset($old_gl_mapping[$gid]) || array_key_exists($gid, $old_gl_mapping)) {
+                    // If it's a key in the mapping, add it (even if value is null)
+                    $gl_ids_to_query[] = $gid;
+                } else {
+                    // For gl_ids not in mapping, check if they might be direct matches
+                    // (some old GL IDs might not need mapping)
+                    $gl_ids_to_query[] = $gid;
+                }
+            }
+        }
+        $gl_ids_to_query = array_unique($gl_ids_to_query);
+        
+    } else {
+        // Mixed mode (only reached for periods <= March 2026).
+        // Map each new gl_id to its old gl_id(s) and query those.
+        foreach (array_unique(array_filter(array_values($gl_id_by_key))) as $new_gid) {
+            $old_ids = $mixed_id_map[$new_gid] ?? [$new_gid];
+            foreach ($old_ids as $oid) {
+                if ($oid !== '') {
+                    $gl_ids_to_query[] = $oid;
+                }
+            }
+        }
+        $gl_ids_to_query = array_unique($gl_ids_to_query);
+    }
+
+    if (empty($gl_ids_to_query)) {
+        return $data;
+    }
+
+    // Build the query - SUM all regions for each gl_id
+    $placeholders = implode(',', array_fill(0, count($gl_ids_to_query), '?'));
+    $sql = "
+        SELECT
+            gl_id,
+            SUM(amount) AS total_amount
+        FROM fs_reports.past_transaction
+        WHERE transaction_year = ?
+        AND transaction_month = ?
+        AND gl_id IN ({$placeholders})
+        AND gl_id IS NOT NULL
+        AND gl_id != ''
+        GROUP BY gl_id
+    ";
+
+    $params = array_merge([$year_val, $month_val], $gl_ids_to_query);
+    $types = "ss" . str_repeat("s", count($gl_ids_to_query));
+
+    $stmt = mysqli_prepare($conn, $sql);
+    $raw_data = [];
+
+    if ($stmt) {
+
+        mysqli_stmt_bind_param(
+            $stmt,
+            $types,
+            ...$params
+        );
+
+        mysqli_stmt_execute($stmt);
+
+        $result = mysqli_stmt_get_result($stmt);
+
+        while ($row = mysqli_fetch_assoc($result)) {
+            $raw_data[$row['gl_id']] =
+                (float)$row['total_amount'];
+        }
+
+        mysqli_stmt_close($stmt);
+    }
+
+    // Return data keyed by the gl_id that the rest of the code expects
+    if ($gl_code_mode === 'old') {
+        // Apply the hardcoded mapping to convert past_transaction gl_ids to gl_codes_ho gl_ids
+        foreach ($raw_data as $past_gl_id => $amount) {
+            if (isset($old_gl_mapping[$past_gl_id])) {
+                $mapped_gl_id = $old_gl_mapping[$past_gl_id];
+                if ($mapped_gl_id !== null) {
+                    // Add to the mapped gl_id
+                    if (!isset($data[$mapped_gl_id])) {
+                        $data[$mapped_gl_id] = 0;
+                    }
+                    $data[$mapped_gl_id] += $amount;
+                }
+                // If mapped_gl_id is null, the amount is discarded (as per "none" mapping)
+            } else {
+                // For unmapped gl_ids, keep them as-is (they might be direct matches)
+                if (!isset($data[$past_gl_id])) {
+                    $data[$past_gl_id] = 0;
+                }
+                $data[$past_gl_id] += $amount;
+            }
+        }
+    } else {
+        // Mixed mode: aggregate old amounts under each new gl_id
+        foreach (array_unique(array_filter(array_values($gl_id_by_key))) as $new_gid) {
+            $total = 0.0;
+            $old_ids = $mixed_id_map[$new_gid] ?? [$new_gid];
+            foreach ($old_ids as $oid) {
+                if ($oid !== '' && isset($raw_data[$oid])) {
+                    $total += $raw_data[$oid];
+                }
+            }
+            $data[$new_gid] = $total;
+        }
+    }
+
+    return $data;
+}
+
+// ============================================================
 // MAIN TABLE CALCULATION
 // ============================================================
 
@@ -597,6 +870,8 @@ function compute_table_rows_for_region_area(
     array $special_keys,
     array $sort_order_descriptions,
     array $gl_id_by_key,
+    array $mixed_id_map = [],
+    array $old_gl_mapping = [],
     bool $use_real_data = true
 ): array {
 
@@ -619,263 +894,72 @@ function compute_table_rows_for_region_area(
         $types .= "s";
     }
 
-    $base_where =
-        !empty($where_conditions)
-            ? "WHERE " . implode(" AND ", $where_conditions)
-            : "WHERE 1=1";
-
-    // Exclude voided transactions
-    $base_where .=
-        " AND (status_void IS NULL OR status_void != 'Void')";
-
     // ========================================================
-    // PRIMARY PERIOD
+    // PRIMARY PERIOD - Always from comparative_report
     // ========================================================
 
     $primary_data = [];
 
-    if (
-        $use_real_data &&
-        !empty($primary_period)
-    ) {
+    if ($use_real_data && !empty($primary_period)) {
 
-        $p_parts =
-            explode('-', $primary_period);
-
-        $p_year =
-            $p_parts[0];
-
-        $p_month_val =
-            $primary_period . '-01';
-
-        $primary_sql = "
-            SELECT
-                gl_code,
-                SUM(amount) AS total_amount
-            FROM fs_reports.comparative_report
-            $base_where
-            AND transaction_year = ?
-            AND transaction_month = ?
-            AND gl_code IS NOT NULL
-            AND gl_code != ''
-            GROUP BY gl_code
-        ";
-
-        $primary_params =
-            array_merge(
-                $params,
-                [$p_year, $p_month_val]
-            );
-
-        $primary_types =
-            $types . "ss";
-
-        $primary_stmt =
-            mysqli_prepare(
-                $conn,
-                $primary_sql
-            );
-
-        if ($primary_stmt) {
-
-            mysqli_stmt_bind_param(
-                $primary_stmt,
-                $primary_types,
-                ...$primary_params
-            );
-
-            mysqli_stmt_execute(
-                $primary_stmt
-            );
-
-            $primary_result =
-                mysqli_stmt_get_result(
-                    $primary_stmt
-                );
-
-            while (
-                $row =
-                    mysqli_fetch_assoc(
-                        $primary_result
-                    )
-            ) {
-
-                $primary_data[
-                    $row['gl_code']
-                ] =
-                    (float)$row['total_amount'];
-            }
-
-            mysqli_stmt_close(
-                $primary_stmt
-            );
-        }
+        $primary_data = get_comparative_data(
+            $conn,
+            $primary_period,
+            $params,
+            $types,
+            true
+        );
     }
 
     // ========================================================
-    // PREVIOUS PERIOD
+    // PREVIOUS PERIOD - Always from comparative_report
     // ========================================================
 
     $previous_data = [];
 
-    if (
-        $use_real_data &&
-        !empty($previous_period)
-    ) {
+    if ($use_real_data && !empty($previous_period)) {
 
-        $prev_parts =
-            explode('-', $previous_period);
-
-        $prev_year_val =
-            $prev_parts[0];
-
-        $prev_month_val =
-            $previous_period . '-01';
-
-        $previous_sql = "
-            SELECT
-                gl_code,
-                SUM(amount) AS total_amount
-            FROM fs_reports.comparative_report
-            $base_where
-            AND transaction_year = ?
-            AND transaction_month = ?
-            AND gl_code IS NOT NULL
-            AND gl_code != ''
-            GROUP BY gl_code
-        ";
-
-        $previous_params =
-            array_merge(
-                $params,
-                [$prev_year_val, $prev_month_val]
-            );
-
-        $previous_types =
-            $types . "ss";
-
-        $previous_stmt =
-            mysqli_prepare(
-                $conn,
-                $previous_sql
-            );
-
-        if ($previous_stmt) {
-
-            mysqli_stmt_bind_param(
-                $previous_stmt,
-                $previous_types,
-                ...$previous_params
-            );
-
-            mysqli_stmt_execute(
-                $previous_stmt
-            );
-
-            $previous_result =
-                mysqli_stmt_get_result(
-                    $previous_stmt
-                );
-
-            while (
-                $row =
-                    mysqli_fetch_assoc(
-                        $previous_result
-                    )
-            ) {
-
-                $previous_data[
-                    $row['gl_code']
-                ] =
-                    (float)$row['total_amount'];
-            }
-
-            mysqli_stmt_close(
-                $previous_stmt
-            );
-        }
+        $previous_data = get_comparative_data(
+            $conn,
+            $previous_period,
+            $params,
+            $types,
+            true
+        );
     }
 
     // ========================================================
-    // THIRD PERIOD
+    // THIRD PERIOD - Use past_transaction for old/mixed
     // ========================================================
 
     $third_data = [];
+    $third_is_old_gl = false;
 
-    if (
-        $use_real_data &&
-        !empty($third_period)
-    ) {
+    if ($use_real_data && !empty($third_period)) {
 
-        $third_parts =
-            explode('-', $third_period);
+        // Determine which table to use for third period
+        $third_is_old_gl = 
+            ($gl_code_mode === 'old') || 
+            ($gl_code_mode === 'mixed' && isMarch2026OrEarlier($third_period));
 
-        $third_year_val =
-            $third_parts[0];
-
-        $third_month_val =
-            $third_period . '-01';
-
-        $third_sql = "
-            SELECT
-                gl_code,
-                SUM(amount) AS total_amount
-            FROM fs_reports.comparative_report
-            $base_where
-            AND transaction_year = ?
-            AND transaction_month = ?
-            AND gl_code IS NOT NULL
-            AND gl_code != ''
-            GROUP BY gl_code
-        ";
-
-        $third_params =
-            array_merge(
-                $params,
-                [$third_year_val, $third_month_val]
-            );
-
-        $third_types =
-            $types . "ss";
-
-        $third_stmt =
-            mysqli_prepare(
+        if ($third_is_old_gl) {
+            // Use past_transaction table (keyed by gl_id)
+            $third_data = get_past_transaction_data(
                 $conn,
-                $third_sql
+                $third_period,
+                $gl_id_by_key,
+                $gl_code_mode,
+                $mixed_id_map,
+                $old_gl_mapping
             );
-
-        if ($third_stmt) {
-
-            mysqli_stmt_bind_param(
-                $third_stmt,
-                $third_types,
-                ...$third_params
-            );
-
-            mysqli_stmt_execute(
-                $third_stmt
-            );
-
-            $third_result =
-                mysqli_stmt_get_result(
-                    $third_stmt
-                );
-
-            while (
-                $row =
-                    mysqli_fetch_assoc(
-                        $third_result
-                    )
-            ) {
-
-                $third_data[
-                    $row['gl_code']
-                ] =
-                    (float)$row['total_amount'];
-            }
-
-            mysqli_stmt_close(
-                $third_stmt
+        } else {
+            // Use comparative_report table (keyed by gl_code)
+            $third_data = get_comparative_data(
+                $conn,
+                $third_period,
+                $params,
+                $types,
+                true
             );
         }
     }
@@ -967,42 +1051,34 @@ function compute_table_rows_for_region_area(
             }
         }
 
-        foreach ($t_codes as $gl_code) {
+        // Third period: past_transaction is keyed by gl_id,
+        // comparative_report is keyed by gl_code.
+        if ($third_is_old_gl) {
+            if (isset($third_data[$current_gl_id])) {
+                $third_total = (float)$third_data[$current_gl_id];
+            }
+        } else {
+            foreach ($t_codes as $gl_code) {
 
-            if (isset($third_data[$gl_code])) {
+                if (isset($third_data[$gl_code])) {
 
-                $third_total +=
-                    $third_data[$gl_code];
+                    $third_total +=
+                        $third_data[$gl_code];
+                }
             }
         }
 
-// ====================================================
-// SPECIAL CALCULATION:
-//
-// SORT ORDER 18 (new GL) / SORT ORDER 17 (old GL) / INJ-3
-//
-// INJ-3 is calculated from the *display* values:
-//   INJ-1
-// - INJ-2 (display value = sign-flipped raw)
-// + INJ-4
-// + INJ-5
-// + ...
-// + INJ-49
-//
-// The actual INJ-3 GL amount is ignored.
-//
-// INJ-2 is always shown with flipped sign in the table
-// ("Less: Sales Return & Discount"), so the calculation
-// must use that same flipped amount.
-// ====================================================
+        // ====================================================
+        // SPECIAL CALCULATION: INJ-3
+        // ====================================================
 
-// Determine which sort_order to use for INJ-3 special calculation
-$inj3_sort_order = ($gl_code_mode === 'old') ? 17 : 18;
+        // Determine which sort_order to use for INJ-3 special calculation
+        $inj3_sort_order = ($gl_code_mode === 'old') ? 17 : 18;
 
-if (
-    (int)$sort_order === $inj3_sort_order &&
-    $current_gl_id === 'INJ-3'
-) {
+        if (
+            (int)$sort_order === $inj3_sort_order &&
+            $current_gl_id === 'INJ-3'
+        ) {
 
             $primary_total = 0.0;
             $previous_total = 0.0;
@@ -1052,8 +1128,6 @@ if (
 
                 // INJ-2: use the display value (sign-flipped raw),
                 // then subtract it so the calc matches the table.
-                // Example: raw -10005 → display 10005 → subtract 10005
-                //          raw  +616  → display -616  → subtract -616 (= add 616)
                 if ($inj_number === 2) {
 
                     $inj_primary_display = -$inj_primary;
@@ -1086,10 +1160,6 @@ if (
 
         // ====================================================
         // INJ-2 DISPLAY SIGN FLIP
-        //
-        // Store the flipped amount so the table row and any
-        // later math that reads primary_total etc. stay in sync
-        // with what the user sees.
         // ====================================================
 
         if ($is_inj2) {
@@ -1224,10 +1294,10 @@ if (
             }
         }
 
-// For Income from Jewelry, use the calculated INJ-3 totals
-$inj3_sort_order = ($gl_code_mode === 'old') ? 17 : 18;
+        // For Income from Jewelry, use the calculated INJ-3 totals
+        $inj3_sort_order = ($gl_code_mode === 'old') ? 17 : 18;
 
-if ((int)$sort_order === $inj3_sort_order) {
+        if ((int)$sort_order === $inj3_sort_order) {
 
             $total_primary_total = 0.0;
             $total_previous_total = 0.0;
@@ -1597,12 +1667,11 @@ if ((int)$sort_order === $inj3_sort_order) {
                             : 0
                     );
 
-                      // Add spacer above GROSS PROFIT
-    $final_table_rows[] = [
-        'is_manual_spacer' => true
-    ];
+            // Add spacer above GROSS PROFIT
+            $final_table_rows[] = [
+                'is_manual_spacer' => true
+            ];
 
-    
             $final_table_rows[] = [
 
                 'sort_order' =>
@@ -2187,6 +2256,8 @@ $table_rows =
         $special_keys,
         $sort_order_descriptions,
         $gl_id_by_key,
+        $mixed_id_map,
+        $old_gl_mapping,
         $valid_filters
     );
 

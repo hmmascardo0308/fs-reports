@@ -76,6 +76,13 @@ try {
     }
 
     // ------------------------------------------------------------
+    // Determine GL table (old vs new) from gl_code_mode
+    // ------------------------------------------------------------
+    $gl_code_mode = $filters['gl_code_mode'] ?? 'old';
+    $gl_code_mode = in_array($gl_code_mode, ['old', 'new'], true) ? $gl_code_mode : 'old';
+    $gl_table = ($gl_code_mode === 'new') ? 'new_gl_codes' : 'gl_codes';
+
+    // ------------------------------------------------------------
     // Get mainzone and zone based on selected region
     // ------------------------------------------------------------
     $mainzone = null;
@@ -107,6 +114,64 @@ try {
     }
 
     $regionStmt->close();
+
+    // ------------------------------------------------------------
+    // Helper: resolve gl_id from sort_order (+ sub_order when present)
+    // ------------------------------------------------------------
+    /**
+     * Look up gl_id from the active GL table.
+     * - When sub_order is provided and not empty → match sort_order + sub_order
+     * - When sub_order is null/empty → match on sort_order only
+     */
+    function resolve_gl_id(mysqli $conn, string $gl_table, int $sort_order, $sub_order): ?string
+    {
+        $gl_id = null;
+
+        if ($sub_order !== null && $sub_order !== '') {
+            $sql = "
+                SELECT gl_id
+                FROM fs_reports.{$gl_table}
+                WHERE sort_order = ?
+                  AND sub_order = ?
+                  AND gl_id IS NOT NULL
+                  AND gl_id != ''
+                LIMIT 1
+            ";
+            $stmt = $conn->prepare($sql);
+            if ($stmt) {
+                $sub = (int)$sub_order;
+                $stmt->bind_param("ii", $sort_order, $sub);
+                $stmt->execute();
+                $res = $stmt->get_result();
+                if ($r = $res->fetch_assoc()) {
+                    $gl_id = $r['gl_id'];
+                }
+                $stmt->close();
+            }
+        } else {
+            // No sub_order → look up by sort_order only
+            $sql = "
+                SELECT gl_id
+                FROM fs_reports.{$gl_table}
+                WHERE sort_order = ?
+                  AND gl_id IS NOT NULL
+                  AND gl_id != ''
+                LIMIT 1
+            ";
+            $stmt = $conn->prepare($sql);
+            if ($stmt) {
+                $stmt->bind_param("i", $sort_order);
+                $stmt->execute();
+                $res = $stmt->get_result();
+                if ($r = $res->fetch_assoc()) {
+                    $gl_id = $r['gl_id'];
+                }
+                $stmt->close();
+            }
+        }
+
+        return $gl_id;
+    }
 
     // ------------------------------------------------------------
     // Begin transaction
@@ -153,20 +218,18 @@ try {
     $deleteStmt->close();
 
     // ------------------------------------------------------------
-    // Prepare INSERT statements
+    // Prepare INSERT statements (now include gl_id)
     //
     // There are TWO types of rows:
     //
     // 1. Normal detail rows:
-    //    sort_order + sub_order + gl_description_comparative
+    //    sort_order + sub_order + gl_description_comparative + gl_id
     //
     // 2. Direct total rows:
     //    sort_order 6, 8, 11
     //    sub_order = NULL
     //    gl_description_comparative = NULL
-    //
-    // For 6/8/11, NULL is written directly in SQL so there is
-    // no ambiguity with mysqli bind_param().
+    //    gl_id looked up by sort_order only
     // ------------------------------------------------------------
 
     // Normal detail-row insert
@@ -177,6 +240,7 @@ try {
             description,
             sub_order,
             gl_description_comparative,
+            gl_id,
             mlfsi,
             jewelers,
             mainzone,
@@ -187,7 +251,7 @@ try {
             adjusted_by,
             adjusted_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ";
 
     $detailInsertStmt = $conn->prepare($detailInsertSql);
@@ -207,6 +271,7 @@ try {
             description,
             sub_order,
             gl_description_comparative,
+            gl_id,
             mlfsi,
             jewelers,
             mainzone,
@@ -217,7 +282,7 @@ try {
             adjusted_by,
             adjusted_at
         )
-        VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ";
 
     $totalInsertStmt = $conn->prepare($totalInsertSql);
@@ -258,10 +323,16 @@ try {
             $nullSubOrderCount++;
             $specialTotalCount++;
 
+            // Look up gl_id using sort_order only (no sub_order)
+            $gl_id = resolve_gl_id($conn, $gl_table, $sort_order, null);
+
+            // types: i s s d d s s s s s s s
+            // sort_order, description, gl_id, mlfsi, jewelers, mainzone, zone, region, transaction_month, transaction_year, adjusted_by, adjusted_at
             $totalInsertStmt->bind_param(
-                "isddsssssss",
+                "issddsssssss",
                 $sort_order,
                 $description,
+                $gl_id,
                 $mlfsi,
                 $jewelers,
                 $mainzone,
@@ -289,20 +360,31 @@ try {
         // --------------------------------------------------------
         // NORMAL DETAIL ROW
         // --------------------------------------------------------
-        $sub_order = $adjustment['sub_order'] ?? null;
+        $sub_order_raw = $adjustment['sub_order'] ?? null;
         $gl_description_comparative =
             $adjustment['gl_description_comparative'] ?? null;
 
-        if ($sub_order === null || $sub_order === '') {
+        // Normalise sub_order for bind_param (int or null)
+        $sub_order = null;
+        if ($sub_order_raw !== null && $sub_order_raw !== '') {
+            $sub_order = (int)$sub_order_raw;
+        } else {
             $nullSubOrderCount++;
         }
 
+        // Look up gl_id from sort_order + sub_order (or sort_order only)
+        $gl_id = resolve_gl_id($conn, $gl_table, $sort_order, $sub_order);
+
+        // types: i s i s s d d s s s s s s s
+        // sort_order, description, sub_order, gl_description_comparative, gl_id, mlfsi, jewelers, mainzone, zone, region, transaction_month, transaction_year, adjusted_by, adjusted_at
+        // Note: when $sub_order is null, mysqli will insert NULL for the integer column
         $detailInsertStmt->bind_param(
-            "isisddsssssss",
+            "isissddsssssss",
             $sort_order,
             $description,
             $sub_order,
             $gl_description_comparative,
+            $gl_id,
             $mlfsi,
             $jewelers,
             $mainzone,

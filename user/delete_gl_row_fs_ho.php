@@ -1,4 +1,5 @@
 <?php
+// delete_gl_row_fs_ho.php
 header('Content-Type: application/json');
 require_once __DIR__ . '/../config/config.php';
 
@@ -23,13 +24,25 @@ if ($id <= 0) {
     exit;
 }
 
+$gl_type = $data['gl_type'] ?? 'new';
+
+if (!in_array($gl_type, ['old', 'new'], true)) {
+    http_response_code(400);
+    echo json_encode(['ok' => false, 'error' => 'Invalid GL type']);
+    exit;
+}
+
+$gl_table = ($gl_type === 'old')
+    ? 'fs_reports.gl_codes_ho'
+    : 'fs_reports.new_gl_codes_ho';
+
 mysqli_begin_transaction($conn);
 
 try {
     // Fetch description before delete (needed to recompute sub_order)
     $desc = null;
     $prefix = null;
-    $desc_stmt = mysqli_prepare($conn, "SELECT description, gl_id FROM fs_reports.gl_codes_ho_new WHERE id = ? LIMIT 1");
+    $desc_stmt = mysqli_prepare($conn, "SELECT description, gl_id FROM $gl_table WHERE id = ? LIMIT 1");
     if (!$desc_stmt) {
         throw new Exception('Prepare failed');
     }
@@ -43,7 +56,7 @@ try {
     mysqli_stmt_close($desc_stmt);
 
     // Delete the row
-    $stmt = mysqli_prepare($conn, "DELETE FROM fs_reports.gl_codes_ho_new WHERE id = ?");
+    $stmt = mysqli_prepare($conn, "DELETE FROM $gl_table WHERE id = ?");
     if (!$stmt) {
         throw new Exception('Prepare failed');
     }
@@ -59,7 +72,7 @@ try {
         $groups_stmt = mysqli_prepare(
             $conn,
             "SELECT gl_description_comparative
-             FROM fs_reports.gl_codes_ho_new
+             FROM $gl_table
              WHERE description = ?
              GROUP BY gl_description_comparative
              ORDER BY MIN(sub_order + 0) ASC, MIN(id) ASC"
@@ -81,7 +94,7 @@ try {
         if (count($comps) > 0) {
             $update_stmt = mysqli_prepare(
                 $conn,
-                "UPDATE fs_reports.gl_codes_ho_new
+                "UPDATE $gl_table
                  SET sub_order = ?, gl_id = ?
                  WHERE description = ? AND gl_description_comparative = ?"
             );
@@ -111,3 +124,5 @@ try {
     echo json_encode(['ok' => false, 'error' => $e->getMessage()]);
 }
 ?>
+
+
