@@ -190,69 +190,10 @@ $new_gl_mapping = [
     'VEH-9' => 'VEH-11',
     
     // INS (Insurance) mappings - NEW GL IDs aggregate multiple old GL IDs
-    'INS-1' => [
-        'INS-28',
-        'INS-29',
-        'INS-30',
-        'INS-31',
-        'INS-34',
-        'INS-39'
-    ],
-    'INS-2' => [
-        'INS-25',
-        'INS-26',
-        'INS-44',
-        'INS-47'
-    ],
-    'INS-3' => [
-        'INS-32',
-        'INS-33',
-        'INS-42',
-        'INS-43',
-        'INS-45'
-    ],
-    'INS-4' => [
-        'INS-27',
-        'INS-46'
-    ],
-    'INS-5' => [
-        'INS-20',
-        'INS-21',
-        'INS-22',
-        'INS-23',
-        'INS-24',
-        'INS-37',
-        'INS-41'
-    ],
-    'INS-6' => [
-        'INS-1',
-        'INS-2',
-        'INS-3',
-        'INS-4',
-        'INS-5',
-        'INS-6',
-        'INS-7',
-        'INS-8',
-        'INS-9',
-        'INS-10',
-        'INS-11',
-        'INS-12',
-        'INS-13',
-        'INS-14',
-        'INS-35',
-        'INS-36',
-        'INS-40'
-    ],
-    'INS-7' => [
-        'INS-15',
-        'INS-16',
-        'INS-17',
-        'INS-18',
-        'INS-19'
-    ],
-    'INS-8' => ['INS-38'],
-    'INS-9' => ['INS-48'],
-    'INS-10' => ['INS-49'],
+    'INS-11' => '',
+    'INS-12' => '',
+
+   
 ];
 
 // Validate periods and GL code mode
@@ -442,85 +383,20 @@ if ($gl_code_mode === 'mixed') {
     // New GL ID => old GL IDs
     $mixed_id_map = [
 
-        'INS-1' => [
-            'INS-28',
-            'INS-29',
-            'INS-30',
-            'INS-31',
-            'INS-34',
-            'INS-39'
-        ],
+       'INS-11' => [''],
+    'INS-12' => [''],
 
-        'INS-2' => [
-            'INS-25',
-            'INS-26',
-            'INS-44',
-            'INS-47'
-        ],
-
-        'INS-3' => [
-            'INS-32',
-            'INS-33',
-            'INS-42',
-            'INS-43',
-            'INS-45'
-        ],
-
-        'INS-4' => [
-            'INS-27',
-            'INS-46'
-        ],
-
-        'INS-5' => [
-            'INS-20',
-            'INS-21',
-            'INS-22',
-            'INS-23',
-            'INS-24',
-            'INS-37',
-            'INS-41'
-        ],
-
-        'INS-6' => [
-            'INS-1',
-            'INS-2',
-            'INS-3',
-            'INS-4',
-            'INS-5',
-            'INS-6',
-            'INS-7',
-            'INS-8',
-            'INS-9',
-            'INS-10',
-            'INS-11',
-            'INS-12',
-            'INS-13',
-            'INS-14',
-            'INS-35',
-            'INS-36',
-            'INS-40'
-        ],
-
-        'INS-7' => [
-            'INS-15',
-            'INS-16',
-            'INS-17',
-            'INS-18',
-            'INS-19'
-        ],
-
-        'INS-8' => ['INS-38'],
-        'INS-9' => ['INS-48'],
-        'INS-10' => ['INS-49'],
+    
 
 // VEHICLE GL MAPPING
 
-        'VEH-6' => [''],
-        'VEH-7' => ['VEH-6'],
-        'VEH-8' => ['VEH-7'],
-        'VEH-9' => ['VEH-8'],
-        'VEH-10' => ['VEH-9'],
-        'VEH-11' => ['VEH-10'],
+'VEH-5'=> [''],  
+'VEH-6'  => [''],          // Yadea – no historical source
+'VEH-7'  => ['VEH-5'],     // Application Fee
+'VEH-8'  => ['VEH-6'],     // Appraisal Fee
+'VEH-9'  => ['VEH-7'],     // Penalty & Other
+'VEH-10' => ['VEH-8'],     // Chattel Mortgage
+'VEH-11' => ['VEH-9'],     // Notarial Income
 
 // TOTAL OTHER INCOME        
         'TOI-33' => ['TOI-31'],
@@ -3120,7 +2996,7 @@ $table_rows =
                 </button>
 
                 <a
-                    href="export_comparative_ho.php?<?= htmlspecialchars(http_build_query($_GET)) ?>"
+                    href="export_comparative_ho_with_past_and_adjustment.php?<?= htmlspecialchars(http_build_query($_GET)) ?>"
                     class="btn-export"
                 >
                     <i class="fa-solid fa-file-excel"></i>
