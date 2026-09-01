@@ -2001,13 +2001,23 @@ $comps_by_desc_json =
             "
         >
 
+        <a
+                href="comparative_report_original_page_four.php"
+                style="text-decoration: none;"
+                class="btn-preview"
+            >
+                <i class="fa-solid fa-file"></i>
+                Consolidated Report (Page 4)
+            </a>
+
+
             <a
                 href="comparative_report_original_ho_with_past_and_adjustment.php"
                 style="text-decoration: none;"
                 class="btn-preview"
             >
                 <i class="fa-solid fa-file"></i>
-                Comparative Report (with HO allocated)
+                Comparative Report (with HO allocated - Page 5)
             </a>
 
 

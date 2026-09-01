@@ -30,6 +30,9 @@ $gl_code_mode = in_array(
     true
 ) ? $gl_code_mode : 'old';
 
+// Determine INJ sort order based on GL mode
+$inj_sort_order = ($gl_code_mode === 'old') ? 17 : 18;
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function compareMonths(string $month1, string $month2): int
@@ -176,9 +179,24 @@ $new_gl_mapping = [
     'VEH-8' => 'VEH-10',
     'VEH-9' => 'VEH-11',
 
-    // INS mappings
-  'INS-11' => '',
-    'INS-12' => '',
+    // INS (Insurance) mappings - NEW GL IDs aggregate multiple old GL IDs
+    // Array form: TARGET (new) => [SOURCE old GL IDs]
+    // Used when reading historical/old-source data into the new structure.
+    // For post-April 2026 manual_adjustment rows that already use new IDs,
+    // direct matches take precedence over these aggregations.
+    'INS-1'  => ['INS-28', 'INS-29', 'INS-30', 'INS-31', 'INS-34', 'INS-39'],
+    'INS-2'  => ['INS-25', 'INS-26', 'INS-44', 'INS-47'],
+    'INS-3'  => ['INS-32', 'INS-33', 'INS-42', 'INS-43', 'INS-45'],
+    'INS-4'  => ['INS-27', 'INS-46'],
+    'INS-5'  => ['INS-20', 'INS-21', 'INS-22', 'INS-23', 'INS-24', 'INS-37', 'INS-41'],
+    'INS-6'  => ['INS-1', 'INS-2', 'INS-3', 'INS-4', 'INS-5', 'INS-6', 'INS-7', 'INS-8', 'INS-9', 'INS-10', 'INS-11', 'INS-12', 'INS-13', 'INS-14', 'INS-35', 'INS-36', 'INS-40'],
+    'INS-7'  => ['INS-15', 'INS-16', 'INS-17', 'INS-18', 'INS-19'],
+    'INS-8'  => ['INS-38'],
+    'INS-9'  => ['INS-48'],
+    'INS-10' => ['INS-49'],
+    // INS-11 / INS-12 are new-only rows (no historical sources)
+    'INS-11' => [],
+    'INS-12' => [],
 ];
 
 // ── validate filters ─────────────────────────────────────────────────────────
@@ -286,18 +304,47 @@ if ($gl_code_mode === 'mixed') {
         }
     }
 
+    // New GL ID => old GL IDs (for historical / pre-new-GL source data)
     $mixed_id_map = [
-    'INS-11' => [''],
-    'INS-12' => [''],
-        'VEH-5' => [''],
-        'VEH-6' => [''],
-        'VEH-7' => ['VEH-5'],
-        'VEH-8' => ['VEH-6'],
-        'VEH-9' => ['VEH-7'],
-        'VEH-10' => ['VEH-8'],
-        'VEH-11' => ['VEH-9'],
+        // INS (Insurance) – same aggregation as new_gl_mapping
+        'INS-1'  => ['INS-28', 'INS-29', 'INS-30', 'INS-31', 'INS-34', 'INS-39'],
+        'INS-2'  => ['INS-25', 'INS-26', 'INS-44', 'INS-47'],
+        'INS-3'  => ['INS-32', 'INS-33', 'INS-42', 'INS-43', 'INS-45'],
+        'INS-4'  => ['INS-27', 'INS-46'],
+        'INS-5'  => ['INS-20', 'INS-21', 'INS-22', 'INS-23', 'INS-24', 'INS-37', 'INS-41'],
+        'INS-6'  => ['INS-1', 'INS-2', 'INS-3', 'INS-4', 'INS-5', 'INS-6', 'INS-7', 'INS-8', 'INS-9', 'INS-10', 'INS-11', 'INS-12', 'INS-13', 'INS-14', 'INS-35', 'INS-36', 'INS-40'],
+        'INS-7'  => ['INS-15', 'INS-16', 'INS-17', 'INS-18', 'INS-19'],
+        'INS-8'  => ['INS-38'],
+        'INS-9'  => ['INS-48'],
+        'INS-10' => ['INS-49'],
+        'INS-11' => [],  // new-only
+        'INS-12' => [],  // new-only
+
+        // COS (Cost of Sales) – old source IDs map into new targets
+        // COS-2/3/4 in the NEW structure are different accounts (ML Shop, etc.)
+        // and must not keep the old Special Products / Tele / Kargo amounts.
+        'COS-5' => ['COS-2'],  // Special Products
+        'COS-6' => ['COS-3'],  // Telecommunication
+        'COS-7' => ['COS-4'],  // ML Kargo
+        'COS-2' => [],         // ML Shop - Jewelry (new-only)
+        'COS-3' => [],         // Online Live Selling (new-only)
+        'COS-4' => [],         // Jewelry - Cost of Sales (new-only)
+        'COS-8' => [],
+        'COS-9' => [],
+
+        // VEHICLE GL MAPPING
+        'VEH-5'  => [''],
+        'VEH-6'  => [''],          // Yadea – no historical source
+        'VEH-7'  => ['VEH-5'],     // Application Fee
+        'VEH-8'  => ['VEH-6'],     // Appraisal Fee
+        'VEH-9'  => ['VEH-7'],     // Penalty & Other
+        'VEH-10' => ['VEH-8'],     // Chattel Mortgage
+        'VEH-11' => ['VEH-9'],     // Notarial Income
+
+        // TOTAL OTHER INCOME
         'TOI-33' => ['TOI-31'],
         'TOI-34' => ['TOI-32'],
+
         'TAE-23' => [''],
     ];
 }
@@ -490,13 +537,29 @@ function get_manual_adjustment_data(
             }
         }
     } else {
+        // MIXED: query new GL ids, mixed_id_map sources, and
+        // scalar mapping sources (e.g. COS-2 for COS-5).
         foreach (
             array_unique(array_filter(array_values($gl_id_by_key))) as $new_gid
         ) {
+            if ($new_gid !== '') {
+                $gl_ids_to_query[] = $new_gid;
+            }
             $old_ids = $mixed_id_map[$new_gid] ?? [$new_gid];
             foreach ($old_ids as $oid) {
                 if ($oid !== '') {
                     $gl_ids_to_query[] = $oid;
+                }
+            }
+        }
+        foreach ($new_gl_mapping as $key => $mapping) {
+            if (!is_array($mapping) && $key !== '') {
+                $gl_ids_to_query[] = $key;
+            } elseif (is_array($mapping)) {
+                foreach ($mapping as $src_id) {
+                    if ($src_id !== '') {
+                        $gl_ids_to_query[] = $src_id;
+                    }
                 }
             }
         }
@@ -564,17 +627,31 @@ function get_manual_adjustment_data(
             }
         }
     } elseif ($gl_code_mode === 'new') {
+        // Scalar: SOURCE => TARGET
+        // Array:  TARGET => [SOURCE1, SOURCE2, ...]
+        // Hybrid for array mappings: prefer non-zero direct TARGET
+        // amount (post-April 2026); otherwise sum historical SOURCES.
         foreach ($new_gl_mapping as $key => $mapping) {
             if (is_array($mapping)) {
                 $target_gl_id = $key;
+
+                $direct = array_key_exists($target_gl_id, $raw_data)
+                    ? (float)$raw_data[$target_gl_id]
+                    : null;
+
                 $total = 0.0;
                 foreach ($mapping as $src_gl_id) {
                     if ($src_gl_id !== '' && isset($raw_data[$src_gl_id])) {
                         $total += (float)$raw_data[$src_gl_id];
                     }
                 }
-                if ($total != 0.0) {
+
+                if ($direct !== null && $direct != 0.0) {
+                    $data[$target_gl_id] = $direct;
+                } elseif ($total != 0.0) {
                     $data[$target_gl_id] = $total;
+                } elseif ($direct !== null) {
+                    $data[$target_gl_id] = $direct;
                 }
             } else {
                 $src_gl_id = $key;
@@ -593,20 +670,67 @@ function get_manual_adjustment_data(
             }
         }
 
+        // Direct-match only for GL IDs that were not used as a
+        // SCALAR mapping SOURCE (those amounts already moved to
+        // their TARGET). Without this, COS-2/3/4 amounts appear
+        // both on the old source row and on COS-5/6/7.
+        $scalar_source_ids = [];
+        foreach ($new_gl_mapping as $key => $mapping) {
+            if (!is_array($mapping) && $key !== '') {
+                $scalar_source_ids[$key] = true;
+            }
+        }
+
         foreach ($gl_id_by_key as $key => $gl_id) {
             if (
                 $gl_id !== '' &&
                 !isset($data[$gl_id]) &&
                 isset($raw_data[$gl_id]) &&
-                !array_key_exists($gl_id, $new_gl_mapping)
+                !isset($scalar_source_ids[$gl_id])
             ) {
                 $data[$gl_id] = (float)$raw_data[$gl_id];
             }
         }
     } else {
+        // MIXED mode:
+        // 1) Apply scalar SOURCE -> TARGET from $new_gl_mapping
+        //    (e.g. COS-2 -> COS-5) so old-encoded amounts land
+        //    on the correct new rows.
+        // 2) For remaining new GL ids, hybrid: prefer non-zero
+        //    direct amount, else sum mixed_id_map sources.
+        // Scalar SOURCE ids must not keep a direct amount on
+        // themselves (avoids COS-2 showing Special Products).
+
+        $scalar_source_ids = [];
+        foreach ($new_gl_mapping as $key => $mapping) {
+            if (!is_array($mapping) && $key !== '' && $mapping !== null && $mapping !== '') {
+                $scalar_source_ids[$key] = true;
+                if (isset($raw_data[$key])) {
+                    if (!isset($data[$mapping])) {
+                        $data[$mapping] = 0.0;
+                    }
+                    $data[$mapping] += (float)$raw_data[$key];
+                }
+            }
+        }
+
         foreach (
             array_unique(array_filter(array_values($gl_id_by_key))) as $new_gid
         ) {
+            if (isset($data[$new_gid])) {
+                continue; // already filled by scalar mapping
+            }
+
+            // Scalar sources that were remapped must stay 0 here.
+            if (isset($scalar_source_ids[$new_gid])) {
+                $data[$new_gid] = 0.0;
+                continue;
+            }
+
+            $direct = array_key_exists($new_gid, $raw_data)
+                ? (float)$raw_data[$new_gid]
+                : null;
+
             $total = 0.0;
             $old_ids = $mixed_id_map[$new_gid] ?? [$new_gid];
             foreach ($old_ids as $oid) {
@@ -614,7 +738,14 @@ function get_manual_adjustment_data(
                     $total += (float)$raw_data[$oid];
                 }
             }
-            $data[$new_gid] = $total;
+
+            if ($direct !== null && $direct != 0.0) {
+                $data[$new_gid] = $direct;
+            } elseif ($total != 0.0) {
+                $data[$new_gid] = $total;
+            } else {
+                $data[$new_gid] = $direct !== null ? $direct : 0.0;
+            }
         }
     }
 
@@ -1776,7 +1907,7 @@ foreach ($data_rows as $item) {
     } else {
         // Detail row
         if (
-            (int)($item['sort_order'] ?? 0) === 18 &&
+            (int)($item['sort_order'] ?? 0) === $inj_sort_order &&
             in_array((int)($item['sub_order'] ?? 0), [3, 4, 5, 6], true)
         ) {
             $sheet->setCellValue("B$row", $item['gl_description'] ?? '');
@@ -1850,7 +1981,7 @@ foreach ($data_rows as $item) {
 // ── Output ────────────────────────────────────────────────────────────────────
 
 header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-header('Content-Disposition: attachment; filename="Comparative_Report_With_HO_Past_And_Adjustment_' . date('Y-m-d') . '.xlsx"');
+header('Content-Disposition: attachment; filename="Comparative_Report_With_HO_Allocated_' . date('Y-m-d') . '.xlsx"');
 $writer = new Xlsx($spreadsheet);
 $writer->save('php://output');
 
